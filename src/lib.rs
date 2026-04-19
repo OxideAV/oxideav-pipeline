@@ -1,12 +1,30 @@
-//! Pipeline composition.
+//! Pipeline composition + JSON-driven job graphs.
 //!
-//! The main abstraction is [`Pipeline`] which routes source streams to
-//! per-stream [`Sink`]s, deciding per-route whether to copy packets
-//! verbatim or transcode (decode + optional re-encode). Streams with
-//! no bound sink stay inactive — the demuxer is told to skip them.
+//! Two layers of API live in this crate:
 //!
-//! Legacy helpers [`remux`] and [`transcode_simple`] are preserved for
-//! backward compatibility.
+//! * **Low-level** — [`Pipeline`] routes source streams to per-stream
+//!   [`Sink`]s, deciding per-route whether to copy packets verbatim or
+//!   transcode (decode + optional re-encode). Plus the [`remux`] /
+//!   [`transcode_simple`] / [`transcode`] helpers.
+//! * **High-level** — [`Job`] + [`Executor`]: a JSON-described
+//!   transcode graph with aliases, filters, stream selectors, and
+//!   either a single-threaded or stage-per-thread executor. Outputs
+//!   plug in via [`JobSink`].
+
+pub mod dag;
+pub mod executor;
+pub mod schema;
+pub mod sinks;
+pub mod validate;
+mod staged;
+
+pub use dag::{Dag, DagNode, NodeId};
+pub use executor::{Executor, JobSink};
+pub use schema::{
+    parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
+    TrackInput, TrackSpec,
+};
+pub use sinks::{FileSink, NullSink};
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_container::{Demuxer, Muxer};
