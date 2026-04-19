@@ -17,7 +17,7 @@ categories = ["multimedia"]
 oxideav-core = "0.1"
 oxideav-codec = "0.1"
 oxideav-container = "0.1"
-oxideav-source = "0.0"
+oxideav-source = "0.1"
 oxideav-pixfmt = "0.1"
 oxideav-audio-filter = { version = "0.0", optional = true }
 serde = { version = "1", features = ["derive"] }
