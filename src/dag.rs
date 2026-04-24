@@ -33,10 +33,12 @@ pub enum DagNode {
     },
     /// Decode packets to frames.
     Decode { upstream: NodeId },
-    /// Apply a filter to frames.
+    /// Apply a named filter to frames. The filter's concrete media-kind
+    /// matrix (audio-in / video-out / …) is resolved at track-runtime
+    /// instantiation via [`crate::FilterRegistry`] — the DAG only
+    /// carries the name + opaque JSON params.
     Filter {
         upstream: NodeId,
-        kind: FilterKind,
         name: String,
         params: serde_json::Value,
     },
@@ -59,12 +61,6 @@ pub enum DagNode {
         target: String,
         tracks: Vec<MuxTrack>,
     },
-}
-
-#[derive(Clone, Debug)]
-pub enum FilterKind {
-    Audio,
-    Video,
 }
 
 #[derive(Clone, Debug)]
@@ -248,7 +244,6 @@ impl Job {
             TrackInput::Source(src) => self.build_source(dag, ctx, src, selector),
             TrackInput::Filter(f) => {
                 let upstream = self.build_input(dag, ctx, f.input.as_ref(), selector)?;
-                let kind = guess_filter_kind(&f.filter);
                 // Filter consumes frames; insert a Decode if the upstream is
                 // still packet-producing.
                 let frame_upstream = if self.is_packet_producing(dag, upstream)? {
@@ -258,7 +253,6 @@ impl Job {
                 };
                 Ok(dag.push(DagNode::Filter {
                     upstream: frame_upstream,
-                    kind,
                     name: f.filter.clone(),
                     params: f.params.clone(),
                 }))
@@ -401,16 +395,6 @@ fn pick_alias_track<'a>(
     }
 }
 
-fn guess_filter_kind(name: &str) -> FilterKind {
-    // Today we only have audio filters. Treat any name prefixed with
-    // `video.` as a video filter (reserved; executor returns Unsupported).
-    if name.starts_with("video.") || name.starts_with("v:") {
-        FilterKind::Video
-    } else {
-        FilterKind::Audio
-    }
-}
-
 impl StreamSelector {
     pub fn resolve(&self, default_kind: MediaType) -> ResolvedSelector {
         ResolvedSelector {
@@ -450,13 +434,11 @@ impl Dag {
             }
             DagNode::Filter {
                 upstream,
-                kind,
                 name,
                 params,
             } => {
                 out.push_str(&format!(
-                    "{pad}filter({kind:?}, {name}, {params})\n",
-                    kind = kind,
+                    "{pad}filter({name}, {params})\n",
                     name = name,
                     params = params
                 ));

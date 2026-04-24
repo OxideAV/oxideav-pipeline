@@ -18,13 +18,15 @@ use std::path::PathBuf;
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_container::{ContainerRegistry, Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, ExecutionContext, Frame, MediaType, Packet, PixelFormat,
-    Result, StreamInfo, TimeBase,
+    CodecId, CodecParameters, Error, ExecutionContext, FilterContext, Frame, MediaType, Packet,
+    PixelFormat, PortParams, PortSpec, Rational, Result, SampleFormat, StreamFilter, StreamInfo,
+    TimeBase,
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 use oxideav_source::SourceRegistry;
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
+use crate::filter_registry::FilterRegistry;
 use crate::schema::{is_reserved_sink, Job};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
@@ -54,6 +56,10 @@ pub struct Executor<'a> {
     containers: &'a ContainerRegistry,
     sources: &'a SourceRegistry,
     sink_overrides: HashMap<String, Box<dyn JobSink>>,
+    /// Named-filter factory table. Defaults to
+    /// `FilterRegistry::with_builtins()` — callers that need custom
+    /// filters replace it via [`Self::with_filter_registry`].
+    filters: FilterRegistry,
     /// Explicit thread budget from the caller. `None` = resolve from
     /// `job.threads` or autodetect. `Some(0)` is treated as auto as well.
     explicit_threads: Option<usize>,
@@ -72,6 +78,7 @@ impl<'a> Executor<'a> {
             containers,
             sources,
             sink_overrides: HashMap::new(),
+            filters: FilterRegistry::with_builtins(),
             explicit_threads: None,
         }
     }
@@ -80,6 +87,14 @@ impl<'a> Executor<'a> {
     /// live-playback sink to `@display`/`@out`.
     pub fn with_sink_override(mut self, name: &str, sink: Box<dyn JobSink>) -> Self {
         self.sink_overrides.insert(name.to_string(), sink);
+        self
+    }
+
+    /// Replace the filter registry. Useful for tests that want to inject
+    /// a custom filter without touching the builtin set, or for callers
+    /// that need to register extra filters on top of the builtins.
+    pub fn with_filter_registry(mut self, filters: FilterRegistry) -> Self {
+        self.filters = filters;
         self
     }
 
@@ -183,21 +198,13 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(self.codecs, &ctx)?;
+            pl.instantiate(self.codecs, &ctx, &self.filters)?;
         }
 
         // Build the per-track output stream infos + open (or replace) the sink.
-        let out_streams: Vec<StreamInfo> = pipelines
-            .iter()
-            .enumerate()
-            .map(|(i, pl)| StreamInfo {
-                index: i as u32,
-                time_base: pl.output_time_base(),
-                duration: None,
-                start_time: Some(0),
-                params: pl.output_params().clone(),
-            })
-            .collect();
+        // Multi-port filters add extra streams after their primary — the sink
+        // sees all of them in `start()` before any frame flows.
+        let out_streams = build_output_streams(&mut pipelines);
 
         let mut sink = self.open_sink(name, &out_streams)?;
         sink.start(&out_streams)?;
@@ -271,12 +278,10 @@ impl<'a> Executor<'a> {
                 }
                 DagNode::Filter {
                     upstream,
-                    kind,
                     name,
                     params,
                 } => {
                     stages.push(StageSpec::Filter {
-                        kind: kind.clone(),
                         name: name.clone(),
                         params: params.clone(),
                     });
@@ -367,19 +372,9 @@ impl<'a> Executor<'a> {
         }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
-            pl.instantiate(self.codecs, &ctx)?;
+            pl.instantiate(self.codecs, &ctx, &self.filters)?;
         }
-        let out_streams: Vec<StreamInfo> = pipelines
-            .iter()
-            .enumerate()
-            .map(|(i, pl)| StreamInfo {
-                index: i as u32,
-                time_base: pl.output_time_base(),
-                duration: None,
-                start_time: Some(0),
-                params: pl.output_params().clone(),
-            })
-            .collect();
+        let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
         staged::run_pipelined(pipelines, dmx_by_uri, sink, out_streams)
     }
@@ -430,7 +425,6 @@ impl<'a> Executor<'a> {
 pub(crate) enum StageSpec {
     Decode,
     Filter {
-        kind: crate::dag::FilterKind,
         name: String,
         params: serde_json::Value,
     },
@@ -467,25 +461,78 @@ pub(crate) struct TrackRuntime {
     pub(crate) frame_stages: Vec<FrameStage>,
     pub(crate) encoder: Option<Box<dyn Encoder>>,
     pub(crate) encoder_time_base: Option<TimeBase>,
+    /// Additional output-stream descriptors synthesised for multi-port
+    /// filters on this track (e.g. spectrogram's video-port).
+    /// Each extra gets its own [`StreamInfo`] in the sink's `start()`
+    /// call, and extra-port frames emitted by `push`/`flush` flow
+    /// straight into the sink tagged with their [`MediaType`].
+    pub(crate) extra_output_streams: Vec<StreamInfo>,
+    /// Per-filter-stage count of extra (non-primary) output ports.
+    /// Parallel to `frame_stages` but only lists Filter stages — a
+    /// PixConvert stage contributes nothing. Used by the staged
+    /// runner to allocate stable stream indices for each filter's
+    /// extras.
+    pub(crate) extra_output_port_counts: Vec<u32>,
+    /// Global index of this track's first auto-attached extra stream
+    /// in the sink's final [`StreamInfo`] list. Populated by
+    /// [`build_output_streams`] before the pipelined runner spawns.
+    pub(crate) extras_base_index: u32,
 }
 
-pub(crate) enum RuntimeFilter {
-    #[cfg(feature = "audio_filter")]
-    Audio(Box<dyn oxideav_audio_filter::AudioFilter>),
-    #[cfg(feature = "image_filter")]
-    Video(Box<dyn oxideav_image_filter::ImageFilter>),
-    #[allow(dead_code)] // only constructed when relevant filter features are disabled
-    Unsupported(String),
+/// A runtime filter instance in `StreamFilter` form. Obtained from the
+/// [`FilterRegistry`]; the executor collects emitted frames on every
+/// output port and routes them to downstream stages (port 0) or
+/// directly to the sink (ports ≥ 1).
+pub(crate) struct RuntimeFilter {
+    pub(crate) inner: Box<dyn StreamFilter>,
 }
 
 /// A per-frame stage in the decoded-frame pipeline. Decoder output
 /// flows through these in order to reach the encoder.
 pub(crate) enum FrameStage {
+    /// Named filter. Multi-port filters (e.g. spectrogram)
+    /// emit on port 0 *and* extra ports; the executor separates the
+    /// two streams after `push` returns.
     Filter(RuntimeFilter),
     /// Pixel-format conversion — calls
     /// [`oxideav_pixfmt::convert`] on each video frame. Non-video
     /// frames pass through unchanged.
     PixConvert(PixelFormat),
+}
+
+/// Classification of a filter's emitted frames. `primary` goes to the
+/// next frame stage (or the encoder); `extras` carry `(media_kind,
+/// Frame)` pairs destined for the sink as auto-attached streams.
+#[derive(Default)]
+pub(crate) struct FilterEmissions {
+    pub(crate) primary: Vec<Frame>,
+    pub(crate) extras: Vec<(MediaType, Frame)>,
+}
+
+/// In-place `FilterContext` used by the executor. Collects emitted
+/// frames into an `EmissionBuffer` so the stage worker can route them
+/// after `push`/`flush` returns.
+pub(crate) struct CollectCtx<'a> {
+    pub(crate) port_kinds: &'a [MediaType],
+    pub(crate) buf: FilterEmissions,
+}
+
+impl<'a> FilterContext for CollectCtx<'a> {
+    fn emit(&mut self, port: usize, frame: Frame) -> Result<()> {
+        match port {
+            0 => self.buf.primary.push(frame),
+            p if p < self.port_kinds.len() => {
+                self.buf.extras.push((self.port_kinds[p], frame));
+            }
+            p => {
+                return Err(Error::invalid(format!(
+                    "filter emitted on port {p} but declared only {} ports",
+                    self.port_kinds.len()
+                )));
+            }
+        }
+        Ok(())
+    }
 }
 
 impl TrackRuntime {
@@ -509,6 +556,9 @@ impl TrackRuntime {
             frame_stages: Vec::new(),
             encoder: None,
             encoder_time_base: None,
+            extra_output_streams: Vec::new(),
+            extra_output_port_counts: Vec::new(),
+            extras_base_index: 0,
         }
     }
 
@@ -516,10 +566,16 @@ impl TrackRuntime {
         &mut self,
         codecs: &CodecRegistry,
         ctx: &ExecutionContext,
+        filters: &FilterRegistry,
     ) -> Result<()> {
         // Track running frame format through the stage stack so the encoder
         // can be constructed with a realistic parameter set.
         let mut running = self.input_params.clone();
+        // Track the running PortSpec that feeds into the next filter. For
+        // audio tracks this starts from `input_params`; for video from
+        // `input_params`. We rebuild it each iteration so chained filters
+        // see the immediately-upstream port, not the original demuxer port.
+        let mut extra_stream_index_base: u32 = 1;
         for stage in &self.stages {
             match stage {
                 StageSpec::Decode => {
@@ -529,41 +585,46 @@ impl TrackRuntime {
                         self.decoder = Some(d);
                     }
                 }
-                StageSpec::Filter { kind, name, params } => {
-                    let src_rate = running.sample_rate.unwrap_or(48_000);
-                    let f = build_filter(kind.clone(), name, params, src_rate)?;
-                    self.frame_stages.push(FrameStage::Filter(f));
-                    // Propagate filter output params into `running` so the
-                    // downstream encoder is instantiated with the right
-                    // dimensions / rate / pixel format.
-                    if let Some(new_rate) = params.get("rate").and_then(|r| r.as_u64()) {
-                        running.sample_rate = Some(new_rate as u32);
+                StageSpec::Filter { name, params } => {
+                    let in_port = port_spec_from_params(&running, self.input_time_base);
+                    let filter = filters.make(name, params, std::slice::from_ref(&in_port))?;
+                    // Inspect output ports: port 0 feeds downstream; every
+                    // extra port becomes an auto-attached output stream.
+                    let out_ports = filter.output_ports().to_vec();
+                    let in_ports = filter.input_ports().to_vec();
+                    if out_ports.is_empty() {
+                        return Err(Error::invalid(format!(
+                            "filter '{name}' declares zero output ports"
+                        )));
                     }
-                    // Video filters that change frame dimensions — resize
-                    // and pixfmt-target-with-resize. Bare `width` /
-                    // `height` params are the convention (see
-                    // `build_video_filter`).
-                    if let Some(w) = params.get("width").and_then(|w| w.as_u64()) {
-                        running.width = Some(w as u32);
+                    // Port 0 rewrites `running` when the filter's port-0
+                    // output differs from its port-0 input (i.e. the filter
+                    // is actually changing shape — resample, resize, edge).
+                    // Pass-through port-0 (spectrogram audio, volume) leaves
+                    // `running` untouched so encoders see the actual source
+                    // params rather than a filter's placeholder.
+                    let input_matches_output = !in_ports.is_empty()
+                        && port_params_equal(&in_ports[0].params, &out_ports[0].params);
+                    if !input_matches_output {
+                        running = port_params_to_codec_params(&out_ports[0].params, &running);
                     }
-                    if let Some(h) = params.get("height").and_then(|h| h.as_u64()) {
-                        running.height = Some(h as u32);
+                    // Register StreamInfo for each extra port so the sink
+                    // sees them before any frame flows.
+                    for (i, port) in out_ports.iter().enumerate().skip(1) {
+                        let (params_cp, time_base) = extra_port_stream(&port.params);
+                        self.extra_output_streams.push(StreamInfo {
+                            index: extra_stream_index_base + (i - 1) as u32,
+                            time_base,
+                            duration: None,
+                            start_time: Some(0),
+                            params: params_cp,
+                        });
                     }
-                    // Video filter that changes the pixel format (pixfmt).
-                    if let Some(fmt_str) = params.get("format").and_then(|f| f.as_str()) {
-                        if let Ok(pf) = crate::schema::parse_pixel_format(fmt_str) {
-                            running.pixel_format = Some(pf);
-                        }
-                    }
-                    // Edge filter collapses any input to a single-plane
-                    // luma output.
-                    let bare = name
-                        .strip_prefix("video.")
-                        .or_else(|| name.strip_prefix("v:"))
-                        .unwrap_or(name);
-                    if bare == "edge" {
-                        running.pixel_format = Some(PixelFormat::Gray8);
-                    }
+                    let extra_count = out_ports.len().saturating_sub(1) as u32;
+                    extra_stream_index_base += extra_count;
+                    self.extra_output_port_counts.push(extra_count);
+                    self.frame_stages
+                        .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
                 }
                 StageSpec::Convert { target } => {
                     self.frame_stages.push(FrameStage::PixConvert(*target));
@@ -710,8 +771,14 @@ impl TrackRuntime {
         for stage in &mut self.frame_stages {
             let mut next = Vec::new();
             for f in frames {
-                let produced = run_frame_stage(stage, f)?;
-                next.extend(produced);
+                let produced = run_frame_stage_emit(stage, f)?;
+                // Extras (multi-port filter emissions) go straight to the
+                // sink as auto-attached streams.
+                for (kind, frm) in produced.extras {
+                    sink.write_frame(kind, &frm)?;
+                    stats.frames_written += 1;
+                }
+                next.extend(produced.primary);
             }
             frames = next;
         }
@@ -766,18 +833,28 @@ impl TrackRuntime {
         // stages downstream.
         let mut tail: Vec<Frame> = Vec::new();
         for i in 0..self.frame_stages.len() {
-            let mut flushed = flush_frame_stage(&mut self.frame_stages[i])?;
+            let flushed = flush_frame_stage_emit(&mut self.frame_stages[i])?;
+            // Extras from a flushing filter go straight to the sink.
+            for (kind, frm) in flushed.extras {
+                sink.write_frame(kind, &frm)?;
+                stats.frames_written += 1;
+            }
+            let mut primary = flushed.primary;
             // Push the flushed frames through the remaining downstream
             // stages so a later pixel-format convert still sees them.
             for j in (i + 1)..self.frame_stages.len() {
                 let mut next: Vec<Frame> = Vec::new();
-                for f in flushed.drain(..) {
-                    let produced = run_frame_stage(&mut self.frame_stages[j], f)?;
-                    next.extend(produced);
+                for f in primary.drain(..) {
+                    let produced = run_frame_stage_emit(&mut self.frame_stages[j], f)?;
+                    for (kind, frm) in produced.extras {
+                        sink.write_frame(kind, &frm)?;
+                        stats.frames_written += 1;
+                    }
+                    next.extend(produced.primary);
                 }
-                flushed = next;
+                primary = next;
             }
-            tail.extend(flushed);
+            tail.extend(primary);
         }
         if let Some(enc) = &mut self.encoder {
             for frame in tail {
@@ -833,234 +910,235 @@ pub(crate) fn drain_decoder(
     }
 }
 
-/// Drive one frame through a [`FrameStage`]. Pixel-format converts on
-/// a non-video frame pass through unchanged so tracks that mix audio
-/// and video (rare today, but cheap to support) don't bounce off the
-/// convert stage.
-pub(crate) fn run_frame_stage(stage: &mut FrameStage, frame: Frame) -> Result<Vec<Frame>> {
+/// Drive one frame through a [`FrameStage`] and return the full
+/// primary + extras emission set. Pixel-format converts on a
+/// non-video frame pass through unchanged; multi-port filters
+/// (spectrogram) put port-1+ frames into `extras` for the caller to
+/// route straight to the sink as an auto-attached output stream.
+pub(crate) fn run_frame_stage_emit(
+    stage: &mut FrameStage,
+    frame: Frame,
+) -> Result<FilterEmissions> {
     match stage {
         FrameStage::Filter(f) => run_filter(f, frame),
         FrameStage::PixConvert(target) => match frame {
             Frame::Video(v) => {
                 let out = pixfmt_convert(&v, *target, &ConvertOptions::default())?;
-                Ok(vec![Frame::Video(out)])
+                Ok(FilterEmissions {
+                    primary: vec![Frame::Video(out)],
+                    extras: Vec::new(),
+                })
             }
-            other => Ok(vec![other]),
+            other => Ok(FilterEmissions {
+                primary: vec![other],
+                extras: Vec::new(),
+            }),
         },
     }
 }
 
 /// Flush any residual frames held inside a [`FrameStage`]. Audio
 /// filters may have tail samples; pixel-format converts are stateless
-/// and return nothing.
-pub(crate) fn flush_frame_stage(stage: &mut FrameStage) -> Result<Vec<Frame>> {
+/// and return an empty [`FilterEmissions`].
+pub(crate) fn flush_frame_stage_emit(stage: &mut FrameStage) -> Result<FilterEmissions> {
     match stage {
         FrameStage::Filter(f) => flush_filter(f),
-        FrameStage::PixConvert(_) => Ok(Vec::new()),
+        FrameStage::PixConvert(_) => Ok(FilterEmissions::default()),
     }
 }
 
-pub(crate) fn run_filter(filter: &mut RuntimeFilter, frame: Frame) -> Result<Vec<Frame>> {
-    match filter {
-        #[cfg(feature = "audio_filter")]
-        RuntimeFilter::Audio(f) => match frame {
-            Frame::Audio(a) => {
-                let outs = f.process(&a)?;
-                Ok(outs.into_iter().map(Frame::Audio).collect())
-            }
-            _ => Err(Error::invalid(
-                "job: audio filter received a non-audio frame",
-            )),
-        },
-        #[cfg(feature = "image_filter")]
-        RuntimeFilter::Video(f) => match frame {
-            Frame::Video(v) => {
-                let out = f.apply(&v)?;
-                Ok(vec![Frame::Video(out)])
-            }
-            _ => Err(Error::invalid(
-                "job: video filter received a non-video frame",
-            )),
-        },
-        RuntimeFilter::Unsupported(name) => Err(Error::unsupported(format!(
-            "job: filter {name} is not supported at execution time"
-        ))),
-    }
-}
-
-pub(crate) fn flush_filter(filter: &mut RuntimeFilter) -> Result<Vec<Frame>> {
-    match filter {
-        #[cfg(feature = "audio_filter")]
-        RuntimeFilter::Audio(f) => {
-            let outs = f.flush()?;
-            Ok(outs.into_iter().map(Frame::Audio).collect())
-        }
-        // Video filters are stateless: nothing to flush.
-        #[cfg(feature = "image_filter")]
-        RuntimeFilter::Video(_) => Ok(Vec::new()),
-        RuntimeFilter::Unsupported(_) => Ok(Vec::new()),
-    }
-}
-
-fn build_filter(
-    kind: crate::dag::FilterKind,
-    name: &str,
-    params: &serde_json::Value,
-    src_rate: u32,
-) -> Result<RuntimeFilter> {
-    use crate::dag::FilterKind;
-    match kind {
-        FilterKind::Video => {
-            #[cfg(feature = "image_filter")]
-            {
-                let f = build_video_filter(name, params)?;
-                Ok(RuntimeFilter::Video(f))
-            }
-            #[cfg(not(feature = "image_filter"))]
-            {
-                let _ = (name, params);
-                Ok(RuntimeFilter::Unsupported(
-                    "video filters disabled at compile time (enable the `image_filter` feature)"
-                        .into(),
-                ))
-            }
-        }
-        FilterKind::Audio => {
-            #[cfg(feature = "audio_filter")]
-            {
-                let f = build_audio_filter(name, params, src_rate)?;
-                Ok(RuntimeFilter::Audio(f))
-            }
-            #[cfg(not(feature = "audio_filter"))]
-            {
-                let _ = (name, params, src_rate);
-                Ok(RuntimeFilter::Unsupported(
-                    "audio filters disabled at compile time (enable the `audio_filter` feature)"
-                        .into(),
-                ))
-            }
-        }
-    }
-}
-
-/// Build a runtime video filter from a name + JSON parameter block.
-///
-/// Names match the ImageMagick-style `oxideav convert` vocabulary:
-/// `resize`, `blur`, `edge`. Unknown names return `Unsupported`.
-#[cfg(feature = "image_filter")]
-fn build_video_filter(
-    name: &str,
-    params: &serde_json::Value,
-) -> Result<Box<dyn oxideav_image_filter::ImageFilter>> {
-    use oxideav_image_filter::{Blur, Edge, Interpolation, Planes, Resize};
-    let p = params.as_object();
-    let get_u64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_u64());
-    let get_f64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_f64());
-    let get_str = |k: &str| {
-        p.and_then(|m| m.get(k))
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
+pub(crate) fn run_filter(filter: &mut RuntimeFilter, frame: Frame) -> Result<FilterEmissions> {
+    let port_kinds: Vec<MediaType> = filter.inner.output_ports().iter().map(|p| p.kind).collect();
+    let mut ctx = CollectCtx {
+        port_kinds: &port_kinds,
+        buf: FilterEmissions::default(),
     };
-    // Accept both `video.resize` (kind-tagged, routed to Video via
-    // dag.rs) and bare `resize` (for callers who set kind manually).
-    let bare = name
-        .strip_prefix("video.")
-        .or_else(|| name.strip_prefix("v:"))
-        .unwrap_or(name);
-    match bare {
-        "resize" => {
-            let w = get_u64("width")
-                .ok_or_else(|| Error::invalid("job: filter 'resize' needs unsigned `width`"))?
-                as u32;
-            let h = get_u64("height")
-                .ok_or_else(|| Error::invalid("job: filter 'resize' needs unsigned `height`"))?
-                as u32;
-            let interp = match get_str("interpolation").as_deref() {
-                Some("nearest") => Interpolation::Nearest,
-                Some("bilinear") | None => Interpolation::Bilinear,
-                Some(other) => {
-                    return Err(Error::invalid(format!(
-                        "job: filter 'resize': unknown interpolation '{other}' \
-                         (expected 'nearest' or 'bilinear')"
-                    )));
-                }
-            };
-            Ok(Box::new(Resize::new(w, h).with_interpolation(interp)))
-        }
-        "blur" => {
-            let radius = get_u64("radius").unwrap_or(3) as u32;
-            let sigma = get_f64("sigma").map(|v| v as f32);
-            let planes = match get_str("planes").as_deref() {
-                Some("all") | None => Planes::All,
-                Some("luma") => Planes::Luma,
-                Some("chroma") => Planes::Chroma,
-                Some(other) => {
-                    return Err(Error::invalid(format!(
-                        "job: filter 'blur': unknown planes '{other}' \
-                         (expected 'all', 'luma', or 'chroma')"
-                    )));
-                }
-            };
-            let mut f = Blur::new(radius).with_planes(planes);
-            if let Some(s) = sigma {
-                f = f.with_sigma(s);
-            }
-            Ok(Box::new(f))
-        }
-        "edge" => Ok(Box::new(Edge::new())),
-        other => Err(Error::unsupported(format!(
-            "job: video filter '{other}' — not implemented"
-        ))),
+    filter.inner.push(&mut ctx, 0, &frame)?;
+    Ok(ctx.buf)
+}
+
+pub(crate) fn flush_filter(filter: &mut RuntimeFilter) -> Result<FilterEmissions> {
+    let port_kinds: Vec<MediaType> = filter.inner.output_ports().iter().map(|p| p.kind).collect();
+    let mut ctx = CollectCtx {
+        port_kinds: &port_kinds,
+        buf: FilterEmissions::default(),
+    };
+    filter.inner.flush(&mut ctx)?;
+    Ok(ctx.buf)
+}
+
+/// True when two [`PortParams`] describe the same concrete shape (same
+/// sample rate/channels/format for audio, same dimensions/pix-fmt/time
+/// base for video). Used to detect pass-through port 0 so we don't
+/// overwrite the running `CodecParameters` with a filter's placeholder
+/// input params.
+pub(crate) fn port_params_equal(a: &PortParams, b: &PortParams) -> bool {
+    match (a, b) {
+        (
+            PortParams::Audio {
+                sample_rate: ar,
+                channels: ac,
+                format: af,
+            },
+            PortParams::Audio {
+                sample_rate: br,
+                channels: bc,
+                format: bf,
+            },
+        ) => ar == br && ac == bc && af == bf,
+        (
+            PortParams::Video {
+                width: aw,
+                height: ah,
+                format: af,
+                time_base: atb,
+            },
+            PortParams::Video {
+                width: bw,
+                height: bh,
+                format: bf,
+                time_base: btb,
+            },
+        ) => aw == bw && ah == bh && af == bf && atb == btb,
+        (PortParams::Subtitle, PortParams::Subtitle) => true,
+        (PortParams::Metadata, PortParams::Metadata) => true,
+        _ => false,
     }
 }
 
-#[cfg(feature = "audio_filter")]
-fn build_audio_filter(
-    name: &str,
-    params: &serde_json::Value,
-    src_rate: u32,
-) -> Result<Box<dyn oxideav_audio_filter::AudioFilter>> {
-    use oxideav_audio_filter::{NoiseGate, Resample, Volume};
-    let p = params.as_object();
-    let get_f64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_f64());
-    let get_u64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_u64());
-    match name {
-        "volume" => {
-            // Accept either `gain` (linear) or `gain_db`; convert the latter to
-            // the linear form the constructor expects.
-            if let Some(db) = get_f64("gain_db") {
-                let linear = 10f32.powf((db as f32) / 20.0);
-                Ok(Box::new(Volume::new(linear)))
-            } else if let Some(g) = get_f64("gain") {
-                Ok(Box::new(Volume::new(g as f32)))
-            } else {
-                Err(Error::invalid(
-                    "job: filter 'volume' needs `gain` or `gain_db`",
-                ))
-            }
-        }
-        "noise_gate" => {
-            let threshold_db = get_f64("threshold_db").unwrap_or(-40.0) as f32;
-            let attack_ms = get_f64("attack_ms").unwrap_or(10.0) as f32;
-            let release_ms = get_f64("release_ms").unwrap_or(100.0) as f32;
-            let hold_ms = get_f64("hold_ms").unwrap_or(50.0) as f32;
-            Ok(Box::new(NoiseGate::new(
-                threshold_db,
-                attack_ms,
-                release_ms,
-                hold_ms,
-            )))
-        }
-        "resample" => {
-            let dst_rate = get_u64("rate").ok_or_else(|| {
-                Error::invalid("job: filter 'resample' needs `rate` (output sample rate)")
-            })?;
-            Ok(Box::new(Resample::new(src_rate, dst_rate as u32)?))
-        }
-        other => Err(Error::unsupported(format!(
-            "job: unknown audio filter '{other}'"
-        ))),
+/// Derive a [`PortSpec`] describing the current running format inside
+/// the stage stack. Only Audio / Video variants are produced today.
+pub(crate) fn port_spec_from_params(cp: &CodecParameters, tb: TimeBase) -> PortSpec {
+    match cp.media_type {
+        MediaType::Audio => PortSpec::audio(
+            "in",
+            cp.sample_rate.unwrap_or(48_000),
+            cp.channels.unwrap_or(2),
+            cp.sample_format.unwrap_or(SampleFormat::F32),
+        ),
+        _ => PortSpec::video(
+            "in",
+            cp.width.unwrap_or(0),
+            cp.height.unwrap_or(0),
+            cp.pixel_format.unwrap_or(PixelFormat::Yuv420P),
+            tb,
+        ),
     }
+}
+
+/// Merge a filter output port's [`PortParams`] into a running
+/// [`CodecParameters`]. The codec id is left unchanged — it describes
+/// *packet-level* codec, while the port describes *frame-level*
+/// shape. Downstream encoders overwrite codec_id from the track
+/// spec's `codec` field.
+pub(crate) fn port_params_to_codec_params(
+    port: &PortParams,
+    prev: &CodecParameters,
+) -> CodecParameters {
+    let mut cp = prev.clone();
+    match port {
+        PortParams::Audio {
+            sample_rate,
+            channels,
+            format,
+        } => {
+            cp.media_type = MediaType::Audio;
+            cp.sample_rate = Some(*sample_rate);
+            cp.channels = Some(*channels);
+            cp.sample_format = Some(*format);
+        }
+        PortParams::Video {
+            width,
+            height,
+            format,
+            ..
+        } => {
+            cp.media_type = MediaType::Video;
+            cp.width = Some(*width);
+            cp.height = Some(*height);
+            cp.pixel_format = Some(*format);
+        }
+        PortParams::Subtitle => cp.media_type = MediaType::Subtitle,
+        PortParams::Metadata => cp.media_type = MediaType::Data,
+    }
+    cp
+}
+
+/// Build a `(CodecParameters, TimeBase)` pair for an extra (non-primary)
+/// filter output port. The sink sees this as a raw frame stream —
+/// `codec_id` is set to `"rawaudio"` / `"rawvideo"` matching the
+/// convention used by `@display`.
+pub(crate) fn extra_port_stream(port: &PortParams) -> (CodecParameters, TimeBase) {
+    match port {
+        PortParams::Audio {
+            sample_rate,
+            channels,
+            format,
+        } => {
+            let mut cp = CodecParameters::audio(CodecId::new("rawaudio"));
+            cp.sample_rate = Some(*sample_rate);
+            cp.channels = Some(*channels);
+            cp.sample_format = Some(*format);
+            let tb = TimeBase::new(1, (*sample_rate as i64).max(1));
+            (cp, tb)
+        }
+        PortParams::Video {
+            width,
+            height,
+            format,
+            time_base,
+        } => {
+            let mut cp = CodecParameters::video(CodecId::new("rawvideo"));
+            cp.width = Some(*width);
+            cp.height = Some(*height);
+            cp.pixel_format = Some(*format);
+            // Frame rate is the reciprocal of the time base.
+            let tb_rat = time_base.as_rational();
+            cp.frame_rate = Some(Rational::new(tb_rat.den, tb_rat.num));
+            (cp, *time_base)
+        }
+        PortParams::Subtitle => (
+            CodecParameters::audio(CodecId::new("rawsubtitle")),
+            TimeBase::new(1, 1000),
+        ),
+        PortParams::Metadata => (
+            CodecParameters::audio(CodecId::new("rawdata")),
+            TimeBase::new(1, 1),
+        ),
+    }
+}
+
+/// Assemble the final sink-facing [`StreamInfo`] list from a set of
+/// track runtimes. Primary streams come first (one per track in
+/// declaration order), followed by any auto-attached extras declared
+/// by multi-port filters. Indices are renumbered to be consecutive so
+/// the sink sees a dense 0..N layout.
+///
+/// Also stamps `extras_base_index` on each [`TrackRuntime`] so the
+/// staged runner can tag extra-port frames with the right stream
+/// index at emission time.
+pub(crate) fn build_output_streams(pipelines: &mut [TrackRuntime]) -> Vec<StreamInfo> {
+    let mut out = Vec::with_capacity(pipelines.len());
+    for (i, pl) in pipelines.iter().enumerate() {
+        out.push(StreamInfo {
+            index: i as u32,
+            time_base: pl.output_time_base(),
+            duration: None,
+            start_time: Some(0),
+            params: pl.output_params().clone(),
+        });
+    }
+    let mut next_idx = pipelines.len() as u32;
+    for pl in pipelines {
+        pl.extras_base_index = next_idx;
+        for extra in &pl.extra_output_streams {
+            let mut e = extra.clone();
+            e.index = next_idx;
+            next_idx += 1;
+            out.push(e);
+        }
+    }
+    out
 }
 
 pub(crate) fn select_stream(streams: &[StreamInfo], sel: &ResolvedSelector) -> Result<u32> {
@@ -1125,60 +1203,7 @@ mod tests {
         assert_eq!(ext_from_uri("/no/ext"), None);
     }
 
-    #[cfg(feature = "image_filter")]
-    #[test]
-    fn build_video_filter_resize_applies_to_frame() {
-        use oxideav_core::{PixelFormat, TimeBase, VideoFrame, VideoPlane};
-        use serde_json::json;
-        let f = build_video_filter(
-            "resize",
-            &json!({"width": 8, "height": 4, "interpolation": "bilinear"}),
-        )
-        .unwrap();
-        let y: Vec<u8> = (0..16 * 16).map(|i| (i % 256) as u8).collect();
-        let u = vec![77u8; 8 * 8];
-        let v = vec![128u8; 8 * 8];
-        let frame = VideoFrame {
-            format: PixelFormat::Yuv420P,
-            width: 16,
-            height: 16,
-            pts: None,
-            time_base: TimeBase::new(1, 1),
-            planes: vec![
-                VideoPlane {
-                    stride: 16,
-                    data: y,
-                },
-                VideoPlane { stride: 8, data: u },
-                VideoPlane { stride: 8, data: v },
-            ],
-        };
-        let out = f.apply(&frame).unwrap();
-        assert_eq!(out.width, 8);
-        assert_eq!(out.height, 4);
-    }
-
-    #[cfg(feature = "image_filter")]
-    #[test]
-    fn build_video_filter_unknown_name_is_unsupported() {
-        use serde_json::json;
-        let res = build_video_filter("not-a-filter", &json!({}));
-        let err = match res {
-            Ok(_) => panic!("expected Unsupported error"),
-            Err(e) => e,
-        };
-        assert!(format!("{err:?}").contains("not implemented"));
-    }
-
-    #[cfg(feature = "image_filter")]
-    #[test]
-    fn build_video_filter_rejects_missing_width() {
-        use serde_json::json;
-        let res = build_video_filter("resize", &json!({"height": 8}));
-        let err = match res {
-            Ok(_) => panic!("expected Invalid error"),
-            Err(e) => e,
-        };
-        assert!(format!("{err:?}").to_lowercase().contains("width"));
-    }
+    // Legacy `build_video_filter` / `build_audio_filter` unit tests
+    // were removed when filter dispatch moved to `FilterRegistry`.
+    // See `filter_registry::tests::*` for the current equivalents.
 }

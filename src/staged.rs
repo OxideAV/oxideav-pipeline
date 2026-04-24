@@ -32,8 +32,8 @@ use oxideav_container::Demuxer;
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
 
 use crate::executor::{
-    drain_decoder, flush_frame_stage, run_frame_stage, ExecutorStats, FrameStage, JobSink,
-    TrackRuntime,
+    drain_decoder, flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage,
+    JobSink, TrackRuntime,
 };
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -201,6 +201,16 @@ pub(crate) fn run_pipelined(
             }));
         }
 
+        // Count extras as we go: the first filter stage on this track
+        // starts at the track's `extras_base_for_this_track`, the next
+        // filter picks up where the previous left off. Non-filter
+        // stages (PixConvert) never emit extras but still advance the
+        // index so downstream sinks remain consistent.
+        let extras_base_for_track: u32 = pl.extras_base_index;
+        let mut running_extras_base = extras_base_for_track;
+        let extra_port_counts: Vec<u32> = pl.extra_output_port_counts.clone().into_iter().collect();
+        let mut extra_counts_iter = extra_port_counts.into_iter();
+
         let mut upstream: Receiver<Msg<Frame>> = frame0_rx;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
             let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(FRAME_CAP);
@@ -210,8 +220,31 @@ pub(crate) fn run_pipelined(
             };
             let name = format!("{label}-{track_idx}-{fidx}");
             let abort_f = abort.clone();
+
+            // Wire an extras channel only for Filter stages that
+            // declared extra output ports.
+            let (stage_extras_tx, stage_extras_base) = if matches!(stage, FrameStage::Filter(_)) {
+                match extra_counts_iter.next() {
+                    Some(n) if n > 0 => {
+                        let base = running_extras_base;
+                        running_extras_base += n;
+                        (Some(out_tx.clone()), base)
+                    }
+                    _ => (None, 0),
+                }
+            } else {
+                (None, 0)
+            };
+
             handles.push(spawn_stage(abort_f, name, move |abort| {
-                run_frame_stage_worker(stage, upstream, ftx, abort)
+                run_frame_stage_worker(
+                    stage,
+                    upstream,
+                    ftx,
+                    stage_extras_tx,
+                    stage_extras_base,
+                    abort,
+                )
             }));
             upstream = frx;
         }
@@ -449,10 +482,17 @@ fn run_decode_stage(
 /// Frame-stage worker: consumes frames, runs them through an audio
 /// filter or pixel-format conversion, and forwards to the next stage.
 /// Used for both `FrameStage::Filter` and `FrameStage::PixConvert`.
+///
+/// If the stage is a multi-port filter, per-extra-port frames are sent
+/// straight to the output channel tagged with the extra stream's
+/// global index (starting at `extras_base`) — they bypass the rest of
+/// the frame-stage chain and land on the sink directly.
 fn run_frame_stage_worker(
     mut stage: FrameStage,
     rx: Receiver<Msg<Frame>>,
     tx: SyncSender<Msg<Frame>>,
+    extras_tx: Option<SyncSender<Msg<OutputItem>>>,
+    extras_base: u32,
     abort: Arc<AbortState>,
 ) -> Result<()> {
     loop {
@@ -461,8 +501,9 @@ fn run_frame_stage_worker(
         }
         match rx.recv() {
             Ok(Msg::Data(frame)) => {
-                let outs = run_frame_stage(&mut stage, frame)?;
-                for o in outs {
+                let emissions = run_frame_stage_emit(&mut stage, frame)?;
+                dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
+                for o in emissions.primary {
                     if tx.send(Msg::Data(o)).is_err() {
                         abort.abort.store(true, Ordering::SeqCst);
                         break;
@@ -470,8 +511,9 @@ fn run_frame_stage_worker(
                 }
             }
             Ok(Msg::Eof) => {
-                let outs = flush_frame_stage(&mut stage)?;
-                for o in outs {
+                let emissions = flush_frame_stage_emit(&mut stage)?;
+                dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
+                for o in emissions.primary {
                     let _ = tx.send(Msg::Data(o));
                 }
                 break;
@@ -481,6 +523,37 @@ fn run_frame_stage_worker(
     }
     let _ = tx.send(Msg::Eof);
     Ok(())
+}
+
+/// Push `emissions.extras` onto the sink's output channel (if present).
+/// Extras are tagged with indices starting at `extras_base`; port 1
+/// becomes `extras_base`, port 2 `extras_base + 1`, etc.
+fn dispatch_extras(
+    emissions: &crate::executor::FilterEmissions,
+    extras_tx: &Option<SyncSender<Msg<OutputItem>>>,
+    extras_base: u32,
+    abort: &Arc<AbortState>,
+) {
+    let Some(tx) = extras_tx else {
+        return;
+    };
+    // The extras vec carries entries in port-1,2,3,… order as emitted
+    // by the filter, but a single `push` may emit multiple frames per
+    // port. We can't recover the port number from the (kind, frame)
+    // tuple alone, so we tag every extra with `extras_base` + its
+    // media-kind slot. For the single-extra-port case (spectrogram)
+    // this is equivalent to `extras_base`.
+    for (kind, frm) in &emissions.extras {
+        let item = OutputItem {
+            track_index: extras_base,
+            kind: *kind,
+            payload: OutputPayload::Frame(frm.clone()),
+        };
+        if tx.send(Msg::Data(item)).is_err() {
+            abort.abort.store(true, Ordering::SeqCst);
+            return;
+        }
+    }
 }
 
 /// Encoder stage: frames -> packets -> OutputItem.
