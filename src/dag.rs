@@ -13,7 +13,8 @@ use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, Result};
 
 use crate::schema::{
-    parse_pixel_format, Job, OutputSpec, SourceRef, StreamSelector, TrackInput, TrackSpec,
+    is_reserved_sink, parse_pixel_format, Job, OutputSpec, SourceRef, StreamSelector, TrackInput,
+    TrackSpec,
 };
 
 /// Opaque index into `Dag::nodes`.
@@ -201,10 +202,18 @@ impl Job {
         let (top, copy) = match (&track.codec, self.is_packet_producing(dag, upstream)?) {
             (None, true) => (upstream, true),
             (None, false) => {
-                return Err(Error::invalid(format!(
-                    "job: {ctx}: track ends with frames but has no `codec` \
-                     (add a codec or remove the terminating filter)"
-                )));
+                // Raw-frame path — legal only when targeting a reserved
+                // sink (`@display`, `@out`, `@null`, `@stdout`) that
+                // consumes `Frame` values directly. File outputs still
+                // need an encoder so the muxer sees real packets.
+                if is_reserved_sink(ctx) {
+                    (upstream, false)
+                } else {
+                    return Err(Error::invalid(format!(
+                        "job: {ctx}: track ends with frames but has no `codec` \
+                         (add a codec or remove the terminating filter)"
+                    )));
+                }
             }
             (Some(c), true) => {
                 // Need to decode first, then encode.
