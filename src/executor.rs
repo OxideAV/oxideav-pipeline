@@ -533,11 +533,36 @@ impl TrackRuntime {
                     let src_rate = running.sample_rate.unwrap_or(48_000);
                     let f = build_filter(kind.clone(), name, params, src_rate)?;
                     self.frame_stages.push(FrameStage::Filter(f));
-                    // Filter output params are assumed to match input for now;
-                    // resample filters override via explicit rate params we
-                    // surface before handing to the encoder below.
+                    // Propagate filter output params into `running` so the
+                    // downstream encoder is instantiated with the right
+                    // dimensions / rate / pixel format.
                     if let Some(new_rate) = params.get("rate").and_then(|r| r.as_u64()) {
                         running.sample_rate = Some(new_rate as u32);
+                    }
+                    // Video filters that change frame dimensions — resize
+                    // and pixfmt-target-with-resize. Bare `width` /
+                    // `height` params are the convention (see
+                    // `build_video_filter`).
+                    if let Some(w) = params.get("width").and_then(|w| w.as_u64()) {
+                        running.width = Some(w as u32);
+                    }
+                    if let Some(h) = params.get("height").and_then(|h| h.as_u64()) {
+                        running.height = Some(h as u32);
+                    }
+                    // Video filter that changes the pixel format (pixfmt).
+                    if let Some(fmt_str) = params.get("format").and_then(|f| f.as_str()) {
+                        if let Ok(pf) = crate::schema::parse_pixel_format(fmt_str) {
+                            running.pixel_format = Some(pf);
+                        }
+                    }
+                    // Edge filter collapses any input to a single-plane
+                    // luma output.
+                    let bare = name
+                        .strip_prefix("video.")
+                        .or_else(|| name.strip_prefix("v:"))
+                        .unwrap_or(name);
+                    if bare == "edge" {
+                        running.pixel_format = Some(PixelFormat::Gray8);
                     }
                 }
                 StageSpec::Convert { target } => {
@@ -936,7 +961,13 @@ fn build_video_filter(
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     };
-    match name {
+    // Accept both `video.resize` (kind-tagged, routed to Video via
+    // dag.rs) and bare `resize` (for callers who set kind manually).
+    let bare = name
+        .strip_prefix("video.")
+        .or_else(|| name.strip_prefix("v:"))
+        .unwrap_or(name);
+    match bare {
         "resize" => {
             let w = get_u64("width").ok_or_else(|| {
                 Error::invalid("job: filter 'resize' needs unsigned `width`")
