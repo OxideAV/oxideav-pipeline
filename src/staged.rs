@@ -338,6 +338,16 @@ pub(crate) fn run_pipelined(
 
     // Drain abort flag + wait for workers regardless of exit path.
     abort.abort.store(true, Ordering::SeqCst);
+    // Drop the mux-end receivers BEFORE joining workers. Upstream
+    // stages (copy / decode / filter / pix-convert / demux) may be
+    // blocked inside `SyncSender::send()` because the bounded
+    // channel is full — setting the abort flag alone doesn't wake
+    // them. Dropping the receivers turns every pending send into an
+    // `Err(SendError)`, the worker's `tx.send().is_err()` branch
+    // breaks its loop, and the cascade propagates up to the demuxer.
+    // Without this, `h.join()` below deadlocks on any abort-path
+    // exit (quit event, sink error, encoder fail).
+    drop(track_output_rx);
     for h in handles {
         let _ = h.join();
     }
