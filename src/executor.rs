@@ -25,9 +25,9 @@ use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 use oxideav_source::SourceRegistry;
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
-use crate::staged;
 use crate::schema::{is_reserved_sink, Job};
 use crate::sinks::{open_file_write, FileSink, NullSink};
+use crate::staged;
 
 /// A user-installable output sink. Implementations receive either raw
 /// packets (copy path) or decoded frames (transcode path without an
@@ -969,12 +969,12 @@ fn build_video_filter(
         .unwrap_or(name);
     match bare {
         "resize" => {
-            let w = get_u64("width").ok_or_else(|| {
-                Error::invalid("job: filter 'resize' needs unsigned `width`")
-            })? as u32;
-            let h = get_u64("height").ok_or_else(|| {
-                Error::invalid("job: filter 'resize' needs unsigned `height`")
-            })? as u32;
+            let w = get_u64("width")
+                .ok_or_else(|| Error::invalid("job: filter 'resize' needs unsigned `width`"))?
+                as u32;
+            let h = get_u64("height")
+                .ok_or_else(|| Error::invalid("job: filter 'resize' needs unsigned `height`"))?
+                as u32;
             let interp = match get_str("interpolation").as_deref() {
                 Some("nearest") => Interpolation::Nearest,
                 Some("bilinear") | None => Interpolation::Bilinear,
@@ -1145,7 +1145,10 @@ mod tests {
             pts: None,
             time_base: TimeBase::new(1, 1),
             planes: vec![
-                VideoPlane { stride: 16, data: y },
+                VideoPlane {
+                    stride: 16,
+                    data: y,
+                },
                 VideoPlane { stride: 8, data: u },
                 VideoPlane { stride: 8, data: v },
             ],

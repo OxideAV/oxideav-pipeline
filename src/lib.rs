@@ -13,13 +13,15 @@
 
 pub mod dag;
 pub mod executor;
+pub mod filter_registry;
 pub mod schema;
 pub mod sinks;
-pub mod validate;
 mod staged;
+pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, JobSink};
+pub use filter_registry::{FilterFactory, FilterRegistry};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
