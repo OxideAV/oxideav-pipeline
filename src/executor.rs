@@ -472,7 +472,9 @@ pub(crate) struct TrackRuntime {
 pub(crate) enum RuntimeFilter {
     #[cfg(feature = "audio_filter")]
     Audio(Box<dyn oxideav_audio_filter::AudioFilter>),
-    #[allow(dead_code)] // only constructed when audio_filter feature is disabled
+    #[cfg(feature = "image_filter")]
+    Video(Box<dyn oxideav_image_filter::ImageFilter>),
+    #[allow(dead_code)] // only constructed when relevant filter features are disabled
     Unsupported(String),
 }
 
@@ -845,6 +847,16 @@ pub(crate) fn run_filter(filter: &mut RuntimeFilter, frame: Frame) -> Result<Vec
                 "job: audio filter received a non-audio frame",
             )),
         },
+        #[cfg(feature = "image_filter")]
+        RuntimeFilter::Video(f) => match frame {
+            Frame::Video(v) => {
+                let out = f.apply(&v)?;
+                Ok(vec![Frame::Video(out)])
+            }
+            _ => Err(Error::invalid(
+                "job: video filter received a non-video frame",
+            )),
+        },
         RuntimeFilter::Unsupported(name) => Err(Error::unsupported(format!(
             "job: filter {name} is not supported at execution time"
         ))),
@@ -858,6 +870,9 @@ pub(crate) fn flush_filter(filter: &mut RuntimeFilter) -> Result<Vec<Frame>> {
             let outs = f.flush()?;
             Ok(outs.into_iter().map(Frame::Audio).collect())
         }
+        // Video filters are stateless: nothing to flush.
+        #[cfg(feature = "image_filter")]
+        RuntimeFilter::Video(_) => Ok(Vec::new()),
         RuntimeFilter::Unsupported(_) => Ok(Vec::new()),
     }
 }
@@ -870,9 +885,21 @@ fn build_filter(
 ) -> Result<RuntimeFilter> {
     use crate::dag::FilterKind;
     match kind {
-        FilterKind::Video => Err(Error::unsupported(format!(
-            "job: video filter '{name}' — no video filters are wired in yet"
-        ))),
+        FilterKind::Video => {
+            #[cfg(feature = "image_filter")]
+            {
+                let f = build_video_filter(name, params)?;
+                Ok(RuntimeFilter::Video(f))
+            }
+            #[cfg(not(feature = "image_filter"))]
+            {
+                let _ = (name, params);
+                Ok(RuntimeFilter::Unsupported(
+                    "video filters disabled at compile time (enable the `image_filter` feature)"
+                        .into(),
+                ))
+            }
+        }
         FilterKind::Audio => {
             #[cfg(feature = "audio_filter")]
             {
@@ -888,6 +915,71 @@ fn build_filter(
                 ))
             }
         }
+    }
+}
+
+/// Build a runtime video filter from a name + JSON parameter block.
+///
+/// Names match the ImageMagick-style `oxideav convert` vocabulary:
+/// `resize`, `blur`, `edge`. Unknown names return `Unsupported`.
+#[cfg(feature = "image_filter")]
+fn build_video_filter(
+    name: &str,
+    params: &serde_json::Value,
+) -> Result<Box<dyn oxideav_image_filter::ImageFilter>> {
+    use oxideav_image_filter::{Blur, Edge, Interpolation, Planes, Resize};
+    let p = params.as_object();
+    let get_u64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_u64());
+    let get_f64 = |k: &str| p.and_then(|m| m.get(k)).and_then(|v| v.as_f64());
+    let get_str = |k: &str| {
+        p.and_then(|m| m.get(k))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    match name {
+        "resize" => {
+            let w = get_u64("width").ok_or_else(|| {
+                Error::invalid("job: filter 'resize' needs unsigned `width`")
+            })? as u32;
+            let h = get_u64("height").ok_or_else(|| {
+                Error::invalid("job: filter 'resize' needs unsigned `height`")
+            })? as u32;
+            let interp = match get_str("interpolation").as_deref() {
+                Some("nearest") => Interpolation::Nearest,
+                Some("bilinear") | None => Interpolation::Bilinear,
+                Some(other) => {
+                    return Err(Error::invalid(format!(
+                        "job: filter 'resize': unknown interpolation '{other}' \
+                         (expected 'nearest' or 'bilinear')"
+                    )));
+                }
+            };
+            Ok(Box::new(Resize::new(w, h).with_interpolation(interp)))
+        }
+        "blur" => {
+            let radius = get_u64("radius").unwrap_or(3) as u32;
+            let sigma = get_f64("sigma").map(|v| v as f32);
+            let planes = match get_str("planes").as_deref() {
+                Some("all") | None => Planes::All,
+                Some("luma") => Planes::Luma,
+                Some("chroma") => Planes::Chroma,
+                Some(other) => {
+                    return Err(Error::invalid(format!(
+                        "job: filter 'blur': unknown planes '{other}' \
+                         (expected 'all', 'luma', or 'chroma')"
+                    )));
+                }
+            };
+            let mut f = Blur::new(radius).with_planes(planes);
+            if let Some(s) = sigma {
+                f = f.with_sigma(s);
+            }
+            Ok(Box::new(f))
+        }
+        "edge" => Ok(Box::new(Edge::new())),
+        other => Err(Error::unsupported(format!(
+            "job: video filter '{other}' — not implemented"
+        ))),
     }
 }
 
@@ -1000,5 +1092,59 @@ mod tests {
             Some("mkv")
         );
         assert_eq!(ext_from_uri("/no/ext"), None);
+    }
+
+    #[cfg(feature = "image_filter")]
+    #[test]
+    fn build_video_filter_resize_applies_to_frame() {
+        use oxideav_core::{PixelFormat, TimeBase, VideoFrame, VideoPlane};
+        use serde_json::json;
+        let f = build_video_filter(
+            "resize",
+            &json!({"width": 8, "height": 4, "interpolation": "bilinear"}),
+        )
+        .unwrap();
+        let y: Vec<u8> = (0..16 * 16).map(|i| (i % 256) as u8).collect();
+        let u = vec![77u8; 8 * 8];
+        let v = vec![128u8; 8 * 8];
+        let frame = VideoFrame {
+            format: PixelFormat::Yuv420P,
+            width: 16,
+            height: 16,
+            pts: None,
+            time_base: TimeBase::new(1, 1),
+            planes: vec![
+                VideoPlane { stride: 16, data: y },
+                VideoPlane { stride: 8, data: u },
+                VideoPlane { stride: 8, data: v },
+            ],
+        };
+        let out = f.apply(&frame).unwrap();
+        assert_eq!(out.width, 8);
+        assert_eq!(out.height, 4);
+    }
+
+    #[cfg(feature = "image_filter")]
+    #[test]
+    fn build_video_filter_unknown_name_is_unsupported() {
+        use serde_json::json;
+        let res = build_video_filter("not-a-filter", &json!({}));
+        let err = match res {
+            Ok(_) => panic!("expected Unsupported error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:?}").contains("not implemented"));
+    }
+
+    #[cfg(feature = "image_filter")]
+    #[test]
+    fn build_video_filter_rejects_missing_width() {
+        use serde_json::json;
+        let res = build_video_filter("resize", &json!({"height": 8}));
+        let err = match res {
+            Ok(_) => panic!("expected Invalid error"),
+            Err(e) => e,
+        };
+        assert!(format!("{err:?}").to_lowercase().contains("width"));
     }
 }
