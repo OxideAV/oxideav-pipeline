@@ -4,18 +4,20 @@
 //! route video frames emitted on the filter's second port straight to
 //! the sink.
 //!
-//! The test fabricates a 1-second 440 Hz mono WAV, runs it through a
-//! `@display`-style reserved sink override implemented here, and
-//! asserts that:
+//! Uses a stub demuxer/decoder (see `tests/common/stub.rs`) so this
+//! test stays in `oxideav-pipeline` without dragging a real codec or
+//! container into the crate's dev-deps.
 //!
+//! Asserts:
 //! 1. `sink.start(streams)` saw both an audio stream **and** a video
 //!    stream whose params come from the spectrogram filter's video
 //!    output port.
 //! 2. After the run, the sink received at least 10 video frames
-//!    (1 s × 30 fps expected around 30, but the exact count depends
-//!    on decoder chunking, so we require only ≥ 10).
+//!    (60 s × 30 fps expected ~1800, but timing depends on decoder
+//!    chunking, so we just gate on ≥ 10).
 
-use std::io::Write;
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use oxideav_codec::CodecRegistry;
@@ -23,49 +25,6 @@ use oxideav_container::ContainerRegistry;
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{Executor, Job, JobSink};
 use oxideav_source::SourceRegistry;
-
-fn build_sine_wav(path: &std::path::Path, sample_rate: u32, ms: u32, freq: f32) {
-    // Minimal RIFF/WAV with 16-bit mono PCM carrying a sine wave.
-    let n_samples = (sample_rate as u64 * ms as u64 / 1000) as u32;
-    let byte_rate = sample_rate * 2;
-    let data_sz = n_samples * 2;
-    let riff_sz = 36 + data_sz;
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(b"RIFF").unwrap();
-    f.write_all(&riff_sz.to_le_bytes()).unwrap();
-    f.write_all(b"WAVE").unwrap();
-    f.write_all(b"fmt ").unwrap();
-    f.write_all(&16u32.to_le_bytes()).unwrap();
-    f.write_all(&1u16.to_le_bytes()).unwrap(); // PCM
-    f.write_all(&1u16.to_le_bytes()).unwrap(); // mono
-    f.write_all(&sample_rate.to_le_bytes()).unwrap();
-    f.write_all(&byte_rate.to_le_bytes()).unwrap();
-    f.write_all(&2u16.to_le_bytes()).unwrap(); // block align
-    f.write_all(&16u16.to_le_bytes()).unwrap(); // bits per sample
-    f.write_all(b"data").unwrap();
-    f.write_all(&data_sz.to_le_bytes()).unwrap();
-    for i in 0..n_samples {
-        let t = i as f32 / sample_rate as f32;
-        let s = (2.0 * std::f32::consts::PI * freq * t).sin();
-        let v = (s * 0.5 * i16::MAX as f32) as i16;
-        f.write_all(&v.to_le_bytes()).unwrap();
-    }
-}
-
-fn registries() -> (CodecRegistry, ContainerRegistry) {
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    oxideav_basic::register_codecs(&mut codecs);
-    oxideav_basic::register_containers(&mut containers);
-    (codecs, containers)
-}
-
-fn tmp_dir(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("oxideav_pipeline_{name}"));
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
 
 /// Observer sink: captures the `StreamInfo` list passed to `start` and
 /// every frame seen via `write_frame`, keyed by `MediaType`.
@@ -107,14 +66,11 @@ impl JobSink for ObserverSink {
 
 #[test]
 fn spectrogram_adds_video_stream_to_display_output() {
-    // 1-second 440 Hz sine at 44.1 kHz mono — matches the
-    // `sine_frame` pattern in the audio-filter unit tests, just
-    // encapsulated in a WAV container so the demuxer can handle it.
-    let dir = tmp_dir("spectrogram_vid");
-    let src = dir.join("sine.wav");
-    build_sine_wav(&src, 44_100, 1_000, 440.0);
+    let src = common::stub::touch("spectrogram_vid");
 
-    let (codecs, containers) = registries();
+    let mut codecs = CodecRegistry::new();
+    let mut containers = ContainerRegistry::new();
+    common::stub::register(&mut codecs, &mut containers);
     let sources = SourceRegistry::with_defaults();
 
     // `@display` is a reserved sink — our override observer picks up
@@ -182,8 +138,7 @@ fn spectrogram_adds_video_stream_to_display_output() {
     assert_eq!(video.params.width, Some(128));
     assert_eq!(video.params.height, Some(64));
 
-    // 2. The run produced at least 10 video frames (≈ 30 at 1 s × 30
-    //    fps, but the actual count depends on decoder chunking).
+    // 2. The run produced at least 10 video frames.
     assert!(
         state.video_frames >= 10,
         "expected ≥ 10 spectrogram video frames, got {}",

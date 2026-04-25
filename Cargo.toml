@@ -30,5 +30,9 @@ default = ["audio_filter", "image_filter"]
 audio_filter = ["dep:oxideav-audio-filter"]
 image_filter = ["dep:oxideav-image-filter"]
 
+# oxideav-pipeline is a framework crate; integration tests that need
+# real codecs/containers (WAV roundtrip, pix-convert with h264, serial-vs-
+# pipelined byte parity) live in oxideav-tests. The tests/ here use only
+# the in-tree stub demuxer + decoder (`tests/common/stub.rs`) so this
+# crate has zero codec/container dev-deps.
 [dev-dependencies]
-oxideav-basic = "0.0"

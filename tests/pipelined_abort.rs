@@ -14,7 +14,8 @@
 //! up to the demuxer via each worker's existing
 //! `tx.send(...).is_err()` branch.
 
-use std::io::Write;
+mod common;
+
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -24,48 +25,6 @@ use oxideav_container::ContainerRegistry;
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{Executor, Job, JobSink};
 use oxideav_source::SourceRegistry;
-
-fn build_sine_wav(path: &std::path::Path, sample_rate: u32, ms: u32, freq: f32) {
-    let n_samples = (sample_rate as u64 * ms as u64 / 1000) as u32;
-    let byte_rate = sample_rate * 2;
-    let data_sz = n_samples * 2;
-    let riff_sz = 36 + data_sz;
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(b"RIFF").unwrap();
-    f.write_all(&riff_sz.to_le_bytes()).unwrap();
-    f.write_all(b"WAVE").unwrap();
-    f.write_all(b"fmt ").unwrap();
-    f.write_all(&16u32.to_le_bytes()).unwrap();
-    f.write_all(&1u16.to_le_bytes()).unwrap();
-    f.write_all(&1u16.to_le_bytes()).unwrap();
-    f.write_all(&sample_rate.to_le_bytes()).unwrap();
-    f.write_all(&byte_rate.to_le_bytes()).unwrap();
-    f.write_all(&2u16.to_le_bytes()).unwrap();
-    f.write_all(&16u16.to_le_bytes()).unwrap();
-    f.write_all(b"data").unwrap();
-    f.write_all(&data_sz.to_le_bytes()).unwrap();
-    for i in 0..n_samples {
-        let t = i as f32 / sample_rate as f32;
-        let s = (2.0 * std::f32::consts::PI * freq * t).sin();
-        let v = (s * 0.5 * i16::MAX as f32) as i16;
-        f.write_all(&v.to_le_bytes()).unwrap();
-    }
-}
-
-fn registries() -> (CodecRegistry, ContainerRegistry) {
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    oxideav_basic::register_codecs(&mut codecs);
-    oxideav_basic::register_containers(&mut containers);
-    (codecs, containers)
-}
-
-fn tmp_dir(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("oxideav_pipeline_{name}"));
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
 
 /// Sink that errors on the very first `write_*`. Exists to trigger
 /// the abort path in the pipelined runtime on turn 1, when upstream
@@ -95,14 +54,16 @@ impl JobSink for AbortingSink {
 
 #[test]
 fn pipelined_sink_error_unwinds_cleanly() {
-    // A few seconds of audio — enough samples that the bounded
-    // channel between decoder and mux is realistically full by the
-    // time the sink errors out.
-    let dir = tmp_dir("pipelined_abort");
-    let src = dir.join("sine.wav");
-    build_sine_wav(&src, 44_100, 3_000, 440.0);
+    // Synthetic 60-second mono PCM stream. The stub demuxer ignores
+    // the file's contents — touching a `.stub` file just satisfies
+    // the source registry's `file://` open. Long enough that the
+    // bounded channels between demuxer/decoder/mux are realistically
+    // full by the time the sink errors out.
+    let src = common::stub::touch("pipelined_abort");
 
-    let (codecs, containers) = registries();
+    let mut codecs = CodecRegistry::new();
+    let mut containers = ContainerRegistry::new();
+    common::stub::register(&mut codecs, &mut containers);
     let sources = SourceRegistry::with_defaults();
 
     let job_json = format!(

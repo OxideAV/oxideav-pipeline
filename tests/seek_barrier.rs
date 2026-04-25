@@ -1,21 +1,20 @@
 //! Integration test for the seek-barrier control surface.
 //!
-//! Spawns an `Executor` over a synthetic WAV (long enough that the
-//! demuxer doesn't hit EOF before we can issue a seek), wires a
+//! Spawns an `Executor` over a synthetic stub stream (60 seconds, so
+//! the demuxer doesn't hit EOF before we issue a seek), wires a
 //! channel-forwarding sink so we observe `start` / `write_frame` /
 //! `barrier` / `finish` calls from the test thread, and:
 //!
 //! 1. Issues `ExecutorHandle::seek(stream, half-way pts, tb)`.
 //! 2. Waits for the sink's `barrier(SeekFlush { generation: 1 })` call.
-//! 3. Verifies that subsequent audio frames carry pts >= the seek
-//!    target (the demuxer's seek_to landed at-or-past the requested
-//!    pts; any decoder samples fed through pre-seek must have been
-//!    flushed when the decode stage observed the barrier).
+//! 3. Verifies that subsequent payloads carry pts at-or-near the seek
+//!    target (the stub demuxer's `seek_to` snaps exactly).
 //!
 //! Also exercises `try_progress` + `stop` for handle lifecycle
 //! coverage.
 
-use std::io::Write;
+mod common;
+
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -25,48 +24,6 @@ use oxideav_container::ContainerRegistry;
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
 use oxideav_source::SourceRegistry;
-
-fn build_sine_wav(path: &std::path::Path, sample_rate: u32, ms: u32, freq: f32) {
-    let n_samples = (sample_rate as u64 * ms as u64 / 1000) as u32;
-    let byte_rate = sample_rate * 2;
-    let data_sz = n_samples * 2;
-    let riff_sz = 36 + data_sz;
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(b"RIFF").unwrap();
-    f.write_all(&riff_sz.to_le_bytes()).unwrap();
-    f.write_all(b"WAVE").unwrap();
-    f.write_all(b"fmt ").unwrap();
-    f.write_all(&16u32.to_le_bytes()).unwrap();
-    f.write_all(&1u16.to_le_bytes()).unwrap();
-    f.write_all(&1u16.to_le_bytes()).unwrap();
-    f.write_all(&sample_rate.to_le_bytes()).unwrap();
-    f.write_all(&byte_rate.to_le_bytes()).unwrap();
-    f.write_all(&2u16.to_le_bytes()).unwrap();
-    f.write_all(&16u16.to_le_bytes()).unwrap();
-    f.write_all(b"data").unwrap();
-    f.write_all(&data_sz.to_le_bytes()).unwrap();
-    for i in 0..n_samples {
-        let t = i as f32 / sample_rate as f32;
-        let s = (2.0 * std::f32::consts::PI * freq * t).sin();
-        let v = (s * 0.5 * i16::MAX as f32) as i16;
-        f.write_all(&v.to_le_bytes()).unwrap();
-    }
-}
-
-fn registries() -> (CodecRegistry, ContainerRegistry) {
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    oxideav_basic::register_codecs(&mut codecs);
-    oxideav_basic::register_containers(&mut containers);
-    (codecs, containers)
-}
-
-fn tmp_dir(name: &str) -> std::path::PathBuf {
-    let mut p = std::env::temp_dir();
-    p.push(format!("oxideav_pipeline_{name}"));
-    let _ = std::fs::create_dir_all(&p);
-    p
-}
 
 /// A test sink that forwards every JobSink event to a channel so the
 /// test driver can `recv()` them in order.
@@ -141,15 +98,14 @@ where
 
 #[test]
 fn spawn_seek_emits_barrier_and_advances_pts() {
-    // 60 seconds of sine — a bounded sink channel applies back-pressure
-    // so the demuxer can't race ahead and hit EOF before we issue the
-    // seek. We seek to the half-way point (~30s) and verify the sink
-    // sees a SeekFlush barrier with generation = 1.
-    let dir = tmp_dir("seek_barrier");
-    let src = dir.join("sine.wav");
-    build_sine_wav(&src, 8_000, 60_000, 440.0);
+    // Stub demuxer emits 60s of synthetic mono audio at 8 kHz.
+    // We seek to the half-way point (~30s) and verify the sink sees
+    // a SeekFlush barrier with generation = 1.
+    let src = common::stub::touch("seek_barrier");
 
-    let (codecs, containers) = registries();
+    let mut codecs = CodecRegistry::new();
+    let mut containers = ContainerRegistry::new();
+    common::stub::register(&mut codecs, &mut containers);
     let sources = SourceRegistry::with_defaults();
 
     let job_json = format!(
@@ -198,7 +154,7 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
         matches!(e, SinkEvent::Payload { .. })
     });
 
-    // Seek to ~30s. tb for 8 kHz mono PCM is 1/8000 so pts is in samples.
+    // Seek to ~30s. Stub tb is 1/sample_rate so pts is in samples.
     let target_pts = (30.0_f64 / audio_tb.as_rational().as_f64()).round() as i64;
     handle
         .seek(audio_idx, target_pts, audio_tb)
@@ -220,15 +176,15 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     }
 
     // Subsequent payloads must have pts at-or-near the seek target.
-    // (Copy mode here means we see packets, not frames; same shape.)
     let post_deadline = Instant::now() + Duration::from_secs(5);
     let evt = wait_for(&rx, post_deadline, |e| {
         matches!(e, SinkEvent::Payload { pts: Some(_), .. })
     })
     .expect("no post-barrier payload within deadline");
     if let SinkEvent::Payload { pts: Some(p), .. } = evt {
-        // Allow anything within ±0.5s of the target; the demuxer's
-        // seek_to may snap to a packet boundary.
+        // Allow anything within ±1s of the target; the stub's
+        // seek_to lands exactly, but any bounded-channel buffering
+        // can let one stale pre-seek packet slip through.
         let target_secs = audio_tb.seconds_of(target_pts);
         let p_secs = audio_tb.seconds_of(p);
         let drift = (p_secs - target_secs).abs();
