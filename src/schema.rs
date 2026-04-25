@@ -314,6 +314,15 @@ pub fn is_reserved_sink(name: &str) -> bool {
     RESERVED_SINKS.contains(&name)
 }
 
+/// True when the given sink consumes decoded frames (playback targets
+/// that own a driver / window). The DAG inserts an auto-decode stage
+/// for no-codec tracks pointed at these sinks so oxideplay doesn't
+/// need to name `pcm_s16le` / `rawvideo` every time. `@null` and
+/// `@stdout` stay in stream-copy mode.
+pub fn is_playback_sink(name: &str) -> bool {
+    matches!(name, "@display" | "@out")
+}
+
 /// Keys reserved for job metadata (not outputs or aliases). Pulled off
 /// the top-level object before the output/alias walk.
 const META_KEYS: &[&str] = &["threads"];

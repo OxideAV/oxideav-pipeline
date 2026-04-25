@@ -13,8 +13,8 @@ use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, Result};
 
 use crate::schema::{
-    is_reserved_sink, parse_pixel_format, Job, OutputSpec, SourceRef, StreamSelector, TrackInput,
-    TrackSpec,
+    is_playback_sink, is_reserved_sink, parse_pixel_format, Job, OutputSpec, SourceRef,
+    StreamSelector, TrackInput, TrackSpec,
 };
 
 /// Opaque index into `Dag::nodes`.
@@ -200,6 +200,16 @@ impl Job {
         // straight from the demuxer (copy path) or a previous `Encode`
         // node.
         let (top, copy) = match (&track.codec, self.is_packet_producing(dag, upstream)?) {
+            (None, true) if is_playback_sink(ctx) => {
+                // Playback sinks (`@display`, `@out`) consume decoded
+                // frames, not packets. No explicit codec means "decode
+                // the source and present frames" — insert an auto-
+                // decode stage instead of stream-copy. `@null` and
+                // `@stdout` stay in copy mode so they can bit-bucket
+                // packet streams without paying the decode cost.
+                let dec = dag.push(DagNode::Decode { upstream });
+                (dec, false)
+            }
             (None, true) => (upstream, true),
             (None, false) => {
                 // Raw-frame path — legal only when targeting a reserved
