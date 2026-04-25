@@ -24,8 +24,8 @@
 #[cfg(feature = "audio_filter")]
 use oxideav_audio_filter::AudioFilter;
 use oxideav_core::{
-    filter::unknown_filter_error, Error, FilterContext, Frame, PixelFormat, PortParams, PortSpec,
-    Result, SampleFormat, StreamFilter, TimeBase,
+    filter::unknown_filter_error, Error, FilterContext, Frame, MediaType, PixelFormat, PortParams,
+    PortSpec, Result, SampleFormat, StreamFilter, TimeBase,
 };
 #[cfg(feature = "image_filter")]
 use oxideav_image_filter::ImageFilter;
@@ -401,8 +401,15 @@ fn make_spectrogram(params: &Value, inputs: &[PortSpec]) -> Result<Box<dyn Strea
         opts.db_range.1 = hi as f32;
     }
     let fps = get_u64("fps").unwrap_or(30) as u32;
-    let _ = inputs;
-    let s = Spectrogram::new(opts)?.with_video_fps(fps);
+    let mut s = Spectrogram::new(opts)?.with_video_fps(fps);
+    // Pre-seed the audio-input params so the output port's time_base +
+    // sample_rate are correct BEFORE the first push. The executor reads
+    // `output_ports()` once at `build_output_streams` time to synthesise
+    // the sink's StreamInfo; without this the placeholder 48 kHz /
+    // TimeBase(1, 48000) leaks into A/V sync and the engine drifts.
+    if let Some(audio) = inputs.iter().find(|p| p.kind == MediaType::Audio) {
+        s = s.with_audio_input(audio);
+    }
     Ok(Box::new(s) as Box<dyn StreamFilter>)
 }
 
