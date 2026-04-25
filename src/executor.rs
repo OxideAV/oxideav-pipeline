@@ -223,6 +223,11 @@ impl<'a> Executor<'a> {
             }
         }
 
+        // Expand `all:` tracks (kind == Unknown, selector == any) into
+        // one TrackRuntime per source stream now that the demuxer can
+        // be queried for its stream list.
+        pipelines = expand_all_tracks(pipelines, &dmx_by_uri);
+
         // Resolve each pipeline's stream index now that we can inspect
         // the demuxer's stream list.
         for pl in &mut pipelines {
@@ -421,6 +426,10 @@ impl<'a> Executor<'a> {
                 dmx_by_uri.insert(pl.source_uri.clone(), dmx);
             }
         }
+        // Expand `all:` tracks (kind == Unknown, selector == any) into
+        // one TrackRuntime per source stream. Done after demuxers open
+        // so the stream kinds are authoritative.
+        pipelines = expand_all_tracks(pipelines, &dmx_by_uri);
         for pl in &mut pipelines {
             let dmx = dmx_by_uri.get(&pl.source_uri).unwrap();
             pl.source_stream = select_stream(dmx.streams(), &pl.selector)?;
@@ -632,6 +641,25 @@ impl TrackRuntime {
             extra_output_port_counts: Vec::new(),
             extras_base_index: 0,
         }
+    }
+
+    /// Clone a pre-instantiate TrackRuntime — only the metadata + stage
+    /// list, not the decoder / encoder / filter-instance slots (which
+    /// are `None` at this point anyway). Used by
+    /// [`expand_all_tracks`] when a `{kind: Unknown, selector: any}`
+    /// track needs to fan out into one runtime per source stream.
+    fn duplicate_pre_instantiate(&self, kind: MediaType, selector: ResolvedSelector) -> Self {
+        assert!(
+            self.decoder.is_none() && self.encoder.is_none() && self.frame_stages.is_empty(),
+            "duplicate_pre_instantiate called post-instantiate"
+        );
+        TrackRuntime::new(
+            self.source_uri.clone(),
+            selector,
+            kind,
+            self.copy,
+            self.stages.clone(),
+        )
     }
 
     pub(crate) fn instantiate(
@@ -1080,6 +1108,53 @@ pub(crate) fn port_params_equal(a: &PortParams, b: &PortParams) -> bool {
 
 /// Derive a [`PortSpec`] describing the current running format inside
 /// the stage stack. Only Audio / Video variants are produced today.
+/// Expand `all:`-originated tracks (kind == `MediaType::Unknown`,
+/// selector without an explicit kind constraint) into one
+/// [`TrackRuntime`] per source stream exposed by the open demuxer.
+///
+/// The DAG builder produces a single MuxTrack per `all:` entry; it
+/// can't know the source's stream layout statically, so it leaves the
+/// kind as `Unknown` and the selector as "any". The executor's prep
+/// phase (both serial and pipelined) calls this after opening
+/// demuxers so the fan-out sees the authoritative stream list.
+///
+/// Tracks with an explicit kind (from `audio:` / `video:` /
+/// `subtitle:` lists) pass through unchanged.
+pub(crate) fn expand_all_tracks(
+    pipelines: Vec<TrackRuntime>,
+    dmx_by_uri: &HashMap<String, Box<dyn Demuxer>>,
+) -> Vec<TrackRuntime> {
+    let mut out: Vec<TrackRuntime> = Vec::with_capacity(pipelines.len());
+    for pl in pipelines {
+        let needs_expand = pl.kind == MediaType::Unknown
+            && pl.selector.kind.is_none()
+            && pl.selector.index.is_none();
+        if !needs_expand {
+            out.push(pl);
+            continue;
+        }
+        let Some(dmx) = dmx_by_uri.get(&pl.source_uri) else {
+            out.push(pl);
+            continue;
+        };
+        let streams = dmx.streams();
+        if streams.is_empty() {
+            out.push(pl);
+            continue;
+        }
+        // One duplicate per source stream. Selector pinned to that
+        // stream's index so later `select_stream` hits deterministically.
+        for s in streams {
+            let selector = ResolvedSelector {
+                kind: Some(s.params.media_type),
+                index: None,
+            };
+            out.push(pl.duplicate_pre_instantiate(s.params.media_type, selector));
+        }
+    }
+    out
+}
+
 pub(crate) fn port_spec_from_params(cp: &CodecParameters, tb: TimeBase) -> PortSpec {
     match cp.media_type {
         MediaType::Audio => PortSpec::audio(
