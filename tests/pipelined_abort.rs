@@ -20,11 +20,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{Executor, Job, JobSink};
-use oxideav_source::SourceRegistry;
 
 /// Sink that errors on the very first `write_*`. Exists to trigger
 /// the abort path in the pipelined runtime on turn 1, when upstream
@@ -61,10 +58,9 @@ fn pipelined_sink_error_unwinds_cleanly() {
     // full by the time the sink errors out.
     let src = common::stub::touch("pipelined_abort");
 
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    common::stub::register(&mut codecs, &mut containers);
-    let sources = SourceRegistry::with_defaults();
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    common::stub::register(&mut ctx.codecs, &mut ctx.containers);
+    oxideav_source::register(&mut ctx);
 
     let job_json = format!(
         r#"{{
@@ -90,7 +86,7 @@ fn pipelined_sink_error_unwinds_cleanly() {
             started: t_started,
             write_count: t_count,
         });
-        Executor::new(&job, &codecs, &containers, &sources)
+        Executor::new(&job, &ctx)
             .with_threads(4) // force the pipelined path
             .with_sink_override("@display", sink)
             .run()

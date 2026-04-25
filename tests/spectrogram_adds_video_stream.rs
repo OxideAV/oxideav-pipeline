@@ -20,11 +20,8 @@ mod common;
 
 use std::sync::{Arc, Mutex};
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{Executor, Job, JobSink};
-use oxideav_source::SourceRegistry;
 
 /// Observer sink: captures the `StreamInfo` list passed to `start` and
 /// every frame seen via `write_frame`, keyed by `MediaType`.
@@ -68,10 +65,10 @@ impl JobSink for ObserverSink {
 fn spectrogram_adds_video_stream_to_display_output() {
     let src = common::stub::touch("spectrogram_vid");
 
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    common::stub::register(&mut codecs, &mut containers);
-    let sources = SourceRegistry::with_defaults();
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    common::stub::register(&mut ctx.codecs, &mut ctx.containers);
+    oxideav_source::register(&mut ctx);
+    oxideav_audio_filter::register(&mut ctx);
 
     // `@display` is a reserved sink — our override observer picks up
     // the stream layout + frame counts.
@@ -104,7 +101,7 @@ fn spectrogram_adds_video_stream_to_display_output() {
     // Force the serial executor so extras routing is exercised on the
     // synchronous pump path; the pipelined path has its own coverage
     // via the parity tests but depends on the same machinery.
-    Executor::new(&job, &codecs, &containers, &sources)
+    Executor::new(&job, &ctx)
         .with_threads(1)
         .with_sink_override("@display", sink)
         .run()

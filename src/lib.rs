@@ -13,7 +13,6 @@
 
 pub mod dag;
 pub mod executor;
-pub mod filter_registry;
 pub mod schema;
 pub mod sinks;
 pub mod staged;
@@ -21,7 +20,7 @@ pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink};
-pub use filter_registry::{FilterFactory, FilterRegistry};
+pub use oxideav_core::{FilterFactory, FilterRegistry};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
@@ -29,10 +28,9 @@ pub use schema::{
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, Progress, SeekCmd};
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
-use oxideav_container::{Demuxer, Muxer};
 use oxideav_core::{
-    CodecParameters, Error, Frame, MediaType, Packet, Result, StreamInfo, TimeBase,
+    CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
+    Packet, Result, StreamInfo, TimeBase,
 };
 
 // ───────────────────────── Sink trait ─────────────────────────

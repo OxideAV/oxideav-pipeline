@@ -15,18 +15,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use oxideav_codec::{CodecRegistry, Decoder, Encoder};
-use oxideav_container::{ContainerRegistry, Demuxer, ReadSeek};
 use oxideav_core::{
-    CodecId, CodecParameters, Error, ExecutionContext, FilterContext, Frame, MediaType, Packet,
-    PixelFormat, PortParams, PortSpec, Rational, Result, SampleFormat, StreamFilter, StreamInfo,
-    TimeBase,
+    CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext,
+    FilterContext, FilterRegistry, Frame, MediaType, Packet, PixelFormat, PortParams, PortSpec,
+    Rational, ReadSeek, Result, RuntimeContext, SampleFormat, StreamFilter, StreamInfo, TimeBase,
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
-use oxideav_source::SourceRegistry;
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
-use crate::filter_registry::FilterRegistry;
 use crate::schema::{is_reserved_sink, Job};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
@@ -65,37 +61,29 @@ pub trait JobSink {
     }
 }
 
-/// Job runner. Constructed with a validated `Job` + registries; dispatches
-/// to serial or pipelined execution based on the effective thread budget.
+/// Job runner. Constructed with a validated `Job` and a unified
+/// [`RuntimeContext`] that bundles every registry the framework needs
+/// (codec / container / source / filter); dispatches to serial or
+/// pipelined execution based on the effective thread budget.
 pub struct Executor<'a> {
     job: &'a Job,
-    codecs: &'a CodecRegistry,
-    containers: &'a ContainerRegistry,
-    sources: &'a SourceRegistry,
+    ctx: &'a RuntimeContext,
     sink_overrides: HashMap<String, Box<dyn JobSink + Send>>,
-    /// Named-filter factory table. Defaults to
-    /// `FilterRegistry::with_builtins()` — callers that need custom
-    /// filters replace it via [`Self::with_filter_registry`].
-    filters: FilterRegistry,
     /// Explicit thread budget from the caller. `None` = resolve from
     /// `job.threads` or autodetect. `Some(0)` is treated as auto as well.
     explicit_threads: Option<usize>,
 }
 
 impl<'a> Executor<'a> {
-    pub fn new(
-        job: &'a Job,
-        codecs: &'a CodecRegistry,
-        containers: &'a ContainerRegistry,
-        sources: &'a SourceRegistry,
-    ) -> Self {
+    /// Construct an executor over `job` using the registries bundled in
+    /// `ctx`. Callers configure `ctx.filters` (and any optional codec
+    /// or container registrations) before constructing the Executor —
+    /// the executor itself doesn't mutate the context.
+    pub fn new(job: &'a Job, ctx: &'a RuntimeContext) -> Self {
         Self {
             job,
-            codecs,
-            containers,
-            sources,
+            ctx,
             sink_overrides: HashMap::new(),
-            filters: FilterRegistry::with_builtins(),
             explicit_threads: None,
         }
     }
@@ -110,14 +98,6 @@ impl<'a> Executor<'a> {
     /// `Send`-able indirection.
     pub fn with_sink_override(mut self, name: &str, sink: Box<dyn JobSink + Send>) -> Self {
         self.sink_overrides.insert(name.to_string(), sink);
-        self
-    }
-
-    /// Replace the filter registry. Useful for tests that want to inject
-    /// a custom filter without touching the builtin set, or for callers
-    /// that need to register extra filters on top of the builtins.
-    pub fn with_filter_registry(mut self, filters: FilterRegistry) -> Self {
-        self.filters = filters;
         self
     }
 
@@ -247,7 +227,7 @@ impl<'a> Executor<'a> {
         // the source stream's pixel format. Runs after the demuxer is
         // open and before codec instantiation.
         for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(self.codecs);
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
         }
 
         // Instantiate decoders / filters / encoders for each track. The
@@ -255,7 +235,7 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(self.codecs, &ctx, &self.filters)?;
+            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)?;
         }
 
         // Build the per-track output stream infos + open (or replace) the sink.
@@ -373,11 +353,16 @@ impl<'a> Executor<'a> {
     }
 
     pub(crate) fn open_demuxer(&self, uri: &str) -> Result<Box<dyn Demuxer>> {
-        let file = self.sources.open(uri)?;
+        let file = self.ctx.sources.open(uri)?;
         let mut file: Box<dyn ReadSeek> = file;
         let ext = ext_from_uri(uri);
-        let format = self.containers.probe_input(&mut *file, ext.as_deref())?;
-        self.containers.open_demuxer(&format, file, self.codecs)
+        let format = self
+            .ctx
+            .containers
+            .probe_input(&mut *file, ext.as_deref())?;
+        self.ctx
+            .containers
+            .open_demuxer(&format, file, &self.ctx.codecs)
     }
 
     /// Pipelined counterpart to [`Self::run_output`]. Builds the same
@@ -444,11 +429,11 @@ impl<'a> Executor<'a> {
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format.
         for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(self.codecs);
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
         }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
-            pl.instantiate(self.codecs, &ctx, &self.filters)?;
+            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)?;
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
@@ -489,13 +474,14 @@ impl<'a> Executor<'a> {
             .and_then(|e| e.to_str())
             .ok_or_else(|| Error::invalid(format!("job: output {name}: no extension")))?;
         let format = self
+            .ctx
             .containers
             .container_for_extension(ext)
             .ok_or_else(|| {
                 Error::FormatNotFound(format!("no muxer registered for extension .{ext}"))
             })?
             .to_owned();
-        let muxer = self.containers.open_muxer(&format, fout, out_streams)?;
+        let muxer = self.ctx.containers.open_muxer(&format, fout, out_streams)?;
         Ok(Box::new(FileSink::new(path, muxer)))
     }
 }

@@ -19,11 +19,8 @@ use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use oxideav_codec::CodecRegistry;
-use oxideav_container::ContainerRegistry;
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
-use oxideav_source::SourceRegistry;
 
 /// A test sink that forwards every JobSink event to a channel so the
 /// test driver can `recv()` them in order.
@@ -103,10 +100,9 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     // a SeekFlush barrier with generation = 1.
     let src = common::stub::touch("seek_barrier");
 
-    let mut codecs = CodecRegistry::new();
-    let mut containers = ContainerRegistry::new();
-    common::stub::register(&mut codecs, &mut containers);
-    let sources = SourceRegistry::with_defaults();
+    let mut ctx = oxideav_core::RuntimeContext::new();
+    common::stub::register(&mut ctx.codecs, &mut ctx.containers);
+    oxideav_source::register(&mut ctx);
 
     let job_json = format!(
         r#"{{
@@ -126,7 +122,7 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
         streams: streams_slot.clone(),
     });
 
-    let handle = Executor::new(&job, &codecs, &containers, &sources)
+    let handle = Executor::new(&job, &ctx)
         .with_sink_override("@display", sink)
         .with_threads(2)
         .spawn()
