@@ -27,8 +27,8 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
-use oxideav_codec::{Decoder, Encoder};
-use oxideav_container::Demuxer;
+use oxideav_core::Demuxer;
+use oxideav_core::{Decoder, Encoder};
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo, TimeBase};
 
 use crate::executor::{

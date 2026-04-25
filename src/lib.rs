@@ -456,7 +456,7 @@ pub fn transcode_simple(
 }
 
 fn drain_encoder(
-    encoder: &mut dyn oxideav_codec::Encoder,
+    encoder: &mut dyn oxideav_core::Encoder,
     muxer: &mut dyn Muxer,
     stats: &mut TranscodeStats,
 ) -> Result<()> {

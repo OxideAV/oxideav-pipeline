@@ -14,9 +14,11 @@ keywords = ["multimedia", "pipeline", "transcoding", "streaming", "pure-rust"]
 categories = ["multimedia"]
 
 [dependencies]
+# Codec / container / source / filter trait + registry types live in
+# oxideav-core directly now; the former oxideav-codec / oxideav-container
+# shim crates are being archived. oxideav-source still hosts the
+# concrete file:// driver + BufferedSource helper.
 oxideav-core = "0.1"
-oxideav-codec = "0.1"
-oxideav-container = "0.1"
 oxideav-source = "0.1"
 oxideav-pixfmt = "0.1"
 serde = { version = "1", features = ["derive"] }

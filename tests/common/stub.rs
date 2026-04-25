@@ -15,12 +15,12 @@
 //!   pts in `(1, sample_rate)` ticks, supports `seek_to`.
 //! * The decoder is a 1:1 packet → `AudioFrame` passthrough.
 
-use oxideav_codec::{registry::CodecInfo, CodecRegistry, Decoder, DecoderFactory};
-use oxideav_container::{ContainerRegistry, Demuxer, OpenDemuxerFn, ReadSeek};
 use oxideav_core::{
     packet::PacketFlags, AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecResolver,
     Error, Frame, Packet, Result, SampleFormat, StreamInfo, TimeBase,
 };
+use oxideav_core::{registry::CodecInfo, CodecRegistry, Decoder, DecoderFactory};
+use oxideav_core::{ContainerRegistry, Demuxer, OpenDemuxerFn, ReadSeek};
 
 /// Codec id for the stub passthrough decoder.
 pub const CODEC_ID: &str = "stub_pcm";

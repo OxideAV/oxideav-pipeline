@@ -8,8 +8,8 @@
 
 use std::path::PathBuf;
 
-use oxideav_container::{Muxer, WriteSeek};
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
+use oxideav_core::{Muxer, WriteSeek};
 
 use crate::executor::JobSink;
 

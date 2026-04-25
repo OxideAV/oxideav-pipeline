@@ -350,7 +350,7 @@ impl Job {
 /// - every registered encoder declares an empty accepted set
 ///   (treat as "any format OK").
 pub(crate) fn codec_accepted_pixel_formats(
-    codecs: &oxideav_codec::CodecRegistry,
+    codecs: &oxideav_core::CodecRegistry,
     codec: &str,
 ) -> Option<Vec<PixelFormat>> {
     let id = oxideav_core::CodecId::new(codec);
