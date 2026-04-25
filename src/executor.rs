@@ -35,11 +35,13 @@ use crate::staged;
 /// packets (copy path) or decoded frames (transcode path without an
 /// encoder node, e.g. live-play).
 ///
-/// `Send` is required so [`Executor::spawn`] can move the sink onto a
-/// background mux thread. The synchronous [`Executor::run`] holds the
-/// sink on the caller thread; either path works with the same trait
-/// bound.
-pub trait JobSink: Send {
+/// The trait itself does NOT require `Send` — the synchronous
+/// [`Executor::run`] keeps the sink on the caller thread, and some
+/// real-world sinks hold non-`Send` resources (e.g. a libloading
+/// audio device). Sinks that want to participate in
+/// [`Executor::spawn`] should additionally be `Send`; the spawn path
+/// requires `Box<dyn JobSink + Send>` directly.
+pub trait JobSink {
     /// Called once after all encoders are constructed and the output
     /// stream layout is known. Muxer-style sinks usually write the
     /// container header here.
@@ -70,7 +72,7 @@ pub struct Executor<'a> {
     codecs: &'a CodecRegistry,
     containers: &'a ContainerRegistry,
     sources: &'a SourceRegistry,
-    sink_overrides: HashMap<String, Box<dyn JobSink>>,
+    sink_overrides: HashMap<String, Box<dyn JobSink + Send>>,
     /// Named-filter factory table. Defaults to
     /// `FilterRegistry::with_builtins()` — callers that need custom
     /// filters replace it via [`Self::with_filter_registry`].
@@ -100,7 +102,13 @@ impl<'a> Executor<'a> {
 
     /// Replace the sink for a named output. Typically used to bind a
     /// live-playback sink to `@display`/`@out`.
-    pub fn with_sink_override(mut self, name: &str, sink: Box<dyn JobSink>) -> Self {
+    ///
+    /// The sink is required to be `Send` so it can move onto the
+    /// background mux thread used by [`Self::spawn`]. Sinks consumed
+    /// only by the synchronous [`Self::run`] path can still satisfy
+    /// this with a wrapper that owns its non-`Send` resources via
+    /// `Send`-able indirection.
+    pub fn with_sink_override(mut self, name: &str, sink: Box<dyn JobSink + Send>) -> Self {
         self.sink_overrides.insert(name.to_string(), sink);
         self
     }
@@ -447,7 +455,7 @@ impl<'a> Executor<'a> {
         &mut self,
         name: &str,
         out_streams: &[StreamInfo],
-    ) -> Result<Box<dyn JobSink>> {
+    ) -> Result<Box<dyn JobSink + Send>> {
         if let Some(s) = self.sink_overrides.remove(name) {
             return Ok(s);
         }
@@ -1242,7 +1250,7 @@ pub(crate) fn ext_from_uri(uri: &str) -> Option<String> {
 pub(crate) struct PreparedRun {
     pub(crate) pipelines: Vec<TrackRuntime>,
     pub(crate) dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
-    pub(crate) sink: Box<dyn JobSink>,
+    pub(crate) sink: Box<dyn JobSink + Send>,
     pub(crate) out_streams: Vec<StreamInfo>,
 }
 

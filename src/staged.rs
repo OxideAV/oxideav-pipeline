@@ -192,7 +192,7 @@ pub(crate) struct PipelineControl {
 pub(crate) fn run_pipelined(
     pipelines: Vec<TrackRuntime>,
     dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
-    sink: Box<dyn JobSink>,
+    sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
 ) -> Result<ExecutorStats> {
     run_pipelined_inner(
@@ -214,7 +214,7 @@ pub(crate) fn run_pipelined(
 pub(crate) fn run_pipelined_with_control(
     pipelines: Vec<TrackRuntime>,
     dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
-    sink: Box<dyn JobSink>,
+    sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
 ) -> Result<ExecutorStats> {
@@ -224,7 +224,7 @@ pub(crate) fn run_pipelined_with_control(
 pub(crate) fn run_pipelined_inner(
     mut pipelines: Vec<TrackRuntime>,
     dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
-    mut sink: Box<dyn JobSink>,
+    mut sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
 ) -> Result<ExecutorStats> {
