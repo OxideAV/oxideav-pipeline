@@ -16,17 +16,18 @@ pub mod executor;
 pub mod filter_registry;
 pub mod schema;
 pub mod sinks;
-mod staged;
+pub mod staged;
 pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
-pub use executor::{Executor, JobSink};
+pub use executor::{Executor, ExecutorHandle, JobSink};
 pub use filter_registry::{FilterFactory, FilterRegistry};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
 };
 pub use sinks::{FileSink, NullSink};
+pub use staged::{BarrierKind, Progress, SeekCmd};
 
 use oxideav_codec::{CodecRegistry, Decoder, Encoder};
 use oxideav_container::{Demuxer, Muxer};

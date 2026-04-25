@@ -35,9 +35,11 @@ use crate::staged;
 /// packets (copy path) or decoded frames (transcode path without an
 /// encoder node, e.g. live-play).
 ///
-/// The sink is not required to be `Send` — the executor is single-threaded
-/// today. Any future parallel scheduler will have to revisit this.
-pub trait JobSink {
+/// `Send` is required so [`Executor::spawn`] can move the sink onto a
+/// background mux thread. The synchronous [`Executor::run`] holds the
+/// sink on the caller thread; either path works with the same trait
+/// bound.
+pub trait JobSink: Send {
     /// Called once after all encoders are constructed and the output
     /// stream layout is known. Muxer-style sinks usually write the
     /// container header here.
@@ -46,6 +48,19 @@ pub trait JobSink {
     fn write_frame(&mut self, kind: MediaType, frm: &Frame) -> Result<()>;
     /// Drain any remaining internal state and finalise the output.
     fn finish(&mut self) -> Result<()>;
+
+    /// Flow-barrier hook. Called by the mux loop when a worker
+    /// forwards a [`crate::BarrierKind`] (today only `SeekFlush`).
+    /// Sinks that buffer frames (a player queueing audio /
+    /// video frames separately) should drop their pre-barrier state
+    /// here so post-barrier frames are presented at the new wall-clock
+    /// position.
+    ///
+    /// Default: no-op — file/null sinks don't buffer anything past the
+    /// muxer's own packet queue.
+    fn barrier(&mut self, _kind: crate::BarrierKind) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Job runner. Constructed with a validated `Job` + registries; dispatches
@@ -123,6 +138,35 @@ impl<'a> Executor<'a> {
             stats.merge(&out_stats);
         }
         Ok(stats)
+    }
+
+    /// Spawn the executor on a background thread and return a handle
+    /// for live control (seek, abort, progress). Unlike [`Self::run`],
+    /// this only supports a single output (the typical playback case
+    /// — one `@display` / `@out`). For multi-output transcodes,
+    /// continue to use [`Self::run`].
+    ///
+    /// All the demuxer-open / decoder-instantiate / sink-resolve work
+    /// happens synchronously up front — the returned handle is live by
+    /// the time `spawn` returns. The mux + worker threads run in the
+    /// background until either the demuxer hits EOF, [`ExecutorHandle::stop`]
+    /// is called, or any worker reports an error.
+    pub fn spawn(mut self) -> Result<ExecutorHandle> {
+        self.job.validate()?;
+        let dag = self.job.to_dag()?;
+        let threads = self.resolve_threads().max(2);
+        let names: Vec<String> = dag.roots.keys().cloned().collect();
+        let name = match names.as_slice() {
+            [n] => n.clone(),
+            [] => return Err(Error::invalid("job: no outputs to spawn")),
+            _ => {
+                return Err(Error::invalid(
+                    "job: spawn() supports a single output today; use run() for multi-output jobs",
+                ));
+            }
+        };
+        let prep = self.prepare_pipelined_run(&dag, &name, threads)?;
+        Ok(ExecutorHandle::start(prep))
     }
 
     /// Resolve the effective thread budget. Priority: explicit
@@ -333,6 +377,21 @@ impl<'a> Executor<'a> {
         name: &str,
         threads: usize,
     ) -> Result<ExecutorStats> {
+        let prep = self.prepare_pipelined_run(dag, name, threads)?;
+        staged::run_pipelined(prep.pipelines, prep.dmx_by_uri, prep.sink, prep.out_streams)
+    }
+
+    /// Shared prep used by both [`Self::run_output_pipelined`] and
+    /// [`Self::spawn`]. Builds + instantiates the per-track runtimes,
+    /// opens the demuxers, and resolves the sink. The returned struct
+    /// is fully owned (no `'a`-borrowed members) so it can be moved
+    /// onto a background thread.
+    fn prepare_pipelined_run(
+        &mut self,
+        dag: &Dag,
+        name: &str,
+        threads: usize,
+    ) -> Result<PreparedRun> {
         let root_id = dag.roots[name];
         let tracks: Vec<MuxTrack> = match dag.node(root_id) {
             DagNode::Mux { tracks, .. } => tracks.clone(),
@@ -376,7 +435,12 @@ impl<'a> Executor<'a> {
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
-        staged::run_pipelined(pipelines, dmx_by_uri, sink, out_streams)
+        Ok(PreparedRun {
+            pipelines,
+            dmx_by_uri,
+            sink,
+            out_streams,
+        })
     }
 
     pub(crate) fn open_sink(
@@ -1166,6 +1230,134 @@ pub(crate) fn ext_from_uri(uri: &str) -> Option<String> {
     let last = last.split('?').next().unwrap_or(last);
     let dot = last.rfind('.')?;
     Some(last[dot + 1..].to_ascii_lowercase())
+}
+
+// ───────────────────────── handle ─────────────────────────
+
+/// Owned bundle of everything `staged::run_pipelined_with_control` needs,
+/// produced synchronously by [`Executor::prepare_pipelined_run`] so the
+/// caller can either run it inline ([`Executor::run`]) or hand it to a
+/// background thread ([`Executor::spawn`]). Holds no `'a`-borrowed
+/// fields — moves freely across threads.
+pub(crate) struct PreparedRun {
+    pub(crate) pipelines: Vec<TrackRuntime>,
+    pub(crate) dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    pub(crate) sink: Box<dyn JobSink>,
+    pub(crate) out_streams: Vec<StreamInfo>,
+}
+
+/// Live handle to a background-running [`Executor`]. Returned by
+/// [`Executor::spawn`]; supports seek, abort, and progress polling.
+///
+/// Dropping the handle without [`Self::stop`] sets the abort flag and
+/// detaches the join handle — the worker threads tear down in the
+/// background. Use [`Self::stop`] to wait for clean exit + recover
+/// the [`ExecutorStats`].
+pub struct ExecutorHandle {
+    abort: std::sync::Arc<crate::staged::AbortState>,
+    seek_tx: std::sync::mpsc::Sender<crate::staged::SeekCmd>,
+    progress_rx: std::sync::mpsc::Receiver<crate::staged::Progress>,
+    join: Option<std::thread::JoinHandle<Result<ExecutorStats>>>,
+    finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl ExecutorHandle {
+    pub(crate) fn start(prep: PreparedRun) -> Self {
+        let abort = crate::staged::AbortState::new();
+        let (seek_tx, seek_rx) = std::sync::mpsc::channel::<crate::staged::SeekCmd>();
+        let (progress_tx, progress_rx) =
+            std::sync::mpsc::sync_channel::<crate::staged::Progress>(64);
+        let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let abort_t = abort.clone();
+        let finished_t = finished.clone();
+        let join = std::thread::Builder::new()
+            .name("oxideav-pipeline-exec".into())
+            .spawn(move || {
+                let result = crate::staged::run_pipelined_with_control(
+                    prep.pipelines,
+                    prep.dmx_by_uri,
+                    prep.sink,
+                    prep.out_streams,
+                    crate::staged::PipelineControl {
+                        seek_rx: Some(seek_rx),
+                        progress_tx: Some(progress_tx),
+                        abort: Some(abort_t),
+                    },
+                );
+                finished_t.store(true, std::sync::atomic::Ordering::SeqCst);
+                result
+            })
+            .expect("oxideav-pipeline: failed to spawn executor thread");
+        Self {
+            abort,
+            seek_tx,
+            progress_rx,
+            join: Some(join),
+            finished,
+        }
+    }
+
+    /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
+    /// demuxer thread receives the command, increments its generation,
+    /// broadcasts a [`crate::BarrierKind::SeekFlush`] on every route,
+    /// then calls `demuxer.seek_to`. The sink will see a `barrier(...)`
+    /// callback once the flush reaches the mux loop.
+    pub fn seek(&self, stream_idx: u32, pts: i64, time_base: oxideav_core::TimeBase) -> Result<()> {
+        self.seek_tx
+            .send(crate::staged::SeekCmd {
+                stream_idx,
+                pts,
+                time_base,
+            })
+            .map_err(|_| Error::other("ExecutorHandle: seek channel closed (executor exited)"))
+    }
+
+    /// Non-blocking poll of the most recent progress message. Returns
+    /// `None` if no update has arrived since the last poll.
+    pub fn try_progress(&self) -> Option<crate::staged::Progress> {
+        let mut latest = None;
+        while let Ok(p) = self.progress_rx.try_recv() {
+            latest = Some(p);
+        }
+        latest
+    }
+
+    /// True once the background thread has returned (EOF, abort, or
+    /// error). Safe to poll concurrently with [`Self::try_progress`].
+    pub fn has_finished(&self) -> bool {
+        self.finished.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Set the abort flag without joining. Useful when the engine is
+    /// quitting and wants the worker to wind down while it tears down
+    /// its driver. Pair with [`Self::stop`] to actually collect the
+    /// thread's result.
+    pub fn request_abort(&self) {
+        self.abort.request_abort();
+    }
+
+    /// Set the abort flag, join the worker thread, and return its
+    /// final stats (or the first error it observed).
+    pub fn stop(mut self) -> Result<ExecutorStats> {
+        self.abort.request_abort();
+        match self.join.take() {
+            Some(h) => h
+                .join()
+                .map_err(|_| Error::other("ExecutorHandle: worker thread panicked"))?,
+            None => Err(Error::other(
+                "ExecutorHandle: stop() called twice or after drop",
+            )),
+        }
+    }
+}
+
+impl Drop for ExecutorHandle {
+    fn drop(&mut self) {
+        self.abort.request_abort();
+        // Detach: the background thread observes the abort flag and
+        // tears down. We don't join here because the engine may have
+        // already called `stop()` (which moved the join handle out).
+    }
 }
 
 // ───────────────────────── stats ─────────────────────────

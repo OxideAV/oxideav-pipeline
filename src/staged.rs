@@ -29,12 +29,49 @@ use std::time::Duration;
 
 use oxideav_codec::{Decoder, Encoder};
 use oxideav_container::Demuxer;
-use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo};
+use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo, TimeBase};
 
 use crate::executor::{
     drain_decoder, flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage,
     JobSink, TrackRuntime,
 };
+
+/// Flow-barrier kind in [`Msg::Barrier`]. Today there is exactly one
+/// variant — `SeekFlush` — broadcast by the demuxer stage when it
+/// receives a [`SeekCmd`] from the [`crate::ExecutorHandle`]. Adding
+/// new kinds is non-breaking: every worker treats unknown kinds as
+/// "forward unchanged".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BarrierKind {
+    /// Seek-induced flush. Workers reset codec / filter state, then
+    /// forward this barrier downstream so the sink can drop any in-
+    /// flight frames buffered above it.
+    ///
+    /// `generation` is incremented by the demuxer on every seek so the
+    /// engine can correlate `seek()` calls with their corresponding
+    /// barrier emission and ignore pre-seek payload still in flight.
+    SeekFlush { generation: u32 },
+}
+
+/// Command sent to the demuxer stage by [`crate::ExecutorHandle::seek`].
+/// The demuxer increments its local generation, broadcasts a
+/// `SeekFlush` barrier on every route, then calls `demuxer.seek_to`.
+#[derive(Clone, Copy, Debug)]
+pub struct SeekCmd {
+    pub stream_idx: u32,
+    pub pts: i64,
+    pub time_base: TimeBase,
+}
+
+/// Per-frame progress event consumed by [`crate::ExecutorHandle::try_progress`].
+/// Updated by the mux loop on every `Msg::Data` carrying frame/packet pts;
+/// the engine polls this once per tick for the status bar.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Progress {
+    pub pts: Option<i64>,
+    pub frames: u64,
+    pub eof: bool,
+}
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
 /// the demuxer before memory blows up; large enough to amortise the mutex
@@ -45,10 +82,16 @@ const PACKET_CAP: usize = 16;
 /// are much larger than compressed packets.
 const FRAME_CAP: usize = 8;
 
-/// Messages across channels. `Eof` is an in-band signal so workers can
-/// flush their state before exiting.
+/// Messages across channels.
+///
+/// * `Data` — payload (packet/frame).
+/// * `Barrier` — flow-control marker. Today only `SeekFlush` is in use;
+///   workers reset codec/filter state and forward unchanged.
+/// * `Eof` — in-band end-of-stream so downstream stages can flush state
+///   before exiting.
 enum Msg<T> {
     Data(T),
+    Barrier(BarrierKind),
     Eof,
 }
 
@@ -76,26 +119,32 @@ impl PipelineCounters {
 }
 
 /// Shared state used to coordinate clean shutdown across all worker
-/// threads in one output's pipeline.
-struct AbortState {
+/// threads in one output's pipeline. Held inside an `Arc` so each
+/// worker can poll the flag and so [`crate::ExecutorHandle`] can
+/// flip it from the outside.
+pub(crate) struct AbortState {
     /// Set by any worker that errors out (or by the mux thread at EOF).
     /// Workers poll it between iterations and bail cleanly.
-    abort: AtomicBool,
+    pub(crate) abort: AtomicBool,
     /// First `Err(_)` seen. Later errors are dropped so the caller
     /// gets the root cause rather than a cascading symptom.
     first_err: Mutex<Option<Error>>,
 }
 
 impl AbortState {
-    fn new() -> Arc<Self> {
+    pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self {
             abort: AtomicBool::new(false),
             first_err: Mutex::new(None),
         })
     }
 
-    fn is_aborted(&self) -> bool {
+    pub(crate) fn is_aborted(&self) -> bool {
         self.abort.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn request_abort(&self) {
+        self.abort.store(true, Ordering::SeqCst);
     }
 
     fn record_error(&self, e: Error) {
@@ -124,20 +173,70 @@ enum OutputPayload {
     Frame(Frame),
 }
 
+/// Optional control bundle for [`run_pipelined`]. `seek_rx` is consumed
+/// by the (single) demuxer thread that picks it up; `progress_tx` is
+/// updated by the mux loop on every data/barrier event.
+///
+/// Both fields are independent — a caller can wire only one if needed.
+/// Used today by [`crate::Executor::spawn`]; the synchronous
+/// [`crate::Executor::run`] passes `None` and gets the legacy behaviour.
+pub(crate) struct PipelineControl {
+    pub seek_rx: Option<Receiver<SeekCmd>>,
+    pub progress_tx: Option<SyncSender<Progress>>,
+    pub abort: Option<Arc<AbortState>>,
+}
+
 /// Run one output's pipeline. The caller has already instantiated all
 /// decoders/filters/encoders via `TrackRuntime::instantiate`, opened the
 /// demuxers, and prepared the sink (but not called `start` on it).
 pub(crate) fn run_pipelined(
+    pipelines: Vec<TrackRuntime>,
+    dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    sink: Box<dyn JobSink>,
+    out_streams: Vec<StreamInfo>,
+) -> Result<ExecutorStats> {
+    run_pipelined_inner(
+        pipelines,
+        dmx_by_uri,
+        sink,
+        out_streams,
+        PipelineControl {
+            seek_rx: None,
+            progress_tx: None,
+            abort: None,
+        },
+    )
+}
+
+/// Like [`run_pipelined`] but with explicit control wiring — used by
+/// [`crate::Executor::spawn`] to plumb the seek + progress + abort
+/// channels through to the demuxer / mux loop.
+pub(crate) fn run_pipelined_with_control(
+    pipelines: Vec<TrackRuntime>,
+    dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    sink: Box<dyn JobSink>,
+    out_streams: Vec<StreamInfo>,
+    control: PipelineControl,
+) -> Result<ExecutorStats> {
+    run_pipelined_inner(pipelines, dmx_by_uri, sink, out_streams, control)
+}
+
+pub(crate) fn run_pipelined_inner(
     mut pipelines: Vec<TrackRuntime>,
     dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
     mut sink: Box<dyn JobSink>,
     out_streams: Vec<StreamInfo>,
+    control: PipelineControl,
 ) -> Result<ExecutorStats> {
     sink.start(&out_streams)?;
 
-    let abort = AbortState::new();
+    // External abort takes precedence so callers (e.g. `ExecutorHandle`)
+    // can pre-arm cancellation before the workers spawn.
+    let abort = control.abort.unwrap_or_else(AbortState::new);
     let counters = Arc::new(PipelineCounters::default());
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
+    let progress_tx = control.progress_tx;
+    let mut seek_rx = control.seek_rx;
 
     // Per-track output channel: stage workers send processed packets /
     // frames on tx; the mux loop on the caller thread reads rx.
@@ -281,7 +380,10 @@ pub(crate) fn run_pipelined(
     // when every stage has finished.
     drop(track_output_tx);
 
-    // Spawn one demuxer thread per URI.
+    // Spawn one demuxer thread per URI. The seek_rx (if any) is given
+    // to the FIRST demuxer that has routes — multi-URI seek is a
+    // follow-up (the engine only ever drives one source today, so a
+    // single seek receiver is enough to cover all of plain playback).
     for (uri, dmx) in dmx_by_uri {
         let routes = routes_by_uri.remove(&uri).unwrap_or_default();
         if routes.is_empty() {
@@ -290,8 +392,9 @@ pub(crate) fn run_pipelined(
         let abort_d = abort.clone();
         let counters_d = counters.clone();
         let name = format!("demux-{uri}");
+        let dmx_seek_rx = seek_rx.take();
         handles.push(spawn_stage(abort_d, name, move |abort| {
-            run_demuxer_stage(dmx, routes, abort, counters_d)
+            run_demuxer_stage(dmx, routes, abort, counters_d, dmx_seek_rx)
         }));
     }
 
@@ -306,22 +409,46 @@ pub(crate) fn run_pipelined(
         }
         let rx = &track_output_rx[i];
         match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Msg::Data(item)) => match item.payload {
-                OutputPayload::Packet(mut p) => {
-                    p.stream_index = item.track_index;
-                    if let Err(e) = sink.write_packet(item.kind, &p) {
-                        abort.record_error(e);
-                        break;
+            Ok(Msg::Data(item)) => {
+                let pts = match &item.payload {
+                    OutputPayload::Packet(p) => p.pts,
+                    OutputPayload::Frame(f) => match f {
+                        Frame::Audio(a) => a.pts,
+                        Frame::Video(v) => v.pts,
+                        _ => None,
+                    },
+                };
+                match item.payload {
+                    OutputPayload::Packet(mut p) => {
+                        p.stream_index = item.track_index;
+                        if let Err(e) = sink.write_packet(item.kind, &p) {
+                            abort.record_error(e);
+                            break;
+                        }
+                    }
+                    OutputPayload::Frame(f) => {
+                        if let Err(e) = sink.write_frame(item.kind, &f) {
+                            abort.record_error(e);
+                            break;
+                        }
+                        counters.frames_written.fetch_add(1, Ordering::SeqCst);
                     }
                 }
-                OutputPayload::Frame(f) => {
-                    if let Err(e) = sink.write_frame(item.kind, &f) {
-                        abort.record_error(e);
-                        break;
-                    }
-                    counters.frames_written.fetch_add(1, Ordering::SeqCst);
+                if let Some(tx) = &progress_tx {
+                    let frames = counters.frames_written.load(Ordering::SeqCst);
+                    let _ = tx.try_send(Progress {
+                        pts,
+                        frames,
+                        eof: false,
+                    });
                 }
-            },
+            }
+            Ok(Msg::Barrier(kind)) => {
+                if let Err(e) = sink.barrier(kind) {
+                    abort.record_error(e);
+                    break;
+                }
+            }
             Ok(Msg::Eof) => {
                 eof_count += 1;
             }
@@ -355,6 +482,14 @@ pub(crate) fn run_pipelined(
         return Err(err);
     }
     sink.finish()?;
+    if let Some(tx) = &progress_tx {
+        let frames = counters.frames_written.load(Ordering::SeqCst);
+        let _ = tx.try_send(Progress {
+            pts: None,
+            frames,
+            eof: true,
+        });
+    }
     Ok(counters.snapshot())
 }
 
@@ -379,15 +514,42 @@ where
 
 /// Demuxer thread: read packets until EOF, fan out to each route whose
 /// source_stream matches. Broadcasts `Msg::Eof` to every route on EOF.
+///
+/// Optional `seek_rx` carries [`SeekCmd`]s from
+/// [`crate::ExecutorHandle::seek`]. On each iteration we
+/// non-blocking-poll the channel; on a SeekCmd we bump `generation`,
+/// fan a `Msg::Barrier(SeekFlush)` out on every route, then call
+/// `dmx.seek_to`. The barrier flows downstream through every worker
+/// (which resets its codec/filter state) and lands on the mux loop,
+/// which calls `sink.barrier(kind)`.
 fn run_demuxer_stage(
     mut dmx: Box<dyn Demuxer>,
     routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
+    seek_rx: Option<Receiver<SeekCmd>>,
 ) -> Result<()> {
+    let mut generation: u32 = 0;
     loop {
         if abort.is_aborted() {
             break;
+        }
+        // Drain any pending seeks before reading the next packet.
+        if let Some(rx) = &seek_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                generation = generation.wrapping_add(1);
+                let kind = BarrierKind::SeekFlush { generation };
+                for (_, tx) in &routes {
+                    if tx.send(Msg::Barrier(kind)).is_err() {
+                        abort.abort.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                }
+                match dmx.seek_to(cmd.stream_idx, cmd.pts) {
+                    Ok(_landed) => {}
+                    Err(e) => return Err(e),
+                }
+            }
         }
         match dmx.next_packet() {
             Ok(pkt) => {
@@ -437,6 +599,12 @@ fn run_copy_stage(
                 }
                 counters.packets_copied.fetch_add(1, Ordering::SeqCst);
             }
+            Ok(Msg::Barrier(b)) => {
+                // Copy stages have no internal state — just forward.
+                if out_tx.send(Msg::Barrier(b)).is_err() {
+                    break;
+                }
+            }
             Ok(Msg::Eof) | Err(_) => break,
         }
     }
@@ -469,6 +637,15 @@ fn run_decode_stage(
                         abort.abort.store(true, Ordering::SeqCst);
                         break;
                     }
+                }
+            }
+            Ok(Msg::Barrier(b)) => {
+                // SeekFlush: drop any in-flight buffered frames + reset
+                // codec state so reference frames from the pre-seek
+                // segment can't leak into the post-seek output.
+                let _ = decoder.reset();
+                if tx.send(Msg::Barrier(b)).is_err() {
+                    break;
                 }
             }
             Ok(Msg::Eof) => {
@@ -520,6 +697,21 @@ fn run_frame_stage_worker(
                     }
                 }
             }
+            Ok(Msg::Barrier(b)) => {
+                // Filter stages may hold rolling-window state (spectrogram
+                // columns, resampler tail) — drop it. Pixel-format
+                // converts are stateless so they no-op. The barrier also
+                // flows to the extras channel so a multi-port filter's
+                // sink (e.g. spectrogram's video output) gets a chance
+                // to drop in-flight extras.
+                reset_frame_stage(&mut stage);
+                if let Some(etx) = &extras_tx {
+                    let _ = etx.send(Msg::Barrier(b));
+                }
+                if tx.send(Msg::Barrier(b)).is_err() {
+                    break;
+                }
+            }
             Ok(Msg::Eof) => {
                 let emissions = flush_frame_stage_emit(&mut stage)?;
                 dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
@@ -533,6 +725,18 @@ fn run_frame_stage_worker(
     }
     let _ = tx.send(Msg::Eof);
     Ok(())
+}
+
+/// Drop internal state of a [`FrameStage`] on a `SeekFlush` barrier.
+/// Filters delegate to [`oxideav_core::StreamFilter::reset`] (default no-op);
+/// pixel-format converts hold no state.
+fn reset_frame_stage(stage: &mut FrameStage) {
+    match stage {
+        FrameStage::Filter(f) => {
+            let _ = f.inner.reset();
+        }
+        FrameStage::PixConvert(_) => {}
+    }
 }
 
 /// Push `emissions.extras` onto the sink's output channel (if present).
@@ -585,6 +789,17 @@ fn run_encode_stage(
                 encoder.send_frame(&frame)?;
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
             }
+            Ok(Msg::Barrier(b)) => {
+                // The encoder trait has no `reset()` today — flush
+                // anything pending and forward the barrier. A future
+                // extension can plumb codec-specific reset (e.g.
+                // dropping the GOP) once needed.
+                let _ = encoder.flush();
+                drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                if out_tx.send(Msg::Barrier(b)).is_err() {
+                    break;
+                }
+            }
             Ok(Msg::Eof) => {
                 encoder.flush()?;
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
@@ -620,6 +835,11 @@ fn run_frame_fanout(
                     }))
                     .is_err()
                 {
+                    break;
+                }
+            }
+            Ok(Msg::Barrier(b)) => {
+                if out_tx.send(Msg::Barrier(b)).is_err() {
                     break;
                 }
             }
