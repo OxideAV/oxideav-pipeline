@@ -32,8 +32,7 @@ use oxideav_core::{Decoder, Encoder};
 use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo, TimeBase};
 
 use crate::executor::{
-    drain_decoder, flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage,
-    JobSink, TrackRuntime,
+    flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage, JobSink, TrackRuntime,
 };
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Today there is exactly one
@@ -620,22 +619,41 @@ fn run_decode_stage(
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
 ) -> Result<()> {
-    let mut scratch = ExecutorStats::default();
-    loop {
+    // Stream frames through `tx` as they're produced rather than
+    // collecting into a `Vec` first. Bounded `tx.send` provides natural
+    // back-pressure: once the downstream stage is full, send blocks and
+    // the decoder is held off until the sink catches up.
+    //
+    // The previous "drain-then-send" shape was a structural hazard for
+    // streaming codecs that emit far more than one frame per packet
+    // (MOD / S3M / XM tracker codecs deliver the whole file in a single
+    // packet and then synthesise frames continuously until the song
+    // ends — or, for songs with a Bxx position-loop at the end, never).
+    // Buffering the entire emission into a Vec deferred the first
+    // downstream send until decode finished; for an infinite-loop song
+    // the player never started.
+    'outer: loop {
         if abort.is_aborted() {
             break;
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
                 decoder.send_packet(&pkt)?;
-                let frames = drain_decoder(decoder.as_mut(), &mut scratch)?;
-                counters
-                    .frames_decoded
-                    .fetch_add(frames.len() as u64, Ordering::SeqCst);
-                for f in frames {
-                    if tx.send(Msg::Data(f)).is_err() {
-                        abort.abort.store(true, Ordering::SeqCst);
-                        break;
+                loop {
+                    if abort.is_aborted() {
+                        break 'outer;
+                    }
+                    match decoder.receive_frame() {
+                        Ok(frame) => {
+                            counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                            if tx.send(Msg::Data(frame)).is_err() {
+                                abort.abort.store(true, Ordering::SeqCst);
+                                break 'outer;
+                            }
+                        }
+                        Err(Error::NeedMore) => break,
+                        Err(Error::Eof) => break 'outer,
+                        Err(e) => return Err(e),
                     }
                 }
             }
@@ -650,12 +668,20 @@ fn run_decode_stage(
             }
             Ok(Msg::Eof) => {
                 decoder.flush()?;
-                let frames = drain_decoder(decoder.as_mut(), &mut scratch)?;
-                counters
-                    .frames_decoded
-                    .fetch_add(frames.len() as u64, Ordering::SeqCst);
-                for f in frames {
-                    let _ = tx.send(Msg::Data(f));
+                loop {
+                    if abort.is_aborted() {
+                        break 'outer;
+                    }
+                    match decoder.receive_frame() {
+                        Ok(frame) => {
+                            counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                            if tx.send(Msg::Data(frame)).is_err() {
+                                break 'outer;
+                            }
+                        }
+                        Err(Error::NeedMore) | Err(Error::Eof) => break,
+                        Err(e) => return Err(e),
+                    }
                 }
                 break;
             }

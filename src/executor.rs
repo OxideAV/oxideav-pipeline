@@ -852,14 +852,27 @@ impl TrackRuntime {
             stats.packets_copied += 1;
             return Ok(());
         }
-        let frames = if let Some(dec) = &mut self.decoder {
-            dec.send_packet(pkt)?;
-            drain_decoder(dec.as_mut(), stats)?
-        } else {
-            Vec::new()
-        };
-        for frame in frames {
-            self.pump_frame(frame, track_index, sink, stats)?;
+        // Stream frames through `pump_frame` as they're produced rather
+        // than buffering them all into a Vec first. Streaming codecs
+        // (MOD, S3M, XM tracker codecs; future live RTP / HLS feeds)
+        // emit far more than one frame per packet — for songs that loop
+        // via Bxx the decoder is effectively infinite. A bounded
+        // drain-then-send shape here would never reach the first sink
+        // call. Inner-scope borrow on `self.decoder` keeps `pump_frame`'s
+        // `&mut self` borrow legal.
+        if self.decoder.is_some() {
+            if let Some(dec) = &mut self.decoder {
+                dec.send_packet(pkt)?;
+            }
+            loop {
+                let frame = match self.decoder.as_mut().unwrap().receive_frame() {
+                    Ok(f) => f,
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => return Err(e),
+                };
+                stats.frames_decoded += 1;
+                self.pump_frame(frame, track_index, sink, stats)?;
+            }
         }
         Ok(())
     }
@@ -921,14 +934,21 @@ impl TrackRuntime {
         if self.copy {
             return Ok(());
         }
-        let tail_from_decoder = if let Some(dec) = &mut self.decoder {
-            dec.flush()?;
-            drain_decoder(dec.as_mut(), stats)?
-        } else {
-            Vec::new()
-        };
-        for frame in tail_from_decoder {
-            self.pump_frame(frame, track_index, sink, stats)?;
+        // Same streaming shape as `pump_packet` — decoder may emit any
+        // number of frames during flush (MOD plays its outro after EOF).
+        if self.decoder.is_some() {
+            if let Some(dec) = &mut self.decoder {
+                dec.flush()?;
+            }
+            loop {
+                let frame = match self.decoder.as_mut().unwrap().receive_frame() {
+                    Ok(f) => f,
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
+                    Err(e) => return Err(e),
+                };
+                stats.frames_decoded += 1;
+                self.pump_frame(frame, track_index, sink, stats)?;
+            }
         }
         // Flush frame stages. Filters may hold internal buffers
         // (resampler tail, noise-gate decay); pixel-format converts
@@ -997,22 +1017,13 @@ impl TrackRuntime {
     }
 }
 
-pub(crate) fn drain_decoder(
-    dec: &mut dyn Decoder,
-    stats: &mut ExecutorStats,
-) -> Result<Vec<Frame>> {
-    let mut out = Vec::new();
-    loop {
-        match dec.receive_frame() {
-            Ok(frame) => {
-                stats.frames_decoded += 1;
-                out.push(frame);
-            }
-            Err(Error::NeedMore) | Err(Error::Eof) => return Ok(out),
-            Err(e) => return Err(e),
-        }
-    }
-}
+// `drain_decoder` was removed — buffering an entire decoder emission
+// into a Vec is unsound for streaming codecs (MOD/S3M/XM tracker codecs
+// emit until song end, songs with Bxx loops are effectively infinite),
+// and it deferred all sink writes until decode completed even for
+// finite codecs. Both call sites (TrackRuntime::pump_packet + drain,
+// staged::run_decode_stage) now stream frames through the sink as they
+// land, which both back-pressures naturally and keeps memory bounded.
 
 /// Drive one frame through a [`FrameStage`] and return the full
 /// primary + extras emission set. Pixel-format converts on a
