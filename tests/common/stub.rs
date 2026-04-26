@@ -163,13 +163,12 @@ impl Decoder for StubDecoder {
         match self.pending.take() {
             Some(p) => {
                 let samples = (p.data.len() / 2) as u32;
+                // Stream-level properties (format, channels, sample_rate,
+                // time_base) live on the stream's CodecParameters, not
+                // per-frame. See StubDemuxer::open for where they get set.
                 Ok(Frame::Audio(AudioFrame {
-                    format: SampleFormat::S16,
-                    channels: CHANNELS,
-                    sample_rate: SAMPLE_RATE,
                     samples,
                     pts: p.pts,
-                    time_base: p.time_base,
                     data: vec![p.data],
                 }))
             }

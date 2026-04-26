@@ -315,7 +315,7 @@ pub(crate) fn run_pipelined_inner(
             let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(FRAME_CAP);
             let label = match &stage {
                 FrameStage::Filter(_) => "filter",
-                FrameStage::PixConvert(_) => "convert",
+                FrameStage::PixConvert { .. } => "convert",
             };
             let name = format!("{label}-{track_idx}-{fidx}");
             let abort_f = abort.clone();
@@ -735,7 +735,7 @@ fn reset_frame_stage(stage: &mut FrameStage) {
         FrameStage::Filter(f) => {
             let _ = f.inner.reset();
         }
-        FrameStage::PixConvert(_) => {}
+        FrameStage::PixConvert { .. } => {}
     }
 }
 

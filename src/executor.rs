@@ -563,8 +563,14 @@ pub(crate) enum FrameStage {
     Filter(RuntimeFilter),
     /// Pixel-format conversion — calls
     /// [`oxideav_pixfmt::convert`] on each video frame. Non-video
-    /// frames pass through unchanged.
-    PixConvert(PixelFormat),
+    /// frames pass through unchanged. Carries the source-side
+    /// `FrameInfo` (pixel format + width + height) since that data
+    /// no longer lives on `VideoFrame`; we cache it at stage-build
+    /// time off the running [`CodecParameters`].
+    PixConvert {
+        src_info: oxideav_pixfmt::FrameInfo,
+        target: PixelFormat,
+    },
 }
 
 /// Classification of a filter's emitted frames. `primary` goes to the
@@ -713,7 +719,19 @@ impl TrackRuntime {
                         .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
                 }
                 StageSpec::Convert { target } => {
-                    self.frame_stages.push(FrameStage::PixConvert(*target));
+                    // Snapshot the running source shape (format + dims)
+                    // to thread into pixfmt_convert — those used to live
+                    // on VideoFrame but moved to CodecParameters with
+                    // the slim.
+                    let src_info = oxideav_pixfmt::FrameInfo::new(
+                        running.pixel_format.unwrap_or(*target),
+                        running.width.unwrap_or(0),
+                        running.height.unwrap_or(0),
+                    );
+                    self.frame_stages.push(FrameStage::PixConvert {
+                        src_info,
+                        target: *target,
+                    });
                     // Propagate the target format into the running
                     // CodecParameters so a downstream encoder sees the
                     // correct `pixel_format`.
@@ -1007,9 +1025,9 @@ pub(crate) fn run_frame_stage_emit(
 ) -> Result<FilterEmissions> {
     match stage {
         FrameStage::Filter(f) => run_filter(f, frame),
-        FrameStage::PixConvert(target) => match frame {
+        FrameStage::PixConvert { src_info, target } => match frame {
             Frame::Video(v) => {
-                let out = pixfmt_convert(&v, *target, &ConvertOptions::default())?;
+                let out = pixfmt_convert(&v, *src_info, *target, &ConvertOptions::default())?;
                 Ok(FilterEmissions {
                     primary: vec![Frame::Video(out)],
                     extras: Vec::new(),
@@ -1029,7 +1047,7 @@ pub(crate) fn run_frame_stage_emit(
 pub(crate) fn flush_frame_stage_emit(stage: &mut FrameStage) -> Result<FilterEmissions> {
     match stage {
         FrameStage::Filter(f) => flush_filter(f),
-        FrameStage::PixConvert(_) => Ok(FilterEmissions::default()),
+        FrameStage::PixConvert { .. } => Ok(FilterEmissions::default()),
     }
 }
 

@@ -472,26 +472,22 @@ fn drain_encoder(
     }
 }
 
-/// If the decoder's output frame doesn't quite match the encoder's input
-/// expectations (e.g. time_base differs by container choice), adapt minimal
-/// fields here. Sample-format conversion is **not** performed yet — the
-/// caller must wire compatible decoder and encoder formats.
-fn adapt_frame_for_encoder(frame: Frame, out_stream: &StreamInfo) -> Result<Frame> {
-    let time_base = out_stream.time_base;
-    Ok(match frame {
-        Frame::Audio(mut a) => {
-            a.time_base = time_base;
-            Frame::Audio(a)
-        }
-        Frame::Video(mut v) => {
-            v.time_base = time_base;
-            Frame::Video(v)
-        }
-        // Subtitle / future frame variants carry their own timing domain —
-        // pass through untouched. The muxer is responsible for rescaling
-        // at the packet layer.
-        other => other,
-    })
+/// Hook for future per-format adaptation between decoder output and
+/// encoder input. Today this is a near no-op pass-through:
+///
+/// * Stream-level properties (time_base, sample format, pixel format,
+///   width/height, sample rate, channels) live on the stream's
+///   `CodecParameters`, not per-frame, so there's nothing to rewrite
+///   on the frame itself.
+/// * Packet-layer pts rescaling (decoder time_base → muxer time_base)
+///   already happens at the muxer layer and is unaffected.
+///
+/// Sample-format / pixel-format conversion is **not** performed here —
+/// the caller must wire compatible decoder and encoder formats. The
+/// signature is kept so future work (resampling, pixfmt conversion)
+/// can hook in without churning callers.
+fn adapt_frame_for_encoder(frame: Frame, _out_stream: &StreamInfo) -> Result<Frame> {
+    Ok(frame)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
