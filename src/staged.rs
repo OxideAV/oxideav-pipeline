@@ -397,69 +397,108 @@ pub(crate) fn run_pipelined_inner(
         }));
     }
 
-    // Mux loop on the caller thread — recv across every track output
+    // Mux loop on the caller thread — drain across every track output
     // channel until all are EOF or abort is set.
+    //
+    // Pre-fix this used a per-track `recv_timeout(50ms)` round-robin: when
+    // one track was empty, the mux blocked 50 ms on it before checking the
+    // next, even if the next had data ready. With audio + video tracks
+    // running in parallel and the slower decoder running ~one frame per
+    // packet, the empty-track stall throttled the *full* track to ~1
+    // message per 50 ms (~20 msg/s). On `solana-ad.mp4` that surfaced as
+    // audio-ring drain during real playback: `--vo winit+wgpu --ao auto`
+    // saw the audio queue collapse from ~1 s to ~0 s within five seconds.
+    //
+    // The new shape is a non-blocking round-robin: each pass calls
+    // `try_recv` on every track in turn, processing whatever is ready.
+    // When *every* track is empty AND none have disconnected, park briefly
+    // (1 ms) so we don't spin a CPU. EOF and disconnection are still
+    // counted as terminal exactly as before. This keeps fast-track
+    // throughput bounded only by the receive + sink-write cost, not by
+    // any sibling track's idleness.
+    let mut eof_state: Vec<bool> = vec![false; track_output_rx.len()];
     let mut eof_count = 0usize;
     let total = track_output_rx.len();
-    let mut i = 0usize;
     while eof_count < total {
         if abort.is_aborted() {
             break;
         }
-        let rx = &track_output_rx[i];
-        match rx.recv_timeout(Duration::from_millis(50)) {
-            Ok(Msg::Data(item)) => {
-                let pts = match &item.payload {
-                    OutputPayload::Packet(p) => p.pts,
-                    OutputPayload::Frame(f) => match f {
-                        Frame::Audio(a) => a.pts,
-                        Frame::Video(v) => v.pts,
-                        _ => None,
-                    },
-                };
-                match item.payload {
-                    OutputPayload::Packet(mut p) => {
-                        p.stream_index = item.track_index;
-                        if let Err(e) = sink.write_packet(item.kind, &p) {
-                            abort.record_error(e);
-                            break;
+        let mut made_progress = false;
+        for i in 0..total {
+            if eof_state[i] {
+                continue;
+            }
+            let rx = &track_output_rx[i];
+            match rx.try_recv() {
+                Ok(Msg::Data(item)) => {
+                    made_progress = true;
+                    let pts = match &item.payload {
+                        OutputPayload::Packet(p) => p.pts,
+                        OutputPayload::Frame(f) => match f {
+                            Frame::Audio(a) => a.pts,
+                            Frame::Video(v) => v.pts,
+                            _ => None,
+                        },
+                    };
+                    match item.payload {
+                        OutputPayload::Packet(mut p) => {
+                            p.stream_index = item.track_index;
+                            if let Err(e) = sink.write_packet(item.kind, &p) {
+                                abort.record_error(e);
+                                break;
+                            }
+                        }
+                        OutputPayload::Frame(f) => {
+                            if let Err(e) = sink.write_frame(item.kind, &f) {
+                                abort.record_error(e);
+                                break;
+                            }
+                            counters.frames_written.fetch_add(1, Ordering::SeqCst);
                         }
                     }
-                    OutputPayload::Frame(f) => {
-                        if let Err(e) = sink.write_frame(item.kind, &f) {
-                            abort.record_error(e);
-                            break;
-                        }
-                        counters.frames_written.fetch_add(1, Ordering::SeqCst);
+                    if let Some(tx) = &progress_tx {
+                        let frames = counters.frames_written.load(Ordering::SeqCst);
+                        let _ = tx.try_send(Progress {
+                            pts,
+                            frames,
+                            eof: false,
+                        });
                     }
                 }
-                if let Some(tx) = &progress_tx {
-                    let frames = counters.frames_written.load(Ordering::SeqCst);
-                    let _ = tx.try_send(Progress {
-                        pts,
-                        frames,
-                        eof: false,
-                    });
+                Ok(Msg::Barrier(kind)) => {
+                    made_progress = true;
+                    if let Err(e) = sink.barrier(kind) {
+                        abort.record_error(e);
+                        break;
+                    }
                 }
-            }
-            Ok(Msg::Barrier(kind)) => {
-                if let Err(e) = sink.barrier(kind) {
-                    abort.record_error(e);
-                    break;
+                Ok(Msg::Eof) => {
+                    made_progress = true;
+                    if !eof_state[i] {
+                        eof_state[i] = true;
+                        eof_count += 1;
+                    }
                 }
-            }
-            Ok(Msg::Eof) => {
-                eof_count += 1;
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Producer panicked or exited without sending Eof —
-                // count as EOF to avoid hanging. Any error was already
-                // recorded on the abort state.
-                eof_count += 1;
+                Err(mpsc::TryRecvError::Empty) => {
+                    // Try the next track; if all are empty we'll park
+                    // briefly below.
+                }
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    // Producer panicked or exited without sending Eof —
+                    // count as EOF to avoid hanging. Any error was
+                    // already recorded on the abort state.
+                    if !eof_state[i] {
+                        eof_state[i] = true;
+                        eof_count += 1;
+                    }
+                }
             }
         }
-        i = (i + 1) % total;
+        if !made_progress && eof_count < total {
+            // Every track was empty this pass — park 1 ms so we don't
+            // spin a CPU core while waiting for upstream stages.
+            thread::sleep(Duration::from_millis(1));
+        }
     }
 
     // Drain abort flag + wait for workers regardless of exit path.
