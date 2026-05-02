@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.3](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.2...v0.1.3) - 2026-05-02
+
+### Other
+
+- migrate to centralized OxideAV/.github reusable workflows
+- stay on 0.1.x during heavy dev (semver_check=false)
+- branch on SourceOutput shape (Bytes/Packets/Frames)
+- non-blocking round-robin so a slow track doesn't starve a fast one
+- stream frames per-receive instead of drain-then-send
+- adopt slim VideoFrame/AudioFrame shape
+- pin release-plz to patch-only bumps
+
 ### Added
 
 - DAG: `PacketSource` and `FrameSource` node variants matching the typed-source
