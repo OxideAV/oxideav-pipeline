@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- DAG: `PacketSource` and `FrameSource` node variants matching the typed-source
+  shapes in `oxideav-core::SourceOutput`. The executor probes every `Demuxer`
+  leaf via `SourceRegistry::open`, then rewrites the node when the registry
+  hands back `SourceOutput::Packets` / `SourceOutput::Frames` so downstream
+  decode (for packets) or filter+sink (for frames) consumes the right shape
+  without an intervening container demux or decoder.
+- Executor: `SourcePump` enum + `open_source` / `resolve_source_shapes`
+  helpers. `run_output` now branches per source shape — bytes goes through
+  the historical demuxer chain, packet sources skip demux, frame sources
+  skip both demux and decode and route directly into the filter chain (or
+  the sink if no filter is declared).
+- Test: `tests/source_variants.rs` exercises all three shapes end-to-end via
+  in-tree mocks; each path produces the expected single audio frame.
+
+### Changed
+
+- Pipelined runner falls back to the serial path when any source resolves
+  to a non-bytes shape. The staged-worker variants for `PacketSource` /
+  `FrameSource` are tracked as follow-up work — RTMP and the generator
+  both run fine on the serial path, which is the default for live playback
+  on the typical thread budget.
+
 ## [0.1.2](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.1...v0.1.2) - 2026-04-25
 
 ### Other

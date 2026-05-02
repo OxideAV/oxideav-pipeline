@@ -25,14 +25,28 @@ pub struct NodeId(pub usize);
 #[derive(Clone, Debug)]
 pub enum DagNode {
     /// Open a demuxer from a source URI. Emits packets stream-by-stream;
-    /// downstream `Select` nodes filter.
+    /// downstream `Select` nodes filter. Built when `SourceRegistry::open`
+    /// resolves the URI to a [`oxideav_core::SourceOutput::Bytes`].
     Demuxer { source: String },
+    /// Open a [`PacketSource`](oxideav_core::PacketSource) from a source
+    /// URI. Skips the container demux stage — the source already emits
+    /// packets natively (RTMP, future SRT / RTSP, …). Downstream `Select`
+    /// nodes still apply per-stream filtering identically.
+    PacketSource { source: String },
+    /// Open a [`FrameSource`](oxideav_core::FrameSource) from a source
+    /// URI. Skips both demux + decode — the source emits decoded frames
+    /// natively (synthetic generators, future capture-card drivers, …).
+    /// Downstream `Filter` / `PixConvert` / `Encode` nodes consume frames
+    /// directly without an intervening `Decode` node.
+    FrameSource { source: String },
     /// Constrain upstream streams to those matching `selector`.
     Select {
         upstream: NodeId,
         selector: ResolvedSelector,
     },
-    /// Decode packets to frames.
+    /// Decode packets to frames. Accepts either `Demuxer` (via `Select`)
+    /// or `PacketSource` upstream — both produce `Packet`s, so the decode
+    /// step is identical.
     Decode { upstream: NodeId },
     /// Apply a named filter to frames. The filter's concrete media-kind
     /// matrix (audio-in / video-out / …) is resolved at track-runtime
@@ -114,6 +128,14 @@ impl Dag {
     }
     pub fn nodes(&self) -> &[DagNode] {
         &self.nodes
+    }
+
+    /// Mutable view over every node. Used by the executor's source-probe
+    /// pass to rewrite `Demuxer { source }` into `PacketSource { source }`
+    /// or `FrameSource { source }` once the source registry has reported
+    /// what shape the URI actually opens as.
+    pub fn nodes_mut(&mut self) -> &mut [DagNode] {
+        &mut self.nodes
     }
 
     fn push(&mut self, node: DagNode) -> NodeId {
@@ -332,10 +354,17 @@ impl Job {
 
     /// Does the node currently emit raw packets? (Demuxer/Select yes, Decode
     /// no, Filter/PixConvert no, Encode yes.)
+    ///
+    /// `PacketSource` is packet-producing (its whole point). `FrameSource`
+    /// is *frame*-producing — the resolver treats it like a `Decode` for
+    /// downstream wiring decisions.
     fn is_packet_producing(&self, dag: &Dag, id: NodeId) -> Result<bool> {
         Ok(matches!(
             dag.node(id),
-            DagNode::Demuxer { .. } | DagNode::Select { .. } | DagNode::Encode { .. }
+            DagNode::Demuxer { .. }
+                | DagNode::PacketSource { .. }
+                | DagNode::Select { .. }
+                | DagNode::Encode { .. }
         ))
     }
 }
@@ -439,6 +468,12 @@ impl Dag {
         match &self.nodes[id.0] {
             DagNode::Demuxer { source } => {
                 out.push_str(&format!("{pad}demuxer({source})\n"));
+            }
+            DagNode::PacketSource { source } => {
+                out.push_str(&format!("{pad}packet-source({source})\n"));
+            }
+            DagNode::FrameSource { source } => {
+                out.push_str(&format!("{pad}frame-source({source})\n"));
             }
             DagNode::Select { upstream, selector } => {
                 out.push_str(&format!(

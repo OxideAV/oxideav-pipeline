@@ -17,8 +17,9 @@ use std::path::PathBuf;
 
 use oxideav_core::{
     CodecId, CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext,
-    FilterContext, FilterRegistry, Frame, MediaType, Packet, PixelFormat, PortParams, PortSpec,
-    Rational, ReadSeek, Result, RuntimeContext, SampleFormat, StreamFilter, StreamInfo, TimeBase,
+    FilterContext, FilterRegistry, Frame, FrameSource, MediaType, Packet, PacketSource,
+    PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result, RuntimeContext, SampleFormat,
+    SourceOutput, StreamFilter, StreamInfo, TimeBase,
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
@@ -26,6 +27,61 @@ use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedS
 use crate::schema::{is_reserved_sink, Job};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
+
+/// One opened source, branched on the registered shape. Held in the
+/// executor's per-URI map so the run loops can pump packets or frames
+/// straight into the per-track stages without re-opening the source.
+///
+/// `Demuxer` is the historical shape (bytes → container probe → demuxer).
+/// `Packets` skips the container layer (RTMP, RTSP, …). `Frames` skips
+/// both demux + decode (synthetic generators).
+pub(crate) enum SourcePump {
+    Demuxer(Box<dyn Demuxer>),
+    Packets(Box<dyn PacketSource>),
+    Frames {
+        source: Box<dyn FrameSource>,
+        /// Synthesised single-stream descriptor — frame sources expose
+        /// only `params()`, but the rest of the executor (selector
+        /// matching, mux output stream layout) wants a `StreamInfo`.
+        streams: Vec<StreamInfo>,
+    },
+}
+
+impl SourcePump {
+    pub(crate) fn streams(&self) -> &[StreamInfo] {
+        match self {
+            Self::Demuxer(d) => d.streams(),
+            Self::Packets(p) => p.streams(),
+            Self::Frames { streams, .. } => streams.as_slice(),
+        }
+    }
+}
+
+/// Build a one-element `StreamInfo` list for a [`FrameSource`]. The
+/// selector logic in [`select_stream`] always picks index 0 for
+/// frame-shape sources.
+fn synth_stream_info(params: &CodecParameters) -> StreamInfo {
+    // Time base: prefer the audio sample rate, else the video frame
+    // rate's reciprocal, else microsecond ticks.
+    let time_base = match params.media_type {
+        MediaType::Audio => match params.sample_rate {
+            Some(sr) if sr > 0 => TimeBase::new(1, sr as i64),
+            _ => TimeBase::new(1, 1_000_000),
+        },
+        MediaType::Video => match params.frame_rate {
+            Some(fr) if fr.num != 0 && fr.den != 0 => TimeBase::new(fr.den, fr.num),
+            _ => TimeBase::new(1, 1_000_000),
+        },
+        _ => TimeBase::new(1, 1_000_000),
+    };
+    StreamInfo {
+        index: 0,
+        time_base,
+        duration: None,
+        start_time: Some(0),
+        params: params.clone(),
+    }
+}
 
 /// A user-installable output sink. Implementations receive either raw
 /// packets (copy path) or decoded frames (transcode path without an
@@ -177,6 +233,13 @@ impl<'a> Executor<'a> {
     }
 
     fn run_output(&mut self, dag: &Dag, name: &str) -> Result<ExecutorStats> {
+        let mut dag = dag.clone();
+        // Probe every Demuxer-shape leaf and rewrite to the typed
+        // variant (PacketSource / FrameSource) when the registry hands
+        // back a non-bytes opener. Returns the opened sources keyed by
+        // URI so we don't re-open below.
+        let mut sources_by_uri = self.resolve_source_shapes(&mut dag)?;
+        let dag = &dag;
         let root_id = dag.roots[name];
         let tracks: Vec<MuxTrack> = match dag.node(root_id) {
             DagNode::Mux { tracks, .. } => tracks.clone(),
@@ -187,44 +250,35 @@ impl<'a> Executor<'a> {
             }
         };
 
-        // Walk each track's upstream chain to find the leaf Demuxer + the
+        // Walk each track's upstream chain to find the source leaf + the
         // stack of stages (select/decode/filter/encode) to apply.
         let mut pipelines: Vec<TrackRuntime> = Vec::new();
         for t in &tracks {
             pipelines.push(self.build_track_runtime(dag, t)?);
         }
 
-        // Open every unique demuxer source exactly once.
-        let mut dmx_by_uri: HashMap<String, Box<dyn Demuxer>> = HashMap::new();
-        for pl in &pipelines {
-            if !dmx_by_uri.contains_key(&pl.source_uri) {
-                let dmx = self.open_demuxer(&pl.source_uri)?;
-                dmx_by_uri.insert(pl.source_uri.clone(), dmx);
-            }
-        }
-
         // Expand `all:` tracks (kind == Unknown, selector == any) into
-        // one TrackRuntime per source stream now that the demuxer can
+        // one TrackRuntime per source stream now that the source can
         // be queried for its stream list.
-        pipelines = expand_all_tracks(pipelines, &dmx_by_uri);
+        pipelines = expand_all_tracks_pump(pipelines, &sources_by_uri);
 
         // Resolve each pipeline's stream index now that we can inspect
-        // the demuxer's stream list.
+        // the source's stream list. For frame sources `select_stream`
+        // always returns the synthetic index 0.
         for pl in &mut pipelines {
-            let dmx = dmx_by_uri.get(&pl.source_uri).unwrap();
-            pl.source_stream = select_stream(dmx.streams(), &pl.selector)?;
-            // The pipeline's input params come from the actual demuxer stream.
-            let info = dmx
+            let pump = sources_by_uri.get(&pl.source_uri).unwrap();
+            pl.source_stream = select_stream(pump.streams(), &pl.selector)?;
+            let info = pump
                 .streams()
                 .iter()
                 .find(|s| s.index == pl.source_stream)
-                .ok_or_else(|| Error::invalid("selected stream not in demuxer"))?;
+                .ok_or_else(|| Error::invalid("selected stream not in source"))?;
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
         }
 
         // Auto-insert pixel-format conversion stages now that we know
-        // the source stream's pixel format. Runs after the demuxer is
+        // the source stream's pixel format. Runs after the source is
         // open and before codec instantiation.
         for pl in &mut pipelines {
             pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
@@ -246,35 +300,87 @@ impl<'a> Executor<'a> {
         let mut sink = self.open_sink(name, &out_streams)?;
         sink.start(&out_streams)?;
 
-        // Main pump. Read packets from every demuxer in round-robin until
-        // all are EOF. Route each packet to every pipeline that consumes it.
+        // Main pump. Read packets / frames from every source in
+        // round-robin until all are EOF. Routes vary by source shape:
+        //   - Demuxer / Packets → next_packet()  → feed_packet()
+        //   - Frames            → next_frame()   → feed_frame()
         let mut stats = ExecutorStats::default();
         let mut eof: HashMap<String, bool> =
-            dmx_by_uri.keys().map(|k| (k.clone(), false)).collect();
-        let uris: Vec<String> = dmx_by_uri.keys().cloned().collect();
+            sources_by_uri.keys().map(|k| (k.clone(), false)).collect();
+        let uris: Vec<String> = sources_by_uri.keys().cloned().collect();
         while eof.values().any(|e| !e) {
             for uri in &uris {
                 if eof[uri] {
                     continue;
                 }
-                let dmx = dmx_by_uri.get_mut(uri).unwrap();
-                let pkt = match dmx.next_packet() {
-                    Ok(p) => p,
-                    Err(Error::Eof) => {
-                        eof.insert(uri.clone(), true);
-                        continue;
-                    }
-                    Err(e) => return Err(e),
-                };
-                stats.packets_read += 1;
-                for (track_idx, pl) in pipelines.iter_mut().enumerate() {
-                    if pl.source_uri != *uri {
-                        continue;
-                    }
-                    if pkt.stream_index != pl.source_stream {
-                        continue;
-                    }
-                    pl.feed_packet(&pkt, track_idx as u32, sink.as_mut(), &mut stats)?;
+                let pump = sources_by_uri.get_mut(uri).unwrap();
+                match pump {
+                    SourcePump::Demuxer(dmx) => match dmx.next_packet() {
+                        Ok(pkt) => {
+                            stats.packets_read += 1;
+                            for (track_idx, pl) in pipelines.iter_mut().enumerate() {
+                                if pl.source_uri != *uri {
+                                    continue;
+                                }
+                                if pkt.stream_index != pl.source_stream {
+                                    continue;
+                                }
+                                pl.feed_packet(&pkt, track_idx as u32, sink.as_mut(), &mut stats)?;
+                            }
+                        }
+                        Err(Error::Eof) => {
+                            eof.insert(uri.clone(), true);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    SourcePump::Packets(pkts) => match pkts.next_packet() {
+                        Ok(pkt) => {
+                            stats.packets_read += 1;
+                            for (track_idx, pl) in pipelines.iter_mut().enumerate() {
+                                if pl.source_uri != *uri {
+                                    continue;
+                                }
+                                if pkt.stream_index != pl.source_stream {
+                                    continue;
+                                }
+                                pl.feed_packet(&pkt, track_idx as u32, sink.as_mut(), &mut stats)?;
+                            }
+                        }
+                        Err(Error::Eof) => {
+                            eof.insert(uri.clone(), true);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    },
+                    SourcePump::Frames { source, .. } => match source.next_frame() {
+                        Ok(frame) => {
+                            // Frame sources have a single synthetic
+                            // stream — every track on this URI consumes
+                            // the same frame. We clone for each track
+                            // beyond the first so ownership works out.
+                            stats.frames_decoded += 1;
+                            let mut consumers: Vec<usize> = Vec::new();
+                            for (track_idx, pl) in pipelines.iter().enumerate() {
+                                if pl.source_uri == *uri {
+                                    consumers.push(track_idx);
+                                }
+                            }
+                            for &track_idx in &consumers {
+                                pipelines[track_idx].feed_frame(
+                                    frame.clone(),
+                                    track_idx as u32,
+                                    sink.as_mut(),
+                                    &mut stats,
+                                )?;
+                            }
+                        }
+                        Err(Error::Eof) => {
+                            eof.insert(uri.clone(), true);
+                            continue;
+                        }
+                        Err(e) => return Err(e),
+                    },
                 }
             }
         }
@@ -288,24 +394,48 @@ impl<'a> Executor<'a> {
 
     pub(crate) fn build_track_runtime(&self, dag: &Dag, track: &MuxTrack) -> Result<TrackRuntime> {
         // Walk upstream chain, accumulating stages in reverse (top-down).
-        // The chain ends at a Demuxer (leaf). The pixel-format
-        // auto-insert pass runs later, once the demuxer is open and
-        // the source's `CodecParameters.pixel_format` is known —
+        // The chain ends at a Demuxer / PacketSource / FrameSource leaf.
+        // The pixel-format auto-insert pass runs later, once the source
+        // is open and its `CodecParameters.pixel_format` is known —
         // see `TrackRuntime::apply_pixel_format_auto_insert`.
         let mut stages: Vec<StageSpec> = Vec::new();
+        let mut leaf_is_frames = false;
         let mut cur = track.upstream;
         let (source_uri, selector) = loop {
             match dag.node(cur) {
                 DagNode::Demuxer { source } => {
                     break (source.clone(), ResolvedSelector::any());
                 }
+                DagNode::PacketSource { source } => {
+                    // PacketSource is a packet-producing leaf — same
+                    // shape as Demuxer for the rest of the pipeline.
+                    break (source.clone(), ResolvedSelector::any());
+                }
+                DagNode::FrameSource { source } => {
+                    // FrameSource is a frame-producing leaf — no decode
+                    // stage in the upstream chain. The runtime detects
+                    // this via the `Frames` SourcePump variant and
+                    // routes frames straight into the filter chain.
+                    leaf_is_frames = true;
+                    break (source.clone(), ResolvedSelector::any());
+                }
                 DagNode::Select { upstream, selector } => match dag.node(*upstream) {
-                    DagNode::Demuxer { source } => {
+                    DagNode::Demuxer { source } | DagNode::PacketSource { source } => {
+                        break (source.clone(), selector.clone());
+                    }
+                    DagNode::FrameSource { source } => {
+                        // A `Select` over a frame source is degenerate —
+                        // there's exactly one (synthetic) stream — but
+                        // honour the kind constraint so a job that asks
+                        // for `audio:` on a video frame source still
+                        // errors loudly downstream rather than silently
+                        // muxing a video frame as audio.
+                        leaf_is_frames = true;
                         break (source.clone(), selector.clone());
                     }
                     _ => {
                         return Err(Error::other(
-                            "job: nested Select above non-Demuxer is not yet supported",
+                            "job: nested Select above non-source-leaf is not yet supported",
                         ));
                     }
                 },
@@ -347,34 +477,147 @@ impl<'a> Executor<'a> {
             }
         };
         stages.reverse();
+        // FrameSource leaves emit decoded frames directly — drop any
+        // `Decode` stage that the resolver inserted between the source
+        // and the first filter / encode. Without this, the runtime
+        // would try to feed frames into a decoder that expects packets.
+        if leaf_is_frames {
+            stages.retain(|s| !matches!(s, StageSpec::Decode));
+        }
         Ok(TrackRuntime::new(
             source_uri, selector, track.kind, track.copy, stages,
         ))
     }
 
+    /// Open a source URI into a [`SourcePump`]. Branches on the
+    /// [`SourceOutput`] returned by the source registry — bytes-shape
+    /// sources go through the historical container-probe + demuxer-open
+    /// dance; packet-shape and frame-shape sources are wrapped directly.
+    pub(crate) fn open_source(&self, uri: &str) -> Result<SourcePump> {
+        match self.ctx.sources.open(uri)? {
+            SourceOutput::Bytes(bytes) => {
+                // The trait alias `BytesSource: Read + Seek + Send` and
+                // `ReadSeek: Read + Seek` differ only in the explicit
+                // `Send` bound; container open wants `Box<dyn ReadSeek>`.
+                // Re-box through a shim so the lifetimes line up without
+                // adding a `Send` bound to the existing demuxer trait.
+                let mut file: Box<dyn ReadSeek> = Box::new(bytes);
+                let ext = ext_from_uri(uri);
+                let format = self
+                    .ctx
+                    .containers
+                    .probe_input(&mut *file, ext.as_deref())?;
+                let dmx = self
+                    .ctx
+                    .containers
+                    .open_demuxer(&format, file, &self.ctx.codecs)?;
+                Ok(SourcePump::Demuxer(dmx))
+            }
+            SourceOutput::Packets(p) => Ok(SourcePump::Packets(p)),
+            SourceOutput::Frames(f) => {
+                let streams = vec![synth_stream_info(f.params())];
+                Ok(SourcePump::Frames { source: f, streams })
+            }
+        }
+    }
+
+    /// Convenience: open a source URI and assert it's bytes-shape.
+    /// Retained for callers that strictly want a `Box<dyn Demuxer>` —
+    /// today only a couple of legacy code paths and tests. New code
+    /// should prefer [`open_source`](Self::open_source) and branch on
+    /// the returned [`SourcePump`].
     pub(crate) fn open_demuxer(&self, uri: &str) -> Result<Box<dyn Demuxer>> {
-        let file = self.ctx.sources.open(uri)?;
-        let mut file: Box<dyn ReadSeek> = file;
-        let ext = ext_from_uri(uri);
-        let format = self
-            .ctx
-            .containers
-            .probe_input(&mut *file, ext.as_deref())?;
-        self.ctx
-            .containers
-            .open_demuxer(&format, file, &self.ctx.codecs)
+        match self.open_source(uri)? {
+            SourcePump::Demuxer(d) => Ok(d),
+            SourcePump::Packets(_) | SourcePump::Frames { .. } => Err(Error::unsupported(format!(
+                "source {uri}: opener returned non-bytes shape; use open_source() instead"
+            ))),
+        }
+    }
+
+    /// Open every unique source URI referenced by a `Demuxer` node in
+    /// `dag`, then rewrite the node to `PacketSource` / `FrameSource`
+    /// when the registry hands back a non-bytes shape. Returns the
+    /// opened sources keyed by URI so the caller can move them into the
+    /// run loop without re-opening.
+    ///
+    /// Bytes-shape sources keep their `Demuxer` node — the container
+    /// probe + demuxer-open already happened during this probe call,
+    /// and the resulting `Box<dyn Demuxer>` is returned in the map.
+    pub(crate) fn resolve_source_shapes(
+        &self,
+        dag: &mut Dag,
+    ) -> Result<HashMap<String, SourcePump>> {
+        // Collect unique source URIs first to avoid double-opening when
+        // the same source appears in multiple places (alias inlining,
+        // multi-track outputs all reading the same input).
+        let mut uris: Vec<(usize, String)> = Vec::new();
+        for (idx, node) in dag.nodes().iter().enumerate() {
+            if let DagNode::Demuxer { source } = node {
+                uris.push((idx, source.clone()));
+            }
+        }
+        let mut opened: HashMap<String, SourcePump> = HashMap::new();
+        for (node_idx, uri) in uris {
+            if !opened.contains_key(&uri) {
+                let pump = self.open_source(&uri)?;
+                opened.insert(uri.clone(), pump);
+            }
+            // Rewrite the node based on what the source actually is.
+            match opened.get(&uri).unwrap() {
+                SourcePump::Demuxer(_) => {
+                    // Stay as Demuxer — historical path.
+                }
+                SourcePump::Packets(_) => {
+                    dag.nodes_mut()[node_idx] = DagNode::PacketSource {
+                        source: uri.clone(),
+                    };
+                }
+                SourcePump::Frames { .. } => {
+                    dag.nodes_mut()[node_idx] = DagNode::FrameSource {
+                        source: uri.clone(),
+                    };
+                }
+            }
+        }
+        Ok(opened)
     }
 
     /// Pipelined counterpart to [`Self::run_output`]. Builds the same
     /// per-track runtimes + demuxers + sink, then hands them off to
     /// [`crate::staged::run_pipelined`] which spawns a stage-per-thread
     /// worker graph.
+    ///
+    /// Falls back to [`Self::run_output`] when any source resolves to a
+    /// non-bytes shape (`PacketSource` / `FrameSource`). The pipelined
+    /// runner today only knows how to drive a `Box<dyn Demuxer>`; the
+    /// staged-worker variants for the typed-source shapes are tracked as
+    /// follow-up work and not blocking for the typed-source pipeline
+    /// to be useful (RTMP + generator both run fine on the serial path).
     fn run_output_pipelined(
         &mut self,
         dag: &Dag,
         name: &str,
         threads: usize,
     ) -> Result<ExecutorStats> {
+        // Probe sources without committing to the pipelined path —
+        // bytes-shape stays pipelined, anything else falls back.
+        let mut probed = dag.clone();
+        let opened = self.resolve_source_shapes(&mut probed)?;
+        let any_typed = opened
+            .values()
+            .any(|p| !matches!(p, SourcePump::Demuxer(_)));
+        if any_typed {
+            // Drop the pre-opened sources so `run_output` can re-open
+            // them itself. Re-opening is cheap for the in-tree drivers
+            // (file is mmap-friendly, generators are deterministic by
+            // URI, RTMP follow-up may need to refactor this when it
+            // lands as the second consumer).
+            drop(opened);
+            return self.run_output(&probed, name);
+        }
+        // Bytes-only path — everything below is unchanged.
+        drop(opened);
         let prep = self.prepare_pipelined_run(dag, name, threads)?;
         staged::run_pipelined(prep.pipelines, prep.dmx_by_uri, prep.sink, prep.out_streams)
     }
@@ -837,6 +1080,19 @@ impl TrackRuntime {
         self.encoder_time_base.unwrap_or(self.input_time_base)
     }
 
+    /// Push one frame straight into this track's frame-stage chain.
+    /// Used when the source is a [`SourcePump::Frames`] — there's no
+    /// upstream decoder to drive, so we skip directly to `pump_frame`.
+    pub(crate) fn feed_frame(
+        &mut self,
+        frame: Frame,
+        track_index: u32,
+        sink: &mut dyn JobSink,
+        stats: &mut ExecutorStats,
+    ) -> Result<()> {
+        self.pump_frame(frame, track_index, sink, stats)
+    }
+
     fn feed_packet(
         &mut self,
         pkt: &Packet,
@@ -1159,6 +1415,43 @@ pub(crate) fn expand_all_tracks(
         }
         // One duplicate per source stream. Selector pinned to that
         // stream's index so later `select_stream` hits deterministically.
+        for s in streams {
+            let selector = ResolvedSelector {
+                kind: Some(s.params.media_type),
+                index: None,
+            };
+            out.push(pl.duplicate_pre_instantiate(s.params.media_type, selector));
+        }
+    }
+    out
+}
+
+/// Like [`expand_all_tracks`] but keyed off a [`SourcePump`] map. Used
+/// by the new typed-source path; mirrors the legacy demuxer-only
+/// helper so the serial + pipelined runners can both call into a
+/// single fan-out routine regardless of source shape.
+pub(crate) fn expand_all_tracks_pump(
+    pipelines: Vec<TrackRuntime>,
+    sources_by_uri: &HashMap<String, SourcePump>,
+) -> Vec<TrackRuntime> {
+    let mut out: Vec<TrackRuntime> = Vec::with_capacity(pipelines.len());
+    for pl in pipelines {
+        let needs_expand = pl.kind == MediaType::Unknown
+            && pl.selector.kind.is_none()
+            && pl.selector.index.is_none();
+        if !needs_expand {
+            out.push(pl);
+            continue;
+        }
+        let Some(pump) = sources_by_uri.get(&pl.source_uri) else {
+            out.push(pl);
+            continue;
+        };
+        let streams = pump.streams();
+        if streams.is_empty() {
+            out.push(pl);
+            continue;
+        }
         for s in streams {
             let selector = ResolvedSelector {
                 kind: Some(s.params.media_type),
