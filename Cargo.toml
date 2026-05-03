@@ -34,4 +34,4 @@ default = []
 # the in-tree stub demuxer + decoder (`tests/common/stub.rs`) so this
 # crate has zero codec/container dev-deps.
 [dev-dependencies]
-oxideav-audio-filter = "0.0"
+oxideav-audio-filter = "0.1"
