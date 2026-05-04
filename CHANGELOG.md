@@ -7,6 +7,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Executor: `run_output_pipelined` no longer panics with `Option::unwrap() on a
+  None` when a typed-source job (e.g. `oxideav convert "xc:red" out.png` and
+  every other `generate://` URI fed to the convert verb) falls back from the
+  pipelined to the serial path. Previously the probe rewrote `Demuxer { source }`
+  → `FrameSource { source }` in a clone of the DAG and handed *that* clone to
+  `run_output`, but `run_output`'s own `resolve_source_shapes` only collects
+  URIs from `Demuxer` nodes — so the second pass found none and
+  `sources_by_uri.get(&pl.source_uri).unwrap()` blew up at executor.rs:269.
+  The fix passes the *original* DAG (with its `Demuxer` leaves) to the
+  fallback so `run_output` can re-discover and re-open the URIs itself.
+  The `.unwrap()` is also rewritten as a descriptive `Error::invalid` so future
+  resolver bugs surface as a normal error rather than a panic. Regression
+  coverage in `tests/source_variants.rs` exercises both the FrameSource and
+  PacketSource shapes through the pipelined path.
+
 ## [0.1.4](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.3...v0.1.4) - 2026-05-03
 
 ### Other

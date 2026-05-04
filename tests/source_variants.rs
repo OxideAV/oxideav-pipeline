@@ -338,6 +338,15 @@ fn make_ctx() -> RuntimeContext {
 /// playback-style `@display` sink. Returns the per-kind frame counts
 /// observed by the sink.
 fn run_via(uri: &str) -> SinkCounters {
+    run_via_threads(uri, 1)
+}
+
+/// Same as [`run_via`] but with an explicit thread budget so callers can
+/// pin the executor to either the serial path (`threads = 1`) or the
+/// pipelined path (`threads ≥ 2`). Pipelined runs of typed-source jobs
+/// historically panicked at `executor.rs` with `Option::unwrap()` on a
+/// `None`, so the tests below cover both paths.
+fn run_via_threads(uri: &str, threads: usize) -> SinkCounters {
     let ctx = make_ctx();
     // `@display` is the standard reserved sink that consumes raw
     // frames; we override it with a counting sink so we can assert on
@@ -355,7 +364,7 @@ fn run_via(uri: &str) -> SinkCounters {
         shared: shared.clone(),
     });
     Executor::new(&job, &ctx)
-        .with_threads(1)
+        .with_threads(threads)
         .with_sink_override("@display", sink)
         .run()
         .expect("executor run");
@@ -405,6 +414,51 @@ fn frame_source_routes_frames_directly_to_sink() {
     assert_eq!(
         c.audio_frames, 1,
         "frame path: expected 1 audio frame routed directly to sink, got {}",
+        c.audio_frames
+    );
+    assert_eq!(c.video_frames, 0);
+}
+
+/// Regression: the pipelined runner used to *probe* the source, rewrite
+/// `Demuxer { source }` → `FrameSource { source }` in a clone of the DAG,
+/// then hand that *rewritten* clone to `run_output` as the fallback path
+/// for typed-source jobs. `run_output`'s own `resolve_source_shapes`
+/// pass only collected URIs from `Demuxer` nodes, so the second pass
+/// found none, `sources_by_uri` came out empty, and the next
+/// `sources_by_uri.get(&pl.source_uri).unwrap()` panicked with
+/// `Option::unwrap() on a None` (executor.rs:269).
+///
+/// Triggered by `oxideav convert "xc:red" out.png` and any other CLI
+/// path that fed a `generate://` URI into the convert verb — every
+/// generator source crashed before producing a single frame.
+///
+/// The fix passes the *original* DAG (with its `Demuxer` leaves) to the
+/// fallback so `run_output` can re-discover and re-open the URIs itself.
+#[test]
+fn frame_source_pipelined_path_does_not_panic() {
+    // `with_threads(2)` selects `run_output_pipelined`, which in turn
+    // falls back to `run_output` because the source resolves to
+    // `SourceOutput::Frames` (the bytes-only pipelined runner can't
+    // drive frame sources). Before the fix this fell through to the
+    // .unwrap() panic; after the fix the frame is delivered normally.
+    let c = run_via_threads("svframes://anything", 2);
+    assert_eq!(
+        c.audio_frames, 1,
+        "frame path (pipelined): expected 1 audio frame, got {}",
+        c.audio_frames
+    );
+    assert_eq!(c.video_frames, 0);
+}
+
+#[test]
+fn packet_source_pipelined_path_does_not_panic() {
+    // Same fallback path as the FrameSource case: pipelined → typed
+    // source → fallback to serial run_output. PacketSource is also
+    // typed, so it also tripped the empty-`sources_by_uri` panic.
+    let c = run_via_threads("svpackets://anything", 2);
+    assert_eq!(
+        c.audio_frames, 1,
+        "packet path (pipelined): expected 1 audio frame, got {}",
         c.audio_frames
     );
     assert_eq!(c.video_frames, 0);

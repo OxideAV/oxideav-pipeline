@@ -266,7 +266,14 @@ impl<'a> Executor<'a> {
         // the source's stream list. For frame sources `select_stream`
         // always returns the synthetic index 0.
         for pl in &mut pipelines {
-            let pump = sources_by_uri.get(&pl.source_uri).unwrap();
+            let pump = sources_by_uri.get(&pl.source_uri).ok_or_else(|| {
+                Error::invalid(format!(
+                    "job: track references source {:?} but no source was opened for that URI \
+                     (known URIs: {:?}) — this is an internal pipeline-resolver bug",
+                    pl.source_uri,
+                    sources_by_uri.keys().collect::<Vec<_>>(),
+                ))
+            })?;
             pl.source_stream = select_stream(pump.streams(), &pl.selector)?;
             let info = pump
                 .streams()
@@ -613,8 +620,16 @@ impl<'a> Executor<'a> {
             // (file is mmap-friendly, generators are deterministic by
             // URI, RTMP follow-up may need to refactor this when it
             // lands as the second consumer).
+            //
+            // Pass the *original* `dag` (with its `Demuxer` leaves) — not
+            // the rewritten `probed` — so `run_output`'s own
+            // `resolve_source_shapes` call can find the Demuxer nodes and
+            // re-open them. `resolve_source_shapes` only collects URIs from
+            // `Demuxer` nodes, so handing it the already-rewritten DAG
+            // would silently produce an empty `sources_by_uri` and panic
+            // on the very next `.unwrap()`.
             drop(opened);
-            return self.run_output(&probed, name);
+            return self.run_output(dag, name);
         }
         // Bytes-only path — everything below is unchanged.
         drop(opened);
