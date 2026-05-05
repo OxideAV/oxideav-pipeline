@@ -671,13 +671,31 @@ fn run_decode_stage(
     // Buffering the entire emission into a Vec deferred the first
     // downstream send until decode finished; for an infinite-loop song
     // the player never started.
+    // Tolerance bookkeeping: a single per-packet decode glitch (e.g.
+    // an AAC frame where the bit-stream has a recoverable parse error)
+    // must NOT abort the entire stream. ffmpeg's `decode_audio` /
+    // `decode_video` log + skip the offending packet and keep going;
+    // the H.264 decoder in this workspace already follows this pattern
+    // internally (`eprintln!("h264 slice skipped: {e}")`). Pre-fix the
+    // audio path here would `return Err(e)` on the first transient
+    // codec error and kill the entire stream — the user-reported
+    // congress_mtgox_coins.mp4 hang at 00:00 was exactly that: AAC
+    // packet #3 returned an "out of bits" error after producing 2
+    // frames, the executor exited the worker, the engine never got
+    // any further frames, the audio clock never advanced.
     'outer: loop {
         if abort.is_aborted() {
             break;
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
-                decoder.send_packet(&pkt)?;
+                if let Err(e) = decoder.send_packet(&pkt) {
+                    eprintln!(
+                        "pipeline: decoder skipped packet (stream {}, pts {:?}): {}",
+                        pkt.stream_index, pkt.pts, e
+                    );
+                    continue;
+                }
                 loop {
                     if abort.is_aborted() {
                         break 'outer;
@@ -692,7 +710,22 @@ fn run_decode_stage(
                         }
                         Err(Error::NeedMore) => break,
                         Err(Error::Eof) => break 'outer,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // Per-packet decode error: log + try the next
+                            // packet. The decoder is responsible for
+                            // self-resyncing (clearing its internal
+                            // pending state when receive_frame errors —
+                            // see oxideav-aac decode_packet.rs). If a
+                            // codec is genuinely broken every packet
+                            // will surface this and the stream will
+                            // stay silent / black, which is better
+                            // than a wedged player.
+                            eprintln!(
+                                "pipeline: decoder skipped frame after packet (stream {}, pts {:?}): {}",
+                                pkt.stream_index, pkt.pts, e
+                            );
+                            break;
+                        }
                     }
                 }
             }
@@ -706,7 +739,9 @@ fn run_decode_stage(
                 }
             }
             Ok(Msg::Eof) => {
-                decoder.flush()?;
+                if let Err(e) = decoder.flush() {
+                    eprintln!("pipeline: decoder flush error: {}", e);
+                }
                 loop {
                     if abort.is_aborted() {
                         break 'outer;
@@ -719,7 +754,10 @@ fn run_decode_stage(
                             }
                         }
                         Err(Error::NeedMore) | Err(Error::Eof) => break,
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            eprintln!("pipeline: decoder error during EOF drain: {}", e);
+                            break;
+                        }
                     }
                 }
                 break;

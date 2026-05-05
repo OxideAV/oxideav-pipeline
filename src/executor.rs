@@ -1133,13 +1133,29 @@ impl TrackRuntime {
         // `&mut self` borrow legal.
         if self.decoder.is_some() {
             if let Some(dec) = &mut self.decoder {
-                dec.send_packet(pkt)?;
+                if let Err(e) = dec.send_packet(pkt) {
+                    // Per-packet decoder errors must not abort the stream.
+                    // Same rationale as `staged.rs::run_decode_stage`: a
+                    // single recoverable bit-stream glitch should be
+                    // logged and skipped, not propagated to the executor.
+                    eprintln!(
+                        "executor: decoder skipped packet (track {}, pts {:?}): {}",
+                        track_index, pkt.pts, e
+                    );
+                    return Ok(());
+                }
             }
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        eprintln!(
+                            "executor: decoder receive_frame error (track {}, pts {:?}): {}",
+                            track_index, pkt.pts, e
+                        );
+                        break;
+                    }
                 };
                 stats.frames_decoded += 1;
                 self.pump_frame(frame, track_index, sink, stats)?;
@@ -1209,13 +1225,24 @@ impl TrackRuntime {
         // number of frames during flush (MOD plays its outro after EOF).
         if self.decoder.is_some() {
             if let Some(dec) = &mut self.decoder {
-                dec.flush()?;
+                if let Err(e) = dec.flush() {
+                    eprintln!(
+                        "executor: decoder flush error (track {}): {}",
+                        track_index, e
+                    );
+                }
             }
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        eprintln!(
+                            "executor: decoder error during EOF drain (track {}): {}",
+                            track_index, e
+                        );
+                        break;
+                    }
                 };
                 stats.frames_decoded += 1;
                 self.pump_frame(frame, track_index, sink, stats)?;

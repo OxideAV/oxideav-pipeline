@@ -22,6 +22,16 @@ returned by `SourceRegistry::open`:
 The shape is decided by the driver at registration time; jobs reference URIs
 identically across the three.
 
+## Per-packet decoder error tolerance
+
+A decoder error on a single packet (e.g. an AAC frame with a recoverable
+bit-stream glitch) is logged + skipped, not propagated as a fatal stream
+failure. The next packet flows through normally. Same model the H.264
+decoder uses internally for per-slice errors. This matches what real-world
+media playback expects — a corrupt frame mid-stream should mean a single
+skipped frame, not a wedged player. See `tests/decoder_error_tolerance.rs`
+for the contract test.
+
 ## Usage
 
 ```toml

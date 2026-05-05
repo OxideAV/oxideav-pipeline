@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Executor: per-packet decoder errors no longer kill the entire stream. Both
+  `run_decode_stage` (pipelined path, `staged.rs`) and `pump_packet` /
+  `drain` (serial path, `executor.rs`) used to propagate any non-`NeedMore`
+  / non-`Eof` `receive_frame` / `send_packet` error as a fatal `return
+  Err(e)`, exiting the worker thread and starving every downstream sink.
+  Real-world fallout: oxideplay sat at 00:00 on a real-world H.264/AAC mp4
+  (`congress_mtgox_coins.mp4`) because the AAC decoder returned
+  `invalid data: bitreader: out of bits` on the third packet — recoverable
+  per the codec's own `pending.take()` semantics, but the executor took
+  it as fatal and the audio clock never advanced. Decoders now follow the
+  same logged-and-skipped policy the H.264 decoder already uses internally
+  for per-slice errors. Regression coverage:
+  `tests/decoder_error_tolerance.rs` exercises both serial and pipelined
+  paths through a flaky stub decoder that errors on every 5th packet and
+  asserts at least 35 of 50 frames still reach the sink (pre-fix: ~4).
 - Executor: `run_output_pipelined` no longer panics with `Option::unwrap() on a
   None` when a typed-source job (e.g. `oxideav convert "xc:red" out.png` and
   every other `generate://` URI fed to the convert verb) falls back from the
