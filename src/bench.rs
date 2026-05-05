@@ -130,21 +130,84 @@ impl std::fmt::Display for BenchSide {
     }
 }
 
+/// Streaming events emitted as the bench loop progresses. Used by
+/// the `_with` variants so a CLI can print live progress instead of
+/// waiting for all results to land.
+#[derive(Debug)]
+pub enum BenchEvent<'a> {
+    /// Starting work on a new codec id (prep + bench loop are both
+    /// upcoming).
+    CodecStart {
+        codec_id: &'a str,
+        media_type: MediaType,
+        n_impls: usize,
+    },
+    /// Generating the synthetic source frames + (decode side) self-
+    /// encoding the prep stream.
+    PrepStart {
+        codec_id: &'a str,
+    },
+    PrepDone {
+        codec_id: &'a str,
+        encoder_used: Option<&'a str>,
+        prep_packets: usize,
+    },
+    /// Decode-side prep failed because no encoder is registered for
+    /// this codec id (decode-only codec, no fixture support yet).
+    PrepFailed {
+        codec_id: &'a str,
+        reason: &'a str,
+    },
+    /// About to bench one (impl × side). The `BenchDone` that follows
+    /// will carry the timing.
+    BenchStart {
+        codec_id: &'a str,
+        backend: &'a str,
+        side: BenchSide,
+        hw: bool,
+        priority: i32,
+    },
+    BenchDone {
+        result: &'a BenchResult,
+    },
+    CodecDone {
+        codec_id: &'a str,
+    },
+}
+
 /// Bench every implementation of `codec_id`. Returns a vector of
 /// per-(backend, side) results. An empty vector means the codec id
 /// isn't registered.
 pub fn run_bench(reg: &CodecRegistry, codec_id: &str, opts: &BenchOpts) -> Vec<BenchResult> {
+    run_bench_with(reg, codec_id, opts, |_| {})
+}
+
+/// Streaming variant of [`run_bench`] — fires `on_event` at codec
+/// start, prep done, before/after each (impl × side) bench, and at
+/// codec done. Useful for CLIs that want to print live progress on
+/// long bench runs.
+pub fn run_bench_with<F: FnMut(BenchEvent)>(
+    reg: &CodecRegistry,
+    codec_id: &str,
+    opts: &BenchOpts,
+    mut on_event: F,
+) -> Vec<BenchResult> {
     let id = CodecId::new(codec_id);
     let impls = reg.implementations(&id);
     if impls.is_empty() {
         return Vec::new();
     }
     let media_type = impls[0].caps.media_type;
+    on_event(BenchEvent::CodecStart {
+        codec_id,
+        media_type,
+        n_impls: impls.len(),
+    });
     let mut results = Vec::new();
 
     match media_type {
-        MediaType::Video => bench_video_codec(&id, impls, opts, &mut results),
-        MediaType::Audio => bench_audio_codec(&id, impls, opts, &mut results),
+        MediaType::Video => bench_video_codec(&id, impls, opts, &mut results, &mut on_event),
+        MediaType::Audio => bench_audio_codec(&id, impls, opts, &mut results, &mut on_event),
         _ => {
             // Subtitles / data — no time-domain throughput meaningful.
             results.push(BenchResult {
@@ -161,6 +224,7 @@ pub fn run_bench(reg: &CodecRegistry, codec_id: &str, opts: &BenchOpts) -> Vec<B
         }
     }
 
+    on_event(BenchEvent::CodecDone { codec_id });
     results
 }
 
@@ -191,36 +255,73 @@ pub fn run_bench_all(reg: &CodecRegistry, opts: &BenchOpts) -> Vec<BenchResult> 
     all
 }
 
+/// Streaming variant of [`run_bench_all`].
+pub fn run_bench_all_with<F: FnMut(BenchEvent)>(
+    reg: &CodecRegistry,
+    opts: &BenchOpts,
+    mut on_event: F,
+) -> Vec<BenchResult> {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut ids: Vec<(MediaType, String)> = Vec::new();
+    for (id, im) in reg.all_implementations() {
+        let mt = im.caps.media_type;
+        if mt != MediaType::Video && mt != MediaType::Audio {
+            continue;
+        }
+        if seen.insert(id.as_str().to_owned()) {
+            ids.push((mt, id.as_str().to_owned()));
+        }
+    }
+    ids.sort_by(|a, b| match (a.0, b.0) {
+        (MediaType::Video, MediaType::Audio) => std::cmp::Ordering::Less,
+        (MediaType::Audio, MediaType::Video) => std::cmp::Ordering::Greater,
+        _ => a.1.cmp(&b.1),
+    });
+    let mut all = Vec::new();
+    for (_, id) in ids {
+        all.extend(run_bench_with(reg, &id, opts, &mut on_event));
+    }
+    all
+}
+
 // --- video ---
 
-fn bench_video_codec(
+fn bench_video_codec<F: FnMut(BenchEvent)>(
     id: &CodecId,
     impls: &[oxideav_core::CodecImplementation],
     opts: &BenchOpts,
     results: &mut Vec<BenchResult>,
+    on_event: &mut F,
 ) {
     let params = video_params(id, opts);
+    on_event(BenchEvent::PrepStart {
+        codec_id: id.as_str(),
+    });
     let frames = video_frames(opts);
 
     let video_frames_owned: Vec<Frame> = frames.iter().cloned().map(Frame::Video).collect();
     let nominal = opts.fps_num as f64 / opts.fps_den as f64;
-    if opts.side != Side::Decode {
-        for imp in impls.iter().filter(|i| i.caps.encode) {
-            results.push(time_encode(
-                id,
-                imp,
-                &params,
-                &video_frames_owned,
-                opts.bench_duration_secs,
-                nominal,
-            ));
-        }
-    }
+    let mut prep_stream: Option<(Vec<Packet>, String)> = None;
 
+    // Self-encode prep stream for the decode bench, *before* the first
+    // event that mentions a packet count. Cache the result; if the
+    // user only asked for `Side::Encode` we never call this.
     if opts.side != Side::Encode {
-        let stream = match self_encode_video(impls, &params, &frames) {
-            Ok(s) => s,
+        match self_encode_video(impls, &params, &frames) {
+            Ok((s, encoder_name)) => {
+                on_event(BenchEvent::PrepDone {
+                    codec_id: id.as_str(),
+                    encoder_used: Some(&encoder_name),
+                    prep_packets: s.len(),
+                });
+                prep_stream = Some((s, encoder_name));
+            }
             Err(e) => {
+                let msg = format!("{e}");
+                on_event(BenchEvent::PrepFailed {
+                    codec_id: id.as_str(),
+                    reason: &msg,
+                });
                 results.push(BenchResult {
                     codec_id: id.as_str().to_owned(),
                     backend: String::new(),
@@ -232,18 +333,50 @@ fn bench_video_codec(
                     realtime: None,
                     error: Some(format!("can't synth decode stream: {e}")),
                 });
-                return;
             }
-        };
-        for imp in impls.iter().filter(|i| i.caps.decode) {
-            results.push(time_decode(
+        }
+    } else {
+        on_event(BenchEvent::PrepDone {
+            codec_id: id.as_str(),
+            encoder_used: None,
+            prep_packets: 0,
+        });
+    }
+
+    if opts.side != Side::Decode {
+        for imp in impls.iter().filter(|i| i.caps.encode) {
+            on_event(BenchEvent::BenchStart {
+                codec_id: id.as_str(),
+                backend: &imp.caps.implementation,
+                side: BenchSide::Encode,
+                hw: imp.caps.hardware_accelerated,
+                priority: imp.caps.priority,
+            });
+            let r = time_encode(
                 id,
                 imp,
                 &params,
-                &stream,
+                &video_frames_owned,
                 opts.bench_duration_secs,
                 nominal,
-            ));
+            );
+            on_event(BenchEvent::BenchDone { result: &r });
+            results.push(r);
+        }
+    }
+
+    if let Some((stream, _)) = prep_stream {
+        for imp in impls.iter().filter(|i| i.caps.decode) {
+            on_event(BenchEvent::BenchStart {
+                codec_id: id.as_str(),
+                backend: &imp.caps.implementation,
+                side: BenchSide::Decode,
+                hw: imp.caps.hardware_accelerated,
+                priority: imp.caps.priority,
+            });
+            let r = time_decode(id, imp, &params, &stream, opts.bench_duration_secs, nominal);
+            on_event(BenchEvent::BenchDone { result: &r });
+            results.push(r);
         }
     }
 }
@@ -302,7 +435,7 @@ fn self_encode_video(
     impls: &[oxideav_core::CodecImplementation],
     params: &CodecParameters,
     frames: &[VideoFrame],
-) -> Result<Vec<Packet>, oxideav_core::Error> {
+) -> Result<(Vec<Packet>, String), oxideav_core::Error> {
     let imp = impls
         .iter()
         .find(|i| i.caps.encode && i.make_encoder.is_some())
@@ -312,6 +445,7 @@ fn self_encode_video(
                 params.codec_id
             ))
         })?;
+    let encoder_name = imp.caps.implementation.clone();
     let mut enc = (imp.make_encoder.unwrap())(params)?;
     let mut packets = Vec::new();
     for f in frames {
@@ -332,41 +466,45 @@ fn self_encode_video(
             Err(e) => return Err(e),
         }
     }
-    Ok(packets)
+    Ok((packets, encoder_name))
 }
 
 // --- audio ---
 
-fn bench_audio_codec(
+fn bench_audio_codec<F: FnMut(BenchEvent)>(
     id: &CodecId,
     impls: &[oxideav_core::CodecImplementation],
     opts: &BenchOpts,
     results: &mut Vec<BenchResult>,
+    on_event: &mut F,
 ) {
     let params = audio_params(id, opts);
+    on_event(BenchEvent::PrepStart {
+        codec_id: id.as_str(),
+    });
     let frames = audio_frames(opts);
 
     let nominal_fps =
         opts.sample_rate as f64 / frames.first().map(|f| f.samples).unwrap_or(1024) as f64;
     let audio_frames_owned: Vec<Frame> = frames.iter().cloned().map(Frame::Audio).collect();
-
-    if opts.side != Side::Decode {
-        for imp in impls.iter().filter(|i| i.caps.encode) {
-            results.push(time_encode(
-                id,
-                imp,
-                &params,
-                &audio_frames_owned,
-                opts.bench_duration_secs,
-                nominal_fps,
-            ));
-        }
-    }
+    let mut prep_stream: Option<(Vec<Packet>, String)> = None;
 
     if opts.side != Side::Encode {
-        let stream = match self_encode_audio(impls, &params, &frames) {
-            Ok(s) => s,
+        match self_encode_audio(impls, &params, &frames) {
+            Ok((s, encoder_name)) => {
+                on_event(BenchEvent::PrepDone {
+                    codec_id: id.as_str(),
+                    encoder_used: Some(&encoder_name),
+                    prep_packets: s.len(),
+                });
+                prep_stream = Some((s, encoder_name));
+            }
             Err(e) => {
+                let msg = format!("{e}");
+                on_event(BenchEvent::PrepFailed {
+                    codec_id: id.as_str(),
+                    reason: &msg,
+                });
                 results.push(BenchResult {
                     codec_id: id.as_str().to_owned(),
                     backend: String::new(),
@@ -378,18 +516,57 @@ fn bench_audio_codec(
                     realtime: None,
                     error: Some(format!("can't synth decode stream: {e}")),
                 });
-                return;
             }
-        };
+        }
+    } else {
+        on_event(BenchEvent::PrepDone {
+            codec_id: id.as_str(),
+            encoder_used: None,
+            prep_packets: 0,
+        });
+    }
+
+    if opts.side != Side::Decode {
+        for imp in impls.iter().filter(|i| i.caps.encode) {
+            on_event(BenchEvent::BenchStart {
+                codec_id: id.as_str(),
+                backend: &imp.caps.implementation,
+                side: BenchSide::Encode,
+                hw: imp.caps.hardware_accelerated,
+                priority: imp.caps.priority,
+            });
+            let r = time_encode(
+                id,
+                imp,
+                &params,
+                &audio_frames_owned,
+                opts.bench_duration_secs,
+                nominal_fps,
+            );
+            on_event(BenchEvent::BenchDone { result: &r });
+            results.push(r);
+        }
+    }
+
+    if let Some((stream, _)) = prep_stream {
         for imp in impls.iter().filter(|i| i.caps.decode) {
-            results.push(time_decode(
+            on_event(BenchEvent::BenchStart {
+                codec_id: id.as_str(),
+                backend: &imp.caps.implementation,
+                side: BenchSide::Decode,
+                hw: imp.caps.hardware_accelerated,
+                priority: imp.caps.priority,
+            });
+            let r = time_decode(
                 id,
                 imp,
                 &params,
                 &stream,
                 opts.bench_duration_secs,
                 nominal_fps,
-            ));
+            );
+            on_event(BenchEvent::BenchDone { result: &r });
+            results.push(r);
         }
     }
 }
@@ -457,7 +634,7 @@ fn self_encode_audio(
     impls: &[oxideav_core::CodecImplementation],
     params: &CodecParameters,
     frames: &[AudioFrame],
-) -> Result<Vec<Packet>, oxideav_core::Error> {
+) -> Result<(Vec<Packet>, String), oxideav_core::Error> {
     let imp = impls
         .iter()
         .find(|i| i.caps.encode && i.make_encoder.is_some())
@@ -467,6 +644,7 @@ fn self_encode_audio(
                 params.codec_id
             ))
         })?;
+    let encoder_name = imp.caps.implementation.clone();
     let mut enc = (imp.make_encoder.unwrap())(params)?;
     let mut packets = Vec::new();
     for f in frames {
@@ -487,7 +665,7 @@ fn self_encode_audio(
             Err(e) => return Err(e),
         }
     }
-    Ok(packets)
+    Ok((packets, encoder_name))
 }
 
 // --- timing ---
@@ -636,4 +814,85 @@ fn error_result(
         realtime: None,
         error: Some(msg),
     }
+}
+
+// --- system info ---
+
+/// Hardware / OS info collected up-front so the bench output can name
+/// the CPU and HW-accel engine the user is testing on. Best-effort —
+/// shells out to `sysctl` (macOS) or reads `/proc/cpuinfo` (Linux);
+/// missing fields fall back to `"unknown"`.
+#[derive(Clone, Debug)]
+pub struct SystemInfo {
+    pub os: &'static str,
+    pub cpu_brand: String,
+    pub cpu_cores: usize,
+    /// Description of the HW-accel engine VideoToolbox / AudioToolbox
+    /// would dispatch to, when running on macOS. `None` on platforms
+    /// where the framework can't be loaded.
+    pub hw_accel_engine: Option<String>,
+}
+
+pub fn system_info() -> SystemInfo {
+    let cpu_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+    #[cfg(target_os = "macos")]
+    {
+        let cpu_brand =
+            sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "unknown".into());
+        // On Apple Silicon the SoC's media engine handles VT/AT — name
+        // it after the CPU brand for a recognisable label.
+        let hw_accel_engine = if cpu_brand.contains("Apple") {
+            Some(format!(
+                "{cpu_brand} Media Engine (VideoToolbox / AudioToolbox)"
+            ))
+        } else {
+            // Intel Mac — fall back to a generic label.
+            Some("Intel Mac (VideoToolbox / AudioToolbox)".into())
+        };
+        return SystemInfo {
+            os: "macos",
+            cpu_brand,
+            cpu_cores,
+            hw_accel_engine,
+        };
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let cpu_brand = std::fs::read_to_string("/proc/cpuinfo")
+            .ok()
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("model name"))
+                    .and_then(|l| l.split(':').nth(1))
+                    .map(|s| s.trim().to_string())
+            })
+            .unwrap_or_else(|| "unknown".into());
+        return SystemInfo {
+            os: "linux",
+            cpu_brand,
+            cpu_cores,
+            hw_accel_engine: None,
+        };
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    SystemInfo {
+        os: std::env::consts::OS,
+        cpu_brand: "unknown".into(),
+        cpu_cores,
+        hw_accel_engine: None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
