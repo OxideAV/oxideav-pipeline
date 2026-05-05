@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.5](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.4...v0.1.5) - 2026-05-05
+
+### Other
+
+- multi-stream transcode_simple + CodecPreferences plumbing
+- tolerate per-packet decoder errors instead of killing stream
+- pipelined fallback panic on typed-source jobs (task #389)
+
 ### Fixed
 
 - Executor: per-packet decoder errors no longer kill the entire stream. Both
