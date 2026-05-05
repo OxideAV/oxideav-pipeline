@@ -25,6 +25,7 @@ use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
 use crate::schema::{is_reserved_sink, Job};
+use crate::selection::{make_decoder, make_encoder};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
@@ -930,7 +931,7 @@ impl TrackRuntime {
             match stage {
                 StageSpec::Decode => {
                     if self.decoder.is_none() {
-                        let mut d = codecs.make_decoder(&self.input_params)?;
+                        let mut d = make_decoder(codecs, &self.input_params)?;
                         d.set_execution_context(ctx);
                         self.decoder = Some(d);
                     }
@@ -1017,7 +1018,7 @@ impl TrackRuntime {
                     if let Some(h) = params.get("height").and_then(|b| b.as_u64()) {
                         enc_params.height = Some(h as u32);
                     }
-                    let mut encoder = codecs.make_encoder(&enc_params)?;
+                    let mut encoder = make_encoder(codecs, &enc_params)?;
                     encoder.set_execution_context(ctx);
                     let out_params = encoder.output_params().clone();
                     running = out_params.clone();

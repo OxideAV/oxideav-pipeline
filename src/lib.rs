@@ -14,13 +14,17 @@
 pub mod dag;
 pub mod executor;
 pub mod schema;
+pub mod selection;
 pub mod sinks;
 pub mod staged;
 pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink};
-pub use oxideav_core::{CodecPreferences, FilterFactory, FilterRegistry};
+pub use oxideav_core::{FilterFactory, FilterRegistry};
+pub use selection::{
+    make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
+};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
@@ -266,11 +270,14 @@ impl Pipeline {
                 {
                     // Same codec but different params — decode only, let sink
                     // handle the format difference (e.g. resample).
-                    let decoder = self.codecs.make_decoder_with(src_params, &self.prefs)?;
+                    let decoder =
+                        selection::make_decoder_with(&self.codecs, src_params, &self.prefs)?;
                     Ok(RouteMode::Decode { decoder })
                 } else {
-                    let decoder = self.codecs.make_decoder_with(src_params, &self.prefs)?;
-                    let encoder = self.codecs.make_encoder_with(target, &self.prefs)?;
+                    let decoder =
+                        selection::make_decoder_with(&self.codecs, src_params, &self.prefs)?;
+                    let encoder =
+                        selection::make_encoder_with(&self.codecs, target, &self.prefs)?;
                     Ok(RouteMode::Transcode { decoder, encoder })
                 }
             }
@@ -441,9 +448,9 @@ pub fn transcode_simple_with(
                 routes.push(TranscodeRoute::Copy { out_index });
             }
             StreamPlan::Reencode { output_codec } => {
-                let decoder = codecs.make_decoder_with(&in_stream.params, prefs)?;
+                let decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
                 let enc_params = build_encoder_params(&output_codec, in_stream)?;
-                let encoder = codecs.make_encoder_with(&enc_params, prefs)?;
+                let encoder = selection::make_encoder_with(codecs, &enc_params, prefs)?;
                 let out_params = encoder.output_params().clone();
                 let out_index = out_streams.len() as u32;
                 let out_time_base = match out_params.media_type {
