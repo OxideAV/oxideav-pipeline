@@ -11,6 +11,7 @@
 //!   either a single-threaded or stage-per-thread executor. Outputs
 //!   plug in via [`JobSink`].
 
+pub mod bench;
 pub mod dag;
 pub mod executor;
 pub mod schema;
