@@ -20,7 +20,7 @@ pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink};
-pub use oxideav_core::{FilterFactory, FilterRegistry};
+pub use oxideav_core::{CodecPreferences, FilterFactory, FilterRegistry};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
@@ -93,6 +93,12 @@ pub struct Pipeline {
     routes: Vec<Route>,
     codecs: CodecRegistry,
     prepared: bool,
+    /// Forwarded to `make_decoder_with` / `make_encoder_with` at route
+    /// resolution time. Default = no filtering. Set via
+    /// [`Pipeline::with_preferences`] to e.g. opt out of hardware impls
+    /// (`CodecPreferences { no_hardware: true, .. }`) without removing
+    /// them from the registry.
+    prefs: CodecPreferences,
 }
 
 /// Stats returned by [`Pipeline::run`].
@@ -113,7 +119,17 @@ impl Pipeline {
             routes: Vec::new(),
             codecs,
             prepared: false,
+            prefs: CodecPreferences::default(),
         }
+    }
+
+    /// Set the codec-resolution preferences (priority bias, hardware
+    /// opt-out, name allow/exclude). Forwarded to `make_decoder_with` /
+    /// `make_encoder_with` for every route. Builder-style — chain on
+    /// `Pipeline::new(...)`.
+    pub fn with_preferences(mut self, prefs: CodecPreferences) -> Self {
+        self.prefs = prefs;
+        self
     }
 
     /// Inspect the source container's streams before binding sinks.
@@ -250,11 +266,11 @@ impl Pipeline {
                 {
                     // Same codec but different params — decode only, let sink
                     // handle the format difference (e.g. resample).
-                    let decoder = self.codecs.make_decoder(src_params)?;
+                    let decoder = self.codecs.make_decoder_with(src_params, &self.prefs)?;
                     Ok(RouteMode::Decode { decoder })
                 } else {
-                    let decoder = self.codecs.make_decoder(src_params)?;
-                    let encoder = self.codecs.make_encoder(target)?;
+                    let decoder = self.codecs.make_decoder_with(src_params, &self.prefs)?;
+                    let encoder = self.codecs.make_encoder_with(target, &self.prefs)?;
                     Ok(RouteMode::Transcode { decoder, encoder })
                 }
             }
@@ -335,7 +351,7 @@ pub fn remux(demuxer: &mut dyn Demuxer, muxer: &mut dyn Muxer) -> Result<u64> {
     Ok(packets)
 }
 
-/// Plan describing how to derive the output stream from the input stream.
+/// Plan describing how to derive an output stream from one input stream.
 #[derive(Clone, Debug)]
 pub enum StreamPlan {
     /// Stream-copy (codec passthrough, no decode).
@@ -344,125 +360,272 @@ pub enum StreamPlan {
     /// with parameters carried over from the input (sample rate, channels…)
     /// and the chosen codec id.
     Reencode { output_codec: String },
+    /// Drop this stream — it appears in the input but should not appear in
+    /// the output container. Useful when an input has e.g. `[video, audio]`
+    /// and the caller only wants the audio.
+    Drop,
 }
 
-/// Single-input single-output transcode (or copy).
+/// Multi-stream transcode helper.
 ///
-/// `make_output_streams` lets the caller customise the output StreamInfo
-/// (e.g. choose container-specific time bases) before the muxer is opened.
-/// For the common case where the output stream layout matches the encoder's
-/// declared parameters, just clone & adapt.
+/// Reads from a multi-stream demuxer, applies a per-stream [`StreamPlan`]
+/// chosen by `plan_for`, and muxes the resulting (copied or re-encoded)
+/// packets into a single output container.
+///
+/// `plan_for` is called once per input stream during set-up, with the
+/// stream's [`StreamInfo`]. Returning [`StreamPlan::Drop`] excludes that
+/// stream from the output entirely. For the common single-stream case
+/// pass `|_| Ok(StreamPlan::Reencode { output_codec: "...".into() })` or
+/// `|_| Ok(StreamPlan::Copy)`.
+///
+/// `muxer_open` receives the **output** stream descriptors (one per
+/// non-Drop input stream, with sequential `index = 0..N`) and returns
+/// the muxer. For copy routes the output stream mirrors the input; for
+/// reencode routes it carries the encoder's `output_params()` plus a
+/// time base derived from the encoder's sample rate (audio) or the
+/// input's time base (video / fallback).
+///
+/// Packet ordering is preserved end-to-end: input packets are read in
+/// demuxer order and copy-route packets are forwarded immediately, so
+/// interleave matches the source. Reencode-route packets emerge from
+/// the encoder in decode order which the muxer is responsible for
+/// interleaving (most container muxers handle this internally via pts).
 pub fn transcode_simple(
     demuxer: &mut dyn Demuxer,
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
     codecs: &CodecRegistry,
-    plan: &StreamPlan,
+    plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
+) -> Result<TranscodeStats> {
+    transcode_simple_with(
+        demuxer,
+        muxer_open,
+        codecs,
+        &CodecPreferences::default(),
+        plan_for,
+    )
+}
+
+/// Same as [`transcode_simple`] but threads `prefs` through to
+/// `make_decoder_with` / `make_encoder_with`. Use this from CLIs that
+/// expose a `--no-hwaccel` style flag or any codec-priority bias.
+pub fn transcode_simple_with(
+    demuxer: &mut dyn Demuxer,
+    muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
+    codecs: &CodecRegistry,
+    prefs: &CodecPreferences,
+    plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
 ) -> Result<TranscodeStats> {
     let in_streams = demuxer.streams().to_vec();
-    if in_streams.len() != 1 {
-        return Err(Error::unsupported(
-            "transcode_simple only handles single-stream inputs today",
+    if in_streams.is_empty() {
+        return Err(Error::invalid("no streams in input"));
+    }
+
+    // Build per-stream routes. `route_by_in_idx` maps the input stream
+    // index → route slot index (or `None` for Drop). The routes list
+    // is densely numbered 0..N matching the output stream indices.
+    let mut routes: Vec<TranscodeRoute> = Vec::with_capacity(in_streams.len());
+    let mut out_streams: Vec<StreamInfo> = Vec::with_capacity(in_streams.len());
+    let mut route_by_in_idx: std::collections::HashMap<u32, usize> =
+        std::collections::HashMap::with_capacity(in_streams.len());
+
+    for in_stream in &in_streams {
+        let plan = plan_for(in_stream)?;
+        match plan {
+            StreamPlan::Drop => continue,
+            StreamPlan::Copy => {
+                let out_index = out_streams.len() as u32;
+                let mut out = in_stream.clone();
+                out.index = out_index;
+                out_streams.push(out);
+                route_by_in_idx.insert(in_stream.index, routes.len());
+                routes.push(TranscodeRoute::Copy { out_index });
+            }
+            StreamPlan::Reencode { output_codec } => {
+                let decoder = codecs.make_decoder_with(&in_stream.params, prefs)?;
+                let enc_params = build_encoder_params(&output_codec, in_stream)?;
+                let encoder = codecs.make_encoder_with(&enc_params, prefs)?;
+                let out_params = encoder.output_params().clone();
+                let out_index = out_streams.len() as u32;
+                let out_time_base = match out_params.media_type {
+                    MediaType::Audio => match out_params.sample_rate {
+                        Some(sr) if sr > 0 => TimeBase::new(1, sr as i64),
+                        _ => in_stream.time_base,
+                    },
+                    _ => in_stream.time_base,
+                };
+                out_streams.push(StreamInfo {
+                    index: out_index,
+                    time_base: out_time_base,
+                    duration: in_stream.duration,
+                    start_time: Some(0),
+                    params: out_params,
+                });
+                route_by_in_idx.insert(in_stream.index, routes.len());
+                routes.push(TranscodeRoute::Reencode {
+                    out_index,
+                    decoder,
+                    encoder,
+                });
+            }
+        }
+    }
+
+    if out_streams.is_empty() {
+        return Err(Error::invalid(
+            "every input stream was dropped — nothing to mux",
         ));
     }
-    let in_stream = &in_streams[0];
 
-    match plan {
-        StreamPlan::Copy => {
-            let mut muxer = muxer_open(&in_streams)?;
-            let n = remux(demuxer, &mut *muxer)?;
-            Ok(TranscodeStats {
-                packets_in: n,
-                packets_out: n,
-                frames_decoded: 0,
-            })
-        }
-        StreamPlan::Reencode { output_codec } => {
-            // Build a decoder from input parameters.
-            let mut decoder = codecs.make_decoder(&in_stream.params)?;
+    let mut muxer = muxer_open(&out_streams)?;
+    muxer.write_header()?;
 
-            // Build encoder parameters from the input stream's audio
-            // properties + the requested codec id.
-            let mut enc_params = CodecParameters::audio(output_codec.as_str().into());
-            enc_params.media_type = MediaType::Audio;
-            enc_params.sample_rate = in_stream.params.sample_rate;
-            enc_params.channels = in_stream.params.channels;
-            enc_params.sample_format = in_stream.params.sample_format;
-            let mut encoder = codecs.make_encoder(&enc_params)?;
-            let out_params = encoder.output_params().clone();
+    let mut stats = TranscodeStats::default();
 
-            let out_time_base = match out_params.sample_rate {
-                Some(sr) if sr > 0 => TimeBase::new(1, sr as i64),
-                _ => in_stream.time_base,
-            };
-            let out_stream = StreamInfo {
-                index: 0,
-                time_base: out_time_base,
-                duration: in_stream.duration,
-                start_time: Some(0),
-                params: out_params,
-            };
-            let mut muxer = muxer_open(std::slice::from_ref(&out_stream))?;
-            muxer.write_header()?;
-
-            let mut stats = TranscodeStats::default();
-
-            // Drive the decode→encode loop.
-            'outer: loop {
-                match demuxer.next_packet() {
-                    Ok(pkt) => {
-                        stats.packets_in += 1;
-                        decoder.send_packet(&pkt)?;
-                        loop {
-                            match decoder.receive_frame() {
-                                Ok(frame) => {
-                                    stats.frames_decoded += 1;
-                                    let frame = adapt_frame_for_encoder(frame, &out_stream)?;
-                                    encoder.send_frame(&frame)?;
-                                    drain_encoder(&mut *encoder, &mut *muxer, &mut stats)?;
-                                }
-                                Err(Error::NeedMore) => break,
-                                Err(Error::Eof) => break 'outer,
-                                Err(e) => return Err(e),
-                            }
-                        }
-                    }
-                    Err(Error::Eof) => {
+    // Pump packets from the demuxer in source order, dispatching by
+    // input stream index. EOF triggers a flush of every reencode route.
+    loop {
+        match demuxer.next_packet() {
+            Ok(pkt) => {
+                stats.packets_in += 1;
+                let Some(&slot) = route_by_in_idx.get(&pkt.stream_index) else {
+                    // Input stream that the caller dropped (or that the
+                    // demuxer surfaces but has no metadata for). Skip.
+                    continue;
+                };
+                process_packet(&mut routes[slot], &pkt, &mut *muxer, &mut stats)?;
+            }
+            Err(Error::Eof) => {
+                // Flush every reencode route, then write the trailer.
+                for route in &mut routes {
+                    if let TranscodeRoute::Reencode {
+                        out_index,
+                        decoder,
+                        encoder,
+                        ..
+                    } = route
+                    {
                         decoder.flush()?;
-                        // Drain remaining frames.
                         loop {
                             match decoder.receive_frame() {
                                 Ok(frame) => {
                                     stats.frames_decoded += 1;
-                                    let frame = adapt_frame_for_encoder(frame, &out_stream)?;
                                     encoder.send_frame(&frame)?;
-                                    drain_encoder(&mut *encoder, &mut *muxer, &mut stats)?;
+                                    drain_encoder(
+                                        &mut **encoder,
+                                        *out_index,
+                                        &mut *muxer,
+                                        &mut stats,
+                                    )?;
                                 }
                                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                                 Err(e) => return Err(e),
                             }
                         }
                         encoder.flush()?;
-                        drain_encoder(&mut *encoder, &mut *muxer, &mut stats)?;
-                        break;
+                        drain_encoder(&mut **encoder, *out_index, &mut *muxer, &mut stats)?;
                     }
+                }
+                break;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    muxer.write_trailer()?;
+    Ok(stats)
+}
+
+/// Build encoder params for an input stream + requested output codec id.
+/// Carries the input's media-type-relevant parameters across so the
+/// encoder constructor sees a fully-populated descriptor.
+fn build_encoder_params(output_codec: &str, in_stream: &StreamInfo) -> Result<CodecParameters> {
+    let codec_id: oxideav_core::CodecId = output_codec.into();
+    match in_stream.params.media_type {
+        MediaType::Audio => {
+            let mut p = CodecParameters::audio(codec_id);
+            p.sample_rate = in_stream.params.sample_rate;
+            p.channels = in_stream.params.channels;
+            p.sample_format = in_stream.params.sample_format;
+            p.channel_layout = in_stream.params.channel_layout;
+            Ok(p)
+        }
+        MediaType::Video => {
+            let mut p = CodecParameters::video(codec_id);
+            p.width = in_stream.params.width;
+            p.height = in_stream.params.height;
+            p.pixel_format = in_stream.params.pixel_format;
+            p.frame_rate = in_stream.params.frame_rate;
+            Ok(p)
+        }
+        MediaType::Subtitle => Ok(CodecParameters::subtitle(codec_id)),
+        MediaType::Data | MediaType::Unknown => Err(Error::unsupported(format!(
+            "transcode_simple Reencode: cannot reencode {:?} stream {}",
+            in_stream.params.media_type, in_stream.index
+        ))),
+    }
+}
+
+enum TranscodeRoute {
+    Copy {
+        out_index: u32,
+    },
+    Reencode {
+        out_index: u32,
+        decoder: Box<dyn Decoder>,
+        encoder: Box<dyn Encoder>,
+    },
+}
+
+fn process_packet(
+    route: &mut TranscodeRoute,
+    pkt: &Packet,
+    muxer: &mut dyn Muxer,
+    stats: &mut TranscodeStats,
+) -> Result<()> {
+    match route {
+        TranscodeRoute::Copy { out_index } => {
+            // Copy path: rewrite stream_index to the muxer's view and
+            // forward the packet verbatim.
+            let mut out_pkt = pkt.clone();
+            out_pkt.stream_index = *out_index;
+            muxer.write_packet(&out_pkt)?;
+            stats.packets_out += 1;
+        }
+        TranscodeRoute::Reencode {
+            out_index,
+            decoder,
+            encoder,
+        } => {
+            decoder.send_packet(pkt)?;
+            loop {
+                match decoder.receive_frame() {
+                    Ok(frame) => {
+                        stats.frames_decoded += 1;
+                        encoder.send_frame(&frame)?;
+                        drain_encoder(&mut **encoder, *out_index, muxer, stats)?;
+                    }
+                    Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => return Err(e),
                 }
             }
-
-            muxer.write_trailer()?;
-            Ok(stats)
         }
     }
+    Ok(())
 }
 
 fn drain_encoder(
     encoder: &mut dyn oxideav_core::Encoder,
+    out_index: u32,
     muxer: &mut dyn Muxer,
     stats: &mut TranscodeStats,
 ) -> Result<()> {
     loop {
         match encoder.receive_packet() {
-            Ok(pkt) => {
+            Ok(mut pkt) => {
+                // Encoders emit packets with stream_index = 0 (they only
+                // know about a single output stream). Patch in the
+                // muxer-side index so multi-stream outputs route correctly.
+                pkt.stream_index = out_index;
                 muxer.write_packet(&pkt)?;
                 stats.packets_out += 1;
             }
@@ -470,24 +633,6 @@ fn drain_encoder(
             Err(e) => return Err(e),
         }
     }
-}
-
-/// Hook for future per-format adaptation between decoder output and
-/// encoder input. Today this is a near no-op pass-through:
-///
-/// * Stream-level properties (time_base, sample format, pixel format,
-///   width/height, sample rate, channels) live on the stream's
-///   `CodecParameters`, not per-frame, so there's nothing to rewrite
-///   on the frame itself.
-/// * Packet-layer pts rescaling (decoder time_base → muxer time_base)
-///   already happens at the muxer layer and is unaffected.
-///
-/// Sample-format / pixel-format conversion is **not** performed here —
-/// the caller must wire compatible decoder and encoder formats. The
-/// signature is kept so future work (resampling, pixfmt conversion)
-/// can hook in without churning callers.
-fn adapt_frame_for_encoder(frame: Frame, _out_stream: &StreamInfo) -> Result<Frame> {
-    Ok(frame)
 }
 
 #[derive(Clone, Copy, Debug, Default)]
