@@ -69,10 +69,7 @@ impl CodecPreferences {
 /// Free-function shorthand: `make_decoder(reg, params)` with default
 /// preferences. Equivalent to
 /// `make_decoder_with(reg, params, &CodecPreferences::default())`.
-pub fn make_decoder(
-    reg: &CodecRegistry,
-    params: &CodecParameters,
-) -> Result<Box<dyn Decoder>> {
+pub fn make_decoder(reg: &CodecRegistry, params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     make_decoder_with(reg, params, &CodecPreferences::default())
 }
 
@@ -112,10 +109,7 @@ pub fn make_decoder_with(
 }
 
 /// Free-function shorthand for encoder construction with default prefs.
-pub fn make_encoder(
-    reg: &CodecRegistry,
-    params: &CodecParameters,
-) -> Result<Box<dyn Encoder>> {
+pub fn make_encoder(reg: &CodecRegistry, params: &CodecParameters) -> Result<Box<dyn Encoder>> {
     make_encoder_with(reg, params, &CodecPreferences::default())
 }
 

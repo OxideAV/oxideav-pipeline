@@ -22,12 +22,12 @@ pub mod validate;
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
-pub use selection::{
-    make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
-};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
     TrackInput, TrackSpec,
+};
+pub use selection::{
+    make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
 };
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, Progress, SeekCmd};
@@ -276,8 +276,7 @@ impl Pipeline {
                 } else {
                     let decoder =
                         selection::make_decoder_with(&self.codecs, src_params, &self.prefs)?;
-                    let encoder =
-                        selection::make_encoder_with(&self.codecs, target, &self.prefs)?;
+                    let encoder = selection::make_encoder_with(&self.codecs, target, &self.prefs)?;
                     Ok(RouteMode::Transcode { decoder, encoder })
                 }
             }
