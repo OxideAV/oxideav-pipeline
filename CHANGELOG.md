@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- bench: iterate per device for HW backends. Each `CodecImplementation`
+  with an `engine_probe` set runs the bench loop once per probed device
+  via `CodecParameters::with_device_index`. SW backends and HW backends
+  without a probe keep their single-row behaviour. `BenchResult` gains
+  `device_index: Option<u32>` and `device_label: Option<String>` so
+  renderers can disambiguate the rows without re-running the probe.
+
 ## [0.1.6](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.5...v0.1.6) - 2026-05-05
 
 ### Other

@@ -113,6 +113,18 @@ pub struct BenchResult {
     /// Set when the impl couldn't be benched (init failure, format
     /// mismatch, no encoder available for the decode-side stream, etc).
     pub error: Option<String>,
+    /// `Some(idx)` for HW backends iterated per device; `None` for SW
+    /// backends or HW backends without an `engine_probe`. Indexing
+    /// matches the position in the engine probe's returned
+    /// `Vec<HwDeviceInfo>` and is the value passed via
+    /// `CodecParameters::with_device_index` to the factory.
+    pub device_index: Option<u32>,
+    /// `HwDeviceInfo.name` for the device this row was benched on.
+    /// `None` for SW backends and for HW backends whose probe returned
+    /// an empty vec (factory falls back to default device, error
+    /// surfaces in `error`). Carrying the label on the result lets
+    /// renderers avoid re-running the probe.
+    pub device_label: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -220,6 +232,8 @@ pub fn run_bench_with<F: FnMut(BenchEvent)>(
                 fps: None,
                 realtime: None,
                 error: Some(format!("bench unsupported for {media_type:?} codecs")),
+                device_index: None,
+                device_label: None,
             });
         }
     }
@@ -284,6 +298,38 @@ pub fn run_bench_all_with<F: FnMut(BenchEvent)>(
     all
 }
 
+// --- per-device iteration ---
+
+/// Yield the `(device_index, device_label)` pairs the bench loop should
+/// iterate over for one impl.
+///
+/// SW codecs (`engine_probe == None`) and HW codecs whose probe returns
+/// an empty vec — typically because the driver / runtime is missing on
+/// this host — yield a single `(None, None)` entry so the caller runs
+/// once with `device_index = None` (current behaviour). The factory
+/// will return `Err` for the missing-driver case and that error is
+/// surfaced on the bench row via [`BenchResult::error`].
+///
+/// HW codecs whose probe returns N >= 1 devices yield N entries with
+/// `Some(idx)` + `Some(name)` so the caller iterates the bench loop
+/// once per `device_index ∈ 0..N`.
+fn bench_devices_for(
+    imp: &oxideav_core::CodecImplementation,
+) -> Vec<(Option<u32>, Option<String>)> {
+    let Some(probe) = imp.engine_probe else {
+        return vec![(None, None)];
+    };
+    let devices = probe();
+    if devices.is_empty() {
+        return vec![(None, None)];
+    }
+    devices
+        .into_iter()
+        .enumerate()
+        .map(|(idx, d)| (Some(idx as u32), Some(d.name)))
+        .collect()
+}
+
 // --- video ---
 
 fn bench_video_codec<F: FnMut(BenchEvent)>(
@@ -332,6 +378,8 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
                     fps: None,
                     realtime: None,
                     error: Some(format!("can't synth decode stream: {e}")),
+                    device_index: None,
+                    device_label: None,
                 });
             }
         }
@@ -345,38 +393,50 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
 
     if opts.side != Side::Decode {
         for imp in impls.iter().filter(|i| i.caps.encode) {
-            on_event(BenchEvent::BenchStart {
-                codec_id: id.as_str(),
-                backend: &imp.caps.implementation,
-                side: BenchSide::Encode,
-                hw: imp.caps.hardware_accelerated,
-                priority: imp.caps.priority,
-            });
-            let r = time_encode(
-                id,
-                imp,
-                &params,
-                &video_frames_owned,
-                opts.bench_duration_secs,
-                nominal,
-            );
-            on_event(BenchEvent::BenchDone { result: &r });
-            results.push(r);
+            for (device_index, device_label) in bench_devices_for(imp) {
+                let mut p = params.clone();
+                p.device_index = device_index;
+                on_event(BenchEvent::BenchStart {
+                    codec_id: id.as_str(),
+                    backend: &imp.caps.implementation,
+                    side: BenchSide::Encode,
+                    hw: imp.caps.hardware_accelerated,
+                    priority: imp.caps.priority,
+                });
+                let mut r = time_encode(
+                    id,
+                    imp,
+                    &p,
+                    &video_frames_owned,
+                    opts.bench_duration_secs,
+                    nominal,
+                );
+                r.device_index = device_index;
+                r.device_label = device_label;
+                on_event(BenchEvent::BenchDone { result: &r });
+                results.push(r);
+            }
         }
     }
 
     if let Some((stream, _)) = prep_stream {
         for imp in impls.iter().filter(|i| i.caps.decode) {
-            on_event(BenchEvent::BenchStart {
-                codec_id: id.as_str(),
-                backend: &imp.caps.implementation,
-                side: BenchSide::Decode,
-                hw: imp.caps.hardware_accelerated,
-                priority: imp.caps.priority,
-            });
-            let r = time_decode(id, imp, &params, &stream, opts.bench_duration_secs, nominal);
-            on_event(BenchEvent::BenchDone { result: &r });
-            results.push(r);
+            for (device_index, device_label) in bench_devices_for(imp) {
+                let mut p = params.clone();
+                p.device_index = device_index;
+                on_event(BenchEvent::BenchStart {
+                    codec_id: id.as_str(),
+                    backend: &imp.caps.implementation,
+                    side: BenchSide::Decode,
+                    hw: imp.caps.hardware_accelerated,
+                    priority: imp.caps.priority,
+                });
+                let mut r = time_decode(id, imp, &p, &stream, opts.bench_duration_secs, nominal);
+                r.device_index = device_index;
+                r.device_label = device_label;
+                on_event(BenchEvent::BenchDone { result: &r });
+                results.push(r);
+            }
         }
     }
 }
@@ -515,6 +575,8 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
                     fps: None,
                     realtime: None,
                     error: Some(format!("can't synth decode stream: {e}")),
+                    device_index: None,
+                    device_label: None,
                 });
             }
         }
@@ -528,45 +590,51 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
 
     if opts.side != Side::Decode {
         for imp in impls.iter().filter(|i| i.caps.encode) {
-            on_event(BenchEvent::BenchStart {
-                codec_id: id.as_str(),
-                backend: &imp.caps.implementation,
-                side: BenchSide::Encode,
-                hw: imp.caps.hardware_accelerated,
-                priority: imp.caps.priority,
-            });
-            let r = time_encode(
-                id,
-                imp,
-                &params,
-                &audio_frames_owned,
-                opts.bench_duration_secs,
-                nominal_fps,
-            );
-            on_event(BenchEvent::BenchDone { result: &r });
-            results.push(r);
+            for (device_index, device_label) in bench_devices_for(imp) {
+                let mut p = params.clone();
+                p.device_index = device_index;
+                on_event(BenchEvent::BenchStart {
+                    codec_id: id.as_str(),
+                    backend: &imp.caps.implementation,
+                    side: BenchSide::Encode,
+                    hw: imp.caps.hardware_accelerated,
+                    priority: imp.caps.priority,
+                });
+                let mut r = time_encode(
+                    id,
+                    imp,
+                    &p,
+                    &audio_frames_owned,
+                    opts.bench_duration_secs,
+                    nominal_fps,
+                );
+                r.device_index = device_index;
+                r.device_label = device_label;
+                on_event(BenchEvent::BenchDone { result: &r });
+                results.push(r);
+            }
         }
     }
 
     if let Some((stream, _)) = prep_stream {
         for imp in impls.iter().filter(|i| i.caps.decode) {
-            on_event(BenchEvent::BenchStart {
-                codec_id: id.as_str(),
-                backend: &imp.caps.implementation,
-                side: BenchSide::Decode,
-                hw: imp.caps.hardware_accelerated,
-                priority: imp.caps.priority,
-            });
-            let r = time_decode(
-                id,
-                imp,
-                &params,
-                &stream,
-                opts.bench_duration_secs,
-                nominal_fps,
-            );
-            on_event(BenchEvent::BenchDone { result: &r });
-            results.push(r);
+            for (device_index, device_label) in bench_devices_for(imp) {
+                let mut p = params.clone();
+                p.device_index = device_index;
+                on_event(BenchEvent::BenchStart {
+                    codec_id: id.as_str(),
+                    backend: &imp.caps.implementation,
+                    side: BenchSide::Decode,
+                    hw: imp.caps.hardware_accelerated,
+                    priority: imp.caps.priority,
+                });
+                let mut r =
+                    time_decode(id, imp, &p, &stream, opts.bench_duration_secs, nominal_fps);
+                r.device_index = device_index;
+                r.device_label = device_label;
+                on_event(BenchEvent::BenchDone { result: &r });
+                results.push(r);
+            }
         }
     }
 }
@@ -729,6 +797,8 @@ fn time_encode(
             None
         },
         error: None,
+        device_index: None,
+        device_label: None,
     }
 }
 
@@ -794,6 +864,8 @@ fn time_decode(
             None
         },
         error: None,
+        device_index: None,
+        device_label: None,
     }
 }
 
@@ -813,6 +885,8 @@ fn error_result(
         fps: None,
         realtime: None,
         error: Some(msg),
+        device_index: None,
+        device_label: None,
     }
 }
 
@@ -895,4 +969,103 @@ fn sysctl_string(name: &str) -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+#[cfg(test)]
+mod device_iteration_tests {
+    //! Coverage for `bench_devices_for`: SW codecs and HW codecs without
+    //! a probe collapse to a single `(None, None)` row; HW codecs with a
+    //! probe yield one `(Some(idx), Some(name))` per device; HW codecs
+    //! whose probe returns nothing fall back to `(None, None)` so the
+    //! factory's "driver missing" error still surfaces.
+    use super::*;
+    use oxideav_core::{
+        engine::{EngineProbeFn, HwDeviceInfo},
+        CodecCapabilities, CodecId, CodecInfo, CodecRegistry,
+    };
+    use oxideav_core::{Decoder, Result as CoreResult};
+
+    fn probe_two_devices() -> Vec<HwDeviceInfo> {
+        vec![
+            HwDeviceInfo {
+                name: "Device A".into(),
+                driver_version: None,
+                api_version: None,
+                total_memory_bytes: None,
+                extra: vec![],
+                codecs: vec![],
+            },
+            HwDeviceInfo {
+                name: "Device B".into(),
+                driver_version: None,
+                api_version: None,
+                total_memory_bytes: None,
+                extra: vec![],
+                codecs: vec![],
+            },
+        ]
+    }
+
+    fn probe_zero_devices() -> Vec<HwDeviceInfo> {
+        vec![]
+    }
+
+    /// Stub decoder factory so `register` keeps the resulting
+    /// `CodecImplementation` (tag-only registrations are dropped).
+    fn dummy_decoder_factory(
+        _params: &oxideav_core::CodecParameters,
+    ) -> CoreResult<Box<dyn Decoder>> {
+        Err(oxideav_core::Error::unsupported(
+            "dummy decoder for bench_devices_for tests",
+        ))
+    }
+
+    /// Build a single `CodecImplementation` for `id` with the given
+    /// engine probe attached. We go through the registry rather than
+    /// constructing `CodecImplementation` directly because the struct's
+    /// `engine_probe` field is populated by `CodecRegistry::register`'s
+    /// internal builder — the public surface is `CodecInfo`.
+    fn make_impl(
+        id: &str,
+        engine_probe: Option<EngineProbeFn>,
+    ) -> oxideav_core::CodecImplementation {
+        let mut info = CodecInfo::new(CodecId::new(id))
+            .capabilities(CodecCapabilities::video(format!("{id}_test")))
+            .decoder(dummy_decoder_factory);
+        if let Some(p) = engine_probe {
+            info = info.with_engine_id("test-backend").with_engine_probe(p);
+        }
+        let mut reg = CodecRegistry::default();
+        reg.register(info);
+        reg.implementations(&CodecId::new(id))[0].clone()
+    }
+
+    #[test]
+    fn sw_codec_yields_single_none_device() {
+        let imp = make_impl("h264", None);
+        let devs = bench_devices_for(&imp);
+        assert_eq!(devs.len(), 1);
+        assert!(devs[0].0.is_none());
+        assert!(devs[0].1.is_none());
+    }
+
+    #[test]
+    fn hw_codec_with_two_devices_yields_two_entries() {
+        let imp = make_impl("h264", Some(probe_two_devices));
+        let devs = bench_devices_for(&imp);
+        assert_eq!(devs.len(), 2);
+        assert_eq!(devs[0].0, Some(0));
+        assert_eq!(devs[0].1.as_deref(), Some("Device A"));
+        assert_eq!(devs[1].0, Some(1));
+        assert_eq!(devs[1].1.as_deref(), Some("Device B"));
+    }
+
+    #[test]
+    fn hw_codec_with_empty_probe_yields_single_none_fallback() {
+        let imp = make_impl("h264", Some(probe_zero_devices));
+        let devs = bench_devices_for(&imp);
+        assert_eq!(devs.len(), 1);
+        assert!(devs[0].0.is_none());
+        assert!(devs[0].1.is_none());
+    }
 }
