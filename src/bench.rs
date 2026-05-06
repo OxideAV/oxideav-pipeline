@@ -925,12 +925,12 @@ pub fn system_info() -> SystemInfo {
             // Intel Mac — fall back to a generic label.
             Some("Intel Mac (VideoToolbox / AudioToolbox)".into())
         };
-        return SystemInfo {
+        SystemInfo {
             os: "macos",
             cpu_brand,
             cpu_cores,
             hw_accel_engine,
-        };
+        }
     }
     #[cfg(target_os = "linux")]
     {
@@ -943,12 +943,12 @@ pub fn system_info() -> SystemInfo {
                     .map(|s| s.trim().to_string())
             })
             .unwrap_or_else(|| "unknown".into());
-        return SystemInfo {
+        SystemInfo {
             os: "linux",
             cpu_brand,
             cpu_cores,
             hw_accel_engine: None,
-        };
+        }
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     SystemInfo {
