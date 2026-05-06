@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.7](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.6...v0.1.7) - 2026-05-06
+
+### Other
+
+- reframe FFI claim — HW-engine crates use OS FFI by necessity
+- drop needless return in system_info macos+linux branches
+- iterate per device for HW backends with engine_probe set
+- streaming progress events + system_info()
+- per-codec throughput micro-benchmarks for `oxideav bench`
+
 - bench: iterate per device for HW backends. Each `CodecImplementation`
   with an `engine_probe` set runs the bench loop once per probed device
   via `CodecParameters::with_device_index`. SW backends and HW backends
