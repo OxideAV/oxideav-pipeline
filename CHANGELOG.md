@@ -24,6 +24,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Demuxer stage now calls `seek_to` first and broadcasts the matching
   barrier (Flush / Rejected) after, so workers can distinguish
   "landed seek — reset codec state" from "rejected seek — keep going".
+- `BarrierKind::SeekFlush` now carries the demuxer's actual `landed_pts`
+  (in the matching `time_base`) alongside `generation`. Pre-fix the
+  barrier discarded `seek_to`'s `Ok(landed)` return value and the
+  engine had to guess the post-seek anchor from "next audio packet's
+  pts" — typically off by 50-200 ms because video lands on a keyframe
+  (≤ target) while audio lands on the next packet (≥ target). With
+  the payload extension, every consumer learns the exact landing
+  atomically: the engine's master clock origin becomes `landed_pts`
+  the instant the barrier fires, position display reads the new
+  position immediately, and any subsequent A/V drift reflects only
+  real-time elapsed since the seek. The barrier remains
+  `Clone + Copy` because `TimeBase` is `Copy`. **API break for
+  consumers that pattern-match on the variant** — most can switch to
+  `SeekFlush { generation, .. }`; engines that re-anchor should
+  capture the two new fields. Regression test:
+  `tests/seek_flush_carries_landed_pts.rs` routes through a
+  `FixedLandingStubDemuxer` whose `seek_to` returns `Ok(42)`
+  regardless of the requested target; the test asserts the barrier
+  surfaces `landed_pts = 42` end-to-end.
 
 
 

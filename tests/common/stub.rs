@@ -34,6 +34,15 @@ pub const EXT: &str = "stub";
 pub const CONTAINER_NOSEEK: &str = "stub_audio_noseek";
 /// Extension for the unseekable stub container.
 pub const EXT_NOSEEK: &str = "stubns";
+/// Container name for the "fixed-landing" variant (every `seek_to`
+/// returns `Ok(FIXED_LANDED_PTS)` regardless of the requested target).
+/// Used to assert the SeekFlush barrier carries the demuxer's actual
+/// landed pts rather than the caller's requested pts.
+pub const CONTAINER_FIXED: &str = "stub_audio_fixed_landing";
+/// Extension for the fixed-landing stub container.
+pub const EXT_FIXED: &str = "stubfx";
+/// pts the fixed-landing demuxer always reports as the seek result.
+pub const FIXED_LANDED_PTS: i64 = 42;
 
 /// Sample rate of the synthetic audio. Small so the demuxer's pts
 /// arithmetic is easy to reason about in tests, realistic enough that
@@ -60,6 +69,13 @@ pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) 
     // path. Codec is shared.
     containers.register_demuxer(CONTAINER_NOSEEK, open_demuxer_noseek as OpenDemuxerFn);
     containers.register_extension(EXT_NOSEEK, CONTAINER_NOSEEK);
+    // Fixed-landing variant: every `seek_to` returns
+    // `Ok(FIXED_LANDED_PTS)` regardless of the requested target. Lets
+    // the SeekFlush-payload test assert that the barrier surfaces the
+    // demuxer's actual landed pts (42) rather than the caller's
+    // requested pts.
+    containers.register_demuxer(CONTAINER_FIXED, open_demuxer_fixed as OpenDemuxerFn);
+    containers.register_extension(EXT_FIXED, CONTAINER_FIXED);
 }
 
 /// Create an empty unseekable-stub file. Same shape as [`touch`] but
@@ -68,6 +84,16 @@ pub fn touch_noseek(name: &str) -> std::path::PathBuf {
     let mut p = std::env::temp_dir();
     p.push(format!("oxideav_pipeline_stub_{name}.{EXT_NOSEEK}"));
     let _ = std::fs::File::create(&p).expect("create stub noseek file");
+    p
+}
+
+/// Create an empty fixed-landing-stub file. Same shape as [`touch`] but
+/// the file's extension routes through the fixed-landing demuxer
+/// (every `seek_to` returns `Ok(FIXED_LANDED_PTS)`).
+pub fn touch_fixed(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("oxideav_pipeline_stub_{name}.{EXT_FIXED}"));
+    let _ = std::fs::File::create(&p).expect("create stub fixed file");
     p
 }
 
@@ -102,6 +128,15 @@ fn open_demuxer_noseek(
     ))))
 }
 
+fn open_demuxer_fixed(
+    _input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(FixedLandingStubDemuxer(StubDemuxer::new(
+        DEFAULT_DURATION_MS,
+    ))))
+}
+
 /// Wraps [`StubDemuxer`] but rejects every `seek_to` with
 /// [`Error::unsupported`] — emulates the legacy behaviour of every
 /// demuxer that hadn't implemented `seek_to` yet. Used to drive the
@@ -120,6 +155,33 @@ impl Demuxer for NoSeekStubDemuxer {
     }
     fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
         Err(Error::unsupported("noseek stub: seek_to not implemented"))
+    }
+}
+
+/// Wraps [`StubDemuxer`] but every `seek_to` returns
+/// [`FIXED_LANDED_PTS`] regardless of the requested target. Drives the
+/// SeekFlush-payload contract test: the barrier reaching the sink must
+/// carry that exact landed pts (proving the demuxer's return value is
+/// preserved end-to-end), not whatever the engine passed in.
+pub struct FixedLandingStubDemuxer(pub StubDemuxer);
+
+impl Demuxer for FixedLandingStubDemuxer {
+    fn format_name(&self) -> &str {
+        CONTAINER_FIXED
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        self.0.streams()
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        self.0.next_packet()
+    }
+    fn seek_to(&mut self, stream_index: u32, _pts: i64) -> Result<i64> {
+        // Re-seat the inner demuxer at FIXED_LANDED_PTS so subsequent
+        // `next_packet` calls produce packets from there — keeps the
+        // pipeline alive after the seek. The reported landed pts is
+        // always FIXED_LANDED_PTS regardless of what the caller asked.
+        let _ = self.0.seek_to(stream_index, FIXED_LANDED_PTS)?;
+        Ok(FIXED_LANDED_PTS)
     }
 }
 

@@ -30,6 +30,18 @@ media playback expects — a corrupt frame mid-stream should mean a single
 skipped frame, not a wedged player. See `tests/decoder_error_tolerance.rs`
 for the contract test.
 
+## Seek-barrier payload
+
+`BarrierKind::SeekFlush` carries the demuxer's actual `landed_pts` plus
+the matching `time_base`, so consumers re-anchor at the precise landing
+position (typically the largest keyframe ≤ requested target) instead of
+guessing from the next packet's pts. Pre-fix the engine had to wait for
+the first post-barrier audio frame and re-anchor there — typically 50-
+200 ms off because video lands on a keyframe (≤ target) while audio
+lands on the next packet (≥ target). With the payload extension,
+position display reads the new position the instant the barrier fires.
+See `tests/seek_flush_carries_landed_pts.rs`.
+
 ## Usage
 
 ```toml

@@ -1,17 +1,20 @@
-//! Integration test for the seek-barrier control surface.
+//! Contract test: the [`BarrierKind::SeekFlush`] barrier must carry
+//! the demuxer's actual landed pts (and the matching `time_base`)
+//! end-to-end, not the caller's requested pts.
 //!
-//! Spawns an `Executor` over a synthetic stub stream (60 seconds, so
-//! the demuxer doesn't hit EOF before we issue a seek), wires a
-//! channel-forwarding sink so we observe `start` / `write_frame` /
-//! `barrier` / `finish` calls from the test thread, and:
+//! Routes through [`common::stub::FixedLandingStubDemuxer`], whose
+//! `seek_to` always returns `Ok(FIXED_LANDED_PTS = 42)` regardless of
+//! the requested target. After issuing a seek to a wildly different
+//! pts (e.g. 30 s ≈ 240 000 samples at 8 kHz), the sink must observe
+//! `SeekFlush { landed_pts: 42, .. }` — proving the demuxer's return
+//! value reaches downstream consumers without being rewritten on the
+//! way through the pipeline.
 //!
-//! 1. Issues `ExecutorHandle::seek(stream, half-way pts, tb)`.
-//! 2. Waits for the sink's `barrier(SeekFlush { generation: 1 })` call.
-//! 3. Verifies that subsequent payloads carry pts at-or-near the seek
-//!    target (the stub demuxer's `seek_to` snaps exactly).
-//!
-//! Also exercises `try_progress` + `stop` for handle lifecycle
-//! coverage.
+//! Why this matters: pre-fix the engine in oxideplay re-anchored its
+//! master clock at "next audio packet's pts", which is typically
+//! 50-200 ms after the actual landing (video lands on a keyframe
+//! ≤ target, audio lands on the next packet ≥ target). Atomic
+//! anchoring at `landed_pts` eliminates that drift entirely.
 
 mod common;
 
@@ -22,11 +25,11 @@ use std::time::{Duration, Instant};
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
 
-/// A test sink that forwards every JobSink event to a channel so the
-/// test driver can `recv()` them in order.
+use common::stub::FIXED_LANDED_PTS;
+
 enum SinkEvent {
     Started(Vec<StreamInfo>),
-    Payload { _kind: MediaType, pts: Option<i64> },
+    Payload { _kind: MediaType, _pts: Option<i64> },
     Barrier(BarrierKind),
     Finished,
 }
@@ -45,7 +48,7 @@ impl JobSink for ChannelSink {
     fn write_packet(&mut self, kind: MediaType, pkt: &Packet) -> Result<()> {
         let _ = self.tx.send(SinkEvent::Payload {
             _kind: kind,
-            pts: pkt.pts,
+            _pts: pkt.pts,
         });
         Ok(())
     }
@@ -55,7 +58,10 @@ impl JobSink for ChannelSink {
             Frame::Video(v) => v.pts,
             _ => None,
         };
-        let _ = self.tx.send(SinkEvent::Payload { _kind: kind, pts });
+        let _ = self.tx.send(SinkEvent::Payload {
+            _kind: kind,
+            _pts: pts,
+        });
         Ok(())
     }
     fn barrier(&mut self, kind: BarrierKind) -> Result<()> {
@@ -68,9 +74,6 @@ impl JobSink for ChannelSink {
     }
 }
 
-/// Drain events until either `pred` matches one (returns it), the
-/// `Finished` event arrives, or the deadline is reached. Returns
-/// the matched event or `None` on timeout/Finished.
 fn wait_for<F>(rx: &Receiver<SinkEvent>, deadline: Instant, mut pred: F) -> Option<SinkEvent>
 where
     F: FnMut(&SinkEvent) -> bool,
@@ -94,11 +97,8 @@ where
 }
 
 #[test]
-fn spawn_seek_emits_barrier_and_advances_pts() {
-    // Stub demuxer emits 60s of synthetic mono audio at 8 kHz.
-    // We seek to the half-way point (~30s) and verify the sink sees
-    // a SeekFlush barrier with generation = 1.
-    let src = common::stub::touch("seek_barrier");
+fn seek_flush_carries_landed_pts() {
+    let src = common::stub::touch_fixed("seek_flush_landed_pts");
 
     let mut ctx = oxideav_core::RuntimeContext::new();
     common::stub::register(&mut ctx.codecs, &mut ctx.containers);
@@ -113,8 +113,6 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     );
     let job = Job::from_json(&job_json).expect("parse job");
 
-    // Small channel so the sink back-pressures the executor — the
-    // pipeline can't outrun this test thread.
     let (tx, rx) = mpsc::sync_channel::<SinkEvent>(8);
     let streams_slot = Arc::new(Mutex::new(Vec::<StreamInfo>::new()));
     let sink = Box::new(ChannelSink {
@@ -128,15 +126,12 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
         .spawn()
         .expect("spawn executor");
 
-    // Wait for `start` to fire and capture the audio stream's tb +
-    // index. The first event must be Started.
     let start_deadline = Instant::now() + Duration::from_secs(5);
     let started = wait_for(&rx, start_deadline, |e| matches!(e, SinkEvent::Started(_)))
         .expect("Started event never arrived");
     let SinkEvent::Started(streams) = started else {
         unreachable!()
     };
-    assert!(!streams.is_empty(), "no streams reported");
     let audio = streams
         .iter()
         .find(|s| s.params.media_type == MediaType::Audio)
@@ -144,19 +139,21 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     let audio_idx = audio.index;
     let audio_tb = audio.time_base;
 
-    // Drain a few frames/packets so the pipeline is "running" before
-    // we seek.
+    // Drain a few pre-seek payloads so the pipeline is warm.
     let _ = wait_for(&rx, Instant::now() + Duration::from_secs(2), |e| {
         matches!(e, SinkEvent::Payload { .. })
     });
 
-    // Seek to ~30s. Stub tb is 1/sample_rate so pts is in samples.
+    // Ask for ~30 s — totally different from FIXED_LANDED_PTS (42
+    // ticks ≈ 5.25 ms at 8 kHz). The fixed-landing demuxer ignores
+    // the request and reports 42 anyway.
     let target_pts = (30.0_f64 / audio_tb.as_rational().as_f64()).round() as i64;
     handle
         .seek(audio_idx, target_pts, audio_tb)
         .expect("seek dispatch");
 
-    // Wait for the barrier with generation == 1 to surface on the sink.
+    // The barrier must carry the demuxer's *actual* landed pts (42),
+    // NOT the requested target (~240 000).
     let barrier_deadline = Instant::now() + Duration::from_secs(5);
     let evt = wait_for(&rx, barrier_deadline, |e| {
         matches!(e, SinkEvent::Barrier(_))
@@ -172,57 +169,30 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
             time_base,
         } => {
             assert_eq!(generation, 1, "first seek must produce generation = 1");
-            // Stub demuxer's `seek_to` clamps to `[0, samples_total]`
-            // and returns the landed pts unchanged otherwise; for our
-            // 30 s target inside a 60 s stream that's exactly
-            // `target_pts`. The barrier must surface that pts and the
-            // stream's tb so the engine can re-anchor without guessing.
             assert_eq!(
-                landed_pts, target_pts,
-                "stub demuxer lands exactly on requested pts"
+                landed_pts, FIXED_LANDED_PTS,
+                "barrier must surface the demuxer's actual landed pts ({}), \
+                 not the caller's requested target ({})",
+                FIXED_LANDED_PTS, target_pts
             );
             assert_eq!(
                 time_base, audio_tb,
-                "barrier carries the SeekCmd's time_base verbatim"
+                "barrier must carry the SeekCmd's time_base verbatim so \
+                 consumers can convert landed_pts to wall-clock without \
+                 re-resolving the stream's tb"
             );
         }
         BarrierKind::SeekRejected { .. } => {
-            panic!("stub demuxer's seek_to lands successfully; SeekFlush expected")
+            panic!("fixed-landing stub returns Ok(42); SeekFlush expected")
         }
     }
 
-    // Subsequent payloads must have pts at-or-near the seek target.
-    let post_deadline = Instant::now() + Duration::from_secs(5);
-    let evt = wait_for(&rx, post_deadline, |e| {
-        matches!(e, SinkEvent::Payload { pts: Some(_), .. })
-    })
-    .expect("no post-barrier payload within deadline");
-    if let SinkEvent::Payload { pts: Some(p), .. } = evt {
-        // Allow anything within ±1s of the target; the stub's
-        // seek_to lands exactly, but any bounded-channel buffering
-        // can let one stale pre-seek packet slip through.
-        let target_secs = audio_tb.seconds_of(target_pts);
-        let p_secs = audio_tb.seconds_of(p);
-        let drift = (p_secs - target_secs).abs();
-        assert!(
-            drift < 1.0,
-            "post-barrier pts {p_secs:.3}s drifted from target {target_secs:.3}s by {drift:.3}s"
-        );
-    }
-
-    // Tear down cleanly. Spawn a draining thread BEFORE calling stop
-    // so the bounded sink channel never deadlocks during the
-    // executor's final `sink.finish()` send: the executor stays
-    // alive until it broadcasts `Finished`, which needs a consumer.
-    // (Pre-fix this test was occasionally observed to hang ~30% of
-    // the time on macOS / Windows runners when the channel saturated
-    // just as the executor wound down.)
-    let drainer = std::thread::spawn(move || {
-        while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
-            // Drain until disconnected. The executor will exit once
-            // its final send goes through.
-        }
-    });
+    // Drain to clean shutdown.
+    let drainer = std::thread::spawn(
+        move || {
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+        },
+    );
     let _stats = handle.stop().expect("stop executor");
     let _ = drainer.join();
 }

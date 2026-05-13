@@ -61,7 +61,19 @@ pub enum BarrierKind {
     /// `generation` is incremented by the demuxer on every seek so the
     /// engine can correlate `seek()` calls with their corresponding
     /// barrier emission and ignore pre-seek payload still in flight.
-    SeekFlush { generation: u32 },
+    ///
+    /// `landed_pts` is the actual position the demuxer reached
+    /// (typically the largest keyframe ≤ requested target), expressed
+    /// in `time_base` units. Engines re-anchor their master clock at
+    /// this exact value rather than guessing from the next packet's
+    /// pts — video lands on a keyframe (≤ target) while audio lands
+    /// on the next packet (≥ target), so any "guess from the next
+    /// audio frame" heuristic is typically off by 50-200 ms.
+    SeekFlush {
+        generation: u32,
+        landed_pts: i64,
+        time_base: TimeBase,
+    },
     /// Demuxer rejected the corresponding [`SeekCmd`] — `seek_to`
     /// returned an error. This barrier carries the same `generation`
     /// the matching `SeekFlush` would have used, so engines that
@@ -620,7 +632,11 @@ fn run_demuxer_stage(
             while let Ok(cmd) = rx.try_recv() {
                 generation = generation.wrapping_add(1);
                 let kind = match dmx.seek_to(cmd.stream_idx, cmd.pts) {
-                    Ok(_landed) => BarrierKind::SeekFlush { generation },
+                    Ok(landed_pts) => BarrierKind::SeekFlush {
+                        generation,
+                        landed_pts,
+                        time_base: cmd.time_base,
+                    },
                     Err(_e) => BarrierKind::SeekRejected { generation },
                 };
                 for (_, tx) in &routes {
