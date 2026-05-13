@@ -193,6 +193,19 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
         );
     }
 
-    // Tear down cleanly.
+    // Tear down cleanly. Spawn a draining thread BEFORE calling stop
+    // so the bounded sink channel never deadlocks during the
+    // executor's final `sink.finish()` send: the executor stays
+    // alive until it broadcasts `Finished`, which needs a consumer.
+    // (Pre-fix this test was occasionally observed to hang ~30% of
+    // the time on macOS / Windows runners when the channel saturated
+    // just as the executor wound down.)
+    let drainer = std::thread::spawn(move || {
+        while rx.recv_timeout(Duration::from_millis(500)).is_ok() {
+            // Drain until disconnected. The executor will exit once
+            // its final send goes through.
+        }
+    });
     let _stats = handle.stop().expect("stop executor");
+    let _ = drainer.join();
 }

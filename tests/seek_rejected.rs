@@ -187,5 +187,14 @@ fn rejected_seek_emits_seek_rejected_barrier_and_keeps_running() {
         );
     }
 
+    // Spawn a draining thread BEFORE stop so the executor's final
+    // `sink.finish()` send (Finished event) doesn't deadlock the
+    // bounded sink channel. Mirrors the fix in `seek_barrier.rs`.
+    let drainer = std::thread::spawn(
+        move || {
+            while rx.recv_timeout(Duration::from_millis(500)).is_ok() {}
+        },
+    );
     let _stats = handle.stop().expect("stop executor");
+    let _ = drainer.join();
 }
