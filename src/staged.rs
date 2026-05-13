@@ -35,11 +35,23 @@ use crate::executor::{
     flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage, JobSink, TrackRuntime,
 };
 
-/// Flow-barrier kind in [`Msg::Barrier`]. Today there is exactly one
-/// variant — `SeekFlush` — broadcast by the demuxer stage when it
-/// receives a [`SeekCmd`] from the [`crate::ExecutorHandle`]. Adding
-/// new kinds is non-breaking: every worker treats unknown kinds as
-/// "forward unchanged".
+/// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
+/// stage when it receives a [`SeekCmd`] from the
+/// [`crate::ExecutorHandle`]. There are two outcomes per command:
+///
+/// * `SeekFlush` — the demuxer's `seek_to` returned `Ok`. Workers
+///   drop in-flight state; the engine re-anchors its clock.
+/// * `SeekRejected` — the demuxer's `seek_to` returned `Err`
+///   (typically `Error::Unsupported`, e.g. an MP3 stream without a
+///   Xing TOC or any container that hasn't implemented seek_to).
+///   The demuxer keeps playing from its current position so the
+///   pipeline stays alive; the engine should disable its seek UI
+///   for the rest of the session.
+///
+/// Each successful and each rejected seek consumes ONE generation
+/// value, incremented in lock-step with the demuxer's internal
+/// counter. Adding new kinds is non-breaking: every worker treats
+/// unknown kinds as "forward unchanged".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BarrierKind {
     /// Seek-induced flush. Workers reset codec / filter state, then
@@ -50,6 +62,15 @@ pub enum BarrierKind {
     /// engine can correlate `seek()` calls with their corresponding
     /// barrier emission and ignore pre-seek payload still in flight.
     SeekFlush { generation: u32 },
+    /// Demuxer rejected the corresponding [`SeekCmd`] — `seek_to`
+    /// returned an error. This barrier carries the same `generation`
+    /// the matching `SeekFlush` would have used, so engines that
+    /// track seek-in-flight by generation can clear that bookkeeping
+    /// uniformly. Workers should NOT reset their codec state on
+    /// `SeekRejected` because the demuxer kept reading from its
+    /// previous position; the in-flight frames are still valid.
+    /// Engines should disable seek UI for the session.
+    SeekRejected { generation: u32 },
 }
 
 /// Command sent to the demuxer stage by [`crate::ExecutorHandle::seek`].
@@ -556,10 +577,17 @@ where
 /// Optional `seek_rx` carries [`SeekCmd`]s from
 /// [`crate::ExecutorHandle::seek`]. On each iteration we
 /// non-blocking-poll the channel; on a SeekCmd we bump `generation`,
-/// fan a `Msg::Barrier(SeekFlush)` out on every route, then call
-/// `dmx.seek_to`. The barrier flows downstream through every worker
-/// (which resets its codec/filter state) and lands on the mux loop,
+/// call `dmx.seek_to`, and fan a single barrier out on every route:
+/// [`BarrierKind::SeekFlush`] on success (workers drop in-flight
+/// state) or [`BarrierKind::SeekRejected`] on error (workers leave
+/// state alone; the demuxer keeps reading from its prior position
+/// so the pipeline stays alive). The barrier lands on the mux loop,
 /// which calls `sink.barrier(kind)`.
+///
+/// Rejecting a seek is NOT a fatal pipeline error — pre-fix, the
+/// stage propagated `seek_to`'s error and the entire executor died
+/// the first time a user pressed `→` on a stream backed by a
+/// demuxer whose `seek_to` was the default `Error::unsupported`.
 fn run_demuxer_stage(
     mut dmx: Box<dyn Demuxer>,
     routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
@@ -572,20 +600,34 @@ fn run_demuxer_stage(
         if abort.is_aborted() {
             break;
         }
-        // Drain any pending seeks before reading the next packet.
+        // Drain any pending seeks before reading the next packet. We
+        // ask the demuxer to seek FIRST and broadcast the matching
+        // barrier AFTER, so workers see whether the seek landed
+        // (`SeekFlush` — reset codec state) or was rejected
+        // (`SeekRejected` — keep going from the prior position).
+        //
+        // Pre-fix this loop broadcast `SeekFlush` unconditionally and
+        // then propagated any `seek_to` error via `return Err(e)`,
+        // which killed the entire demuxer thread the first time a
+        // user pressed `→` on a stream backed by a demuxer whose
+        // `seek_to` was the default `Error::unsupported`. The
+        // executor would surface the error, the engine would stall
+        // with no further packets, and the player UI froze. We now
+        // keep the pipeline alive on rejection and signal the engine
+        // via a dedicated barrier kind so it can disable seek UI for
+        // the session.
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
                 generation = generation.wrapping_add(1);
-                let kind = BarrierKind::SeekFlush { generation };
+                let kind = match dmx.seek_to(cmd.stream_idx, cmd.pts) {
+                    Ok(_landed) => BarrierKind::SeekFlush { generation },
+                    Err(_e) => BarrierKind::SeekRejected { generation },
+                };
                 for (_, tx) in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {
                         abort.abort.store(true, Ordering::SeqCst);
                         return Ok(());
                     }
-                }
-                match dmx.seek_to(cmd.stream_idx, cmd.pts) {
-                    Ok(_landed) => {}
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -733,7 +775,13 @@ fn run_decode_stage(
                 // SeekFlush: drop any in-flight buffered frames + reset
                 // codec state so reference frames from the pre-seek
                 // segment can't leak into the post-seek output.
-                let _ = decoder.reset();
+                // SeekRejected: demuxer never moved; the in-flight
+                // packets are still on the original timeline, so
+                // leave decoder state alone and only forward the
+                // barrier so the engine sees it.
+                if matches!(b, BarrierKind::SeekFlush { .. }) {
+                    let _ = decoder.reset();
+                }
                 if tx.send(Msg::Barrier(b)).is_err() {
                     break;
                 }
@@ -807,7 +855,13 @@ fn run_frame_stage_worker(
                 // flows to the extras channel so a multi-port filter's
                 // sink (e.g. spectrogram's video output) gets a chance
                 // to drop in-flight extras.
-                reset_frame_stage(&mut stage);
+                //
+                // SeekRejected: demuxer never moved, so the filter's
+                // rolling state is still consistent with the upstream
+                // frames in flight; only forward the barrier.
+                if matches!(b, BarrierKind::SeekFlush { .. }) {
+                    reset_frame_stage(&mut stage);
+                }
                 if let Some(etx) = &extras_tx {
                     let _ = etx.send(Msg::Barrier(b));
                 }
@@ -897,8 +951,14 @@ fn run_encode_stage(
                 // anything pending and forward the barrier. A future
                 // extension can plumb codec-specific reset (e.g.
                 // dropping the GOP) once needed.
-                let _ = encoder.flush();
-                drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                //
+                // SeekRejected: demuxer never moved; skip the flush
+                // (which would emit a partial GOP for nothing) and
+                // only forward the barrier.
+                if matches!(b, BarrierKind::SeekFlush { .. }) {
+                    let _ = encoder.flush();
+                    drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
+                }
                 if out_tx.send(Msg::Barrier(b)).is_err() {
                     break;
                 }

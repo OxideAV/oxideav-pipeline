@@ -7,7 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [0.1.7](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.6...v0.1.7) - 2026-05-06
+### Added
+
+- `BarrierKind::SeekRejected { generation }` variant. Emitted by the
+  demuxer stage when `Demuxer::seek_to` returns an error (the typical
+  case for a container that hasn't implemented seek yet, e.g. MP3 /
+  MOV / AAC / AC3 before they grew dedicated impls). The pipeline now
+  keeps reading from the pre-seek position instead of dying. Engines
+  should match the new variant alongside `SeekFlush` and disable seek
+  UI for the rest of the session on rejection. Reported by the user
+  as "oxideplay can't seek on mp3 / any file" — the demuxer thread
+  was propagating `seek_to`'s error and the executor exited silently.
+
+### Changed
+
+- Demuxer stage now calls `seek_to` first and broadcasts the matching
+  barrier (Flush / Rejected) after, so workers can distinguish
+  "landed seek — reset codec state" from "rejected seek — keep going".
+
+
 
 ### Other
 

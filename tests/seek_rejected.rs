@@ -1,17 +1,19 @@
-//! Integration test for the seek-barrier control surface.
+//! Integration test for the seek-rejected control surface.
 //!
-//! Spawns an `Executor` over a synthetic stub stream (60 seconds, so
-//! the demuxer doesn't hit EOF before we issue a seek), wires a
-//! channel-forwarding sink so we observe `start` / `write_frame` /
-//! `barrier` / `finish` calls from the test thread, and:
+//! Mirrors `seek_barrier.rs` but routes through the
+//! [`common::stub::NoSeekStubDemuxer`] whose `seek_to` always returns
+//! `Error::unsupported`. Asserts:
 //!
-//! 1. Issues `ExecutorHandle::seek(stream, half-way pts, tb)`.
-//! 2. Waits for the sink's `barrier(SeekFlush { generation: 1 })` call.
-//! 3. Verifies that subsequent payloads carry pts at-or-near the seek
-//!    target (the stub demuxer's `seek_to` snaps exactly).
+//! 1. The pipeline does NOT die when a seek is rejected (pre-fix, the
+//!    demuxer thread propagated the error and the executor exited).
+//! 2. A [`BarrierKind::SeekRejected`] barrier with the matching
+//!    generation surfaces on the sink.
+//! 3. Audio payloads keep flowing after the rejected seek.
 //!
-//! Also exercises `try_progress` + `stop` for handle lifecycle
-//! coverage.
+//! This is the regression that the user reported as "if I run oxideplay
+//! on any file (mp3, video, etc) I can't seek" — every demuxer that
+//! still uses the default `seek_to` (mp3, mov, aac, ac3) hit the same
+//! bug, manifesting as the player stalling after the first seek key.
 
 mod common;
 
@@ -22,8 +24,6 @@ use std::time::{Duration, Instant};
 use oxideav_core::{Frame, MediaType, Packet, Result, StreamInfo};
 use oxideav_pipeline::{BarrierKind, Executor, Job, JobSink};
 
-/// A test sink that forwards every JobSink event to a channel so the
-/// test driver can `recv()` them in order.
 enum SinkEvent {
     Started(Vec<StreamInfo>),
     Payload { _kind: MediaType, pts: Option<i64> },
@@ -68,9 +68,6 @@ impl JobSink for ChannelSink {
     }
 }
 
-/// Drain events until either `pred` matches one (returns it), the
-/// `Finished` event arrives, or the deadline is reached. Returns
-/// the matched event or `None` on timeout/Finished.
 fn wait_for<F>(rx: &Receiver<SinkEvent>, deadline: Instant, mut pred: F) -> Option<SinkEvent>
 where
     F: FnMut(&SinkEvent) -> bool,
@@ -94,11 +91,10 @@ where
 }
 
 #[test]
-fn spawn_seek_emits_barrier_and_advances_pts() {
-    // Stub demuxer emits 60s of synthetic mono audio at 8 kHz.
-    // We seek to the half-way point (~30s) and verify the sink sees
-    // a SeekFlush barrier with generation = 1.
-    let src = common::stub::touch("seek_barrier");
+fn rejected_seek_emits_seek_rejected_barrier_and_keeps_running() {
+    // Stub demuxer (noseek variant): emits 60s of synthetic mono audio
+    // and rejects every `seek_to`.
+    let src = common::stub::touch_noseek("seek_rejected");
 
     let mut ctx = oxideav_core::RuntimeContext::new();
     common::stub::register(&mut ctx.codecs, &mut ctx.containers);
@@ -113,8 +109,6 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     );
     let job = Job::from_json(&job_json).expect("parse job");
 
-    // Small channel so the sink back-pressures the executor — the
-    // pipeline can't outrun this test thread.
     let (tx, rx) = mpsc::sync_channel::<SinkEvent>(8);
     let streams_slot = Arc::new(Mutex::new(Vec::<StreamInfo>::new()));
     let sink = Box::new(ChannelSink {
@@ -128,15 +122,13 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
         .spawn()
         .expect("spawn executor");
 
-    // Wait for `start` to fire and capture the audio stream's tb +
-    // index. The first event must be Started.
+    // Get audio stream metadata via the first Started event.
     let start_deadline = Instant::now() + Duration::from_secs(5);
     let started = wait_for(&rx, start_deadline, |e| matches!(e, SinkEvent::Started(_)))
         .expect("Started event never arrived");
     let SinkEvent::Started(streams) = started else {
         unreachable!()
     };
-    assert!(!streams.is_empty(), "no streams reported");
     let audio = streams
         .iter()
         .find(|s| s.params.media_type == MediaType::Audio)
@@ -144,55 +136,56 @@ fn spawn_seek_emits_barrier_and_advances_pts() {
     let audio_idx = audio.index;
     let audio_tb = audio.time_base;
 
-    // Drain a few frames/packets so the pipeline is "running" before
-    // we seek.
+    // Drain a few pre-seek payloads so the pipeline is steady-state.
     let _ = wait_for(&rx, Instant::now() + Duration::from_secs(2), |e| {
         matches!(e, SinkEvent::Payload { .. })
     });
 
-    // Seek to ~30s. Stub tb is 1/sample_rate so pts is in samples.
+    // Issue a seek — the noseek demuxer will reject it.
     let target_pts = (30.0_f64 / audio_tb.as_rational().as_f64()).round() as i64;
     handle
         .seek(audio_idx, target_pts, audio_tb)
         .expect("seek dispatch");
 
-    // Wait for the barrier with generation == 1 to surface on the sink.
+    // Wait for a barrier. It must be SeekRejected with generation == 1.
     let barrier_deadline = Instant::now() + Duration::from_secs(5);
     let evt = wait_for(&rx, barrier_deadline, |e| {
         matches!(e, SinkEvent::Barrier(_))
     })
-    .expect("Barrier never arrived after seek");
+    .expect("Barrier never arrived after rejected seek (pipeline likely died)");
     let SinkEvent::Barrier(b) = evt else {
         unreachable!()
     };
     match b {
-        BarrierKind::SeekFlush { generation } => {
-            assert_eq!(generation, 1, "first seek must produce generation = 1");
+        BarrierKind::SeekRejected { generation } => {
+            assert_eq!(
+                generation, 1,
+                "first rejected seek must report generation = 1"
+            );
         }
-        BarrierKind::SeekRejected { .. } => {
-            panic!("stub demuxer's seek_to lands successfully; SeekFlush expected")
-        }
+        other => panic!("expected SeekRejected, got {other:?}"),
     }
 
-    // Subsequent payloads must have pts at-or-near the seek target.
+    // After the rejected seek, the pipeline must KEEP producing audio
+    // payloads from where it was. This is the bug that the user
+    // reported: pre-fix the demuxer thread propagated the error and
+    // the executor exited, so no further payloads arrived.
     let post_deadline = Instant::now() + Duration::from_secs(5);
     let evt = wait_for(&rx, post_deadline, |e| {
         matches!(e, SinkEvent::Payload { pts: Some(_), .. })
     })
-    .expect("no post-barrier payload within deadline");
+    .expect("no post-rejection payload — pipeline died on rejected seek");
     if let SinkEvent::Payload { pts: Some(p), .. } = evt {
-        // Allow anything within ±1s of the target; the stub's
-        // seek_to lands exactly, but any bounded-channel buffering
-        // can let one stale pre-seek packet slip through.
-        let target_secs = audio_tb.seconds_of(target_pts);
+        // pts should be in the pre-seek timeline (i.e. < 30s of audio),
+        // not anywhere near the rejected target. The stub emits 100ms
+        // packets so by the time the seek + barrier round-trip
+        // completes we're at most a few seconds in.
         let p_secs = audio_tb.seconds_of(p);
-        let drift = (p_secs - target_secs).abs();
         assert!(
-            drift < 1.0,
-            "post-barrier pts {p_secs:.3}s drifted from target {target_secs:.3}s by {drift:.3}s"
+            p_secs < 25.0,
+            "post-rejection pts {p_secs:.3}s is suspiciously close to the rejected target (30s) — demuxer should NOT have moved"
         );
     }
 
-    // Tear down cleanly.
     let _stats = handle.stop().expect("stop executor");
 }

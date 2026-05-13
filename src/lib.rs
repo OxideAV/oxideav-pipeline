@@ -41,6 +41,12 @@ use oxideav_core::{
 // ───────────────────────── Sink trait ─────────────────────────
 
 /// What a [`Sink`] wants for a given source stream.
+///
+/// `Transcode` carries a full [`CodecParameters`] (~200 B) which is
+/// larger than the other variants; boxing the field would be an
+/// API-visible churn and the enum is only constructed once per
+/// stream/route resolution, so it's not on a hot path.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum SinkAcceptance {
     /// Take raw packets as-is — stream copy, no decoding.

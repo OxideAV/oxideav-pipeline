@@ -1733,9 +1733,20 @@ impl ExecutorHandle {
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
     /// demuxer thread receives the command, increments its generation,
-    /// broadcasts a [`crate::BarrierKind::SeekFlush`] on every route,
-    /// then calls `demuxer.seek_to`. The sink will see a `barrier(...)`
-    /// callback once the flush reaches the mux loop.
+    /// calls `demuxer.seek_to`, then broadcasts exactly one barrier on
+    /// every route:
+    ///
+    /// * [`crate::BarrierKind::SeekFlush`] if the demuxer reported a
+    ///   successful seek. Workers reset codec / filter state, the
+    ///   engine re-anchors its master clock at the landing pts.
+    /// * [`crate::BarrierKind::SeekRejected`] if `demuxer.seek_to`
+    ///   returned an error (Unsupported, no SEEKTABLE, etc). The
+    ///   pipeline keeps producing packets from where it was; the
+    ///   engine should disable seek UI for the session.
+    ///
+    /// Callers must therefore handle BOTH barrier kinds when matching
+    /// on `generation`. The send itself only fails if the executor
+    /// thread already exited.
     pub fn seek(&self, stream_idx: u32, pts: i64, time_base: oxideav_core::TimeBase) -> Result<()> {
         self.seek_tx
             .send(crate::staged::SeekCmd {

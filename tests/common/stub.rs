@@ -29,6 +29,11 @@ pub const CONTAINER: &str = "stub_audio";
 /// Extension that triggers the stub container via the registry's
 /// extension hint.
 pub const EXT: &str = "stub";
+/// Container name for the unseekable variant (every `seek_to` returns
+/// `Error::unsupported`).
+pub const CONTAINER_NOSEEK: &str = "stub_audio_noseek";
+/// Extension for the unseekable stub container.
+pub const EXT_NOSEEK: &str = "stubns";
 
 /// Sample rate of the synthetic audio. Small so the demuxer's pts
 /// arithmetic is easy to reason about in tests, realistic enough that
@@ -50,6 +55,20 @@ pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) 
 
     containers.register_demuxer(CONTAINER, open_demuxer as OpenDemuxerFn);
     containers.register_extension(EXT, CONTAINER);
+    // Unseekable variant: same packets, but `seek_to` always returns
+    // `Error::unsupported` so pipeline tests can drive the SeekRejected
+    // path. Codec is shared.
+    containers.register_demuxer(CONTAINER_NOSEEK, open_demuxer_noseek as OpenDemuxerFn);
+    containers.register_extension(EXT_NOSEEK, CONTAINER_NOSEEK);
+}
+
+/// Create an empty unseekable-stub file. Same shape as [`touch`] but
+/// the file's extension routes through the noseek demuxer.
+pub fn touch_noseek(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("oxideav_pipeline_stub_{name}.{EXT_NOSEEK}"));
+    let _ = std::fs::File::create(&p).expect("create stub noseek file");
+    p
 }
 
 /// Create an empty `.stub` file under `std::env::temp_dir()` and
@@ -72,6 +91,36 @@ fn open_demuxer(
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(StubDemuxer::new(DEFAULT_DURATION_MS)))
+}
+
+fn open_demuxer_noseek(
+    _input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(NoSeekStubDemuxer(StubDemuxer::new(
+        DEFAULT_DURATION_MS,
+    ))))
+}
+
+/// Wraps [`StubDemuxer`] but rejects every `seek_to` with
+/// [`Error::unsupported`] — emulates the legacy behaviour of every
+/// demuxer that hadn't implemented `seek_to` yet. Used to drive the
+/// pipeline's `BarrierKind::SeekRejected` path under test.
+pub struct NoSeekStubDemuxer(pub StubDemuxer);
+
+impl Demuxer for NoSeekStubDemuxer {
+    fn format_name(&self) -> &str {
+        CONTAINER_NOSEEK
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        self.0.streams()
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        self.0.next_packet()
+    }
+    fn seek_to(&mut self, _stream_index: u32, _pts: i64) -> Result<i64> {
+        Err(Error::unsupported("noseek stub: seek_to not implemented"))
+    }
 }
 
 /// Stub demuxer: emits zero-filled S16 mono packets at fixed cadence.
