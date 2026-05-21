@@ -1690,6 +1690,13 @@ pub(crate) struct PreparedRun {
 pub struct ExecutorHandle {
     abort: std::sync::Arc<crate::staged::AbortState>,
     seek_tx: std::sync::mpsc::Sender<crate::staged::SeekCmd>,
+    /// Monotonic counter incremented inside
+    /// [`Self::seek_with_generation`] before each `SeekCmd` is queued.
+    /// The value stamped on the command is what the demuxer copies
+    /// verbatim into the resulting `BarrierKind::Seek*` — the handle
+    /// and the barrier are guaranteed to use the same `generation` so
+    /// callers can correlate dispatches with their barriers.
+    next_generation: std::sync::Arc<std::sync::atomic::AtomicU32>,
     progress_rx: std::sync::mpsc::Receiver<crate::staged::Progress>,
     join: Option<std::thread::JoinHandle<Result<ExecutorStats>>>,
     finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1725,6 +1732,7 @@ impl ExecutorHandle {
         Self {
             abort,
             seek_tx,
+            next_generation: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
             progress_rx,
             join: Some(join),
             finished,
@@ -1732,9 +1740,8 @@ impl ExecutorHandle {
     }
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
-    /// demuxer thread receives the command, increments its generation,
-    /// calls `demuxer.seek_to`, then broadcasts exactly one barrier on
-    /// every route:
+    /// demuxer thread receives the command, calls `demuxer.seek_to`,
+    /// then broadcasts exactly one barrier on every route:
     ///
     /// * [`crate::BarrierKind::SeekFlush`] if the demuxer reported a
     ///   successful seek. Workers reset codec / filter state, the
@@ -1747,14 +1754,60 @@ impl ExecutorHandle {
     /// Callers must therefore handle BOTH barrier kinds when matching
     /// on `generation`. The send itself only fails if the executor
     /// thread already exited.
+    ///
+    /// This convenience wrapper discards the generation that the
+    /// handle assigns; prefer [`Self::seek_with_generation`] if you
+    /// need to correlate `seek` dispatches with the resulting barrier
+    /// (i.e. ignore stale pre-seek payloads still in flight, or detect
+    /// dropped seeks under a rapid burst).
     pub fn seek(&self, stream_idx: u32, pts: i64, time_base: oxideav_core::TimeBase) -> Result<()> {
+        self.seek_with_generation(stream_idx, pts, time_base)
+            .map(|_| ())
+    }
+
+    /// Issue a seek and return the `generation` value the handle
+    /// assigned. The matching `BarrierKind::SeekFlush { generation, .. }`
+    /// or `BarrierKind::SeekRejected { generation }` will surface on
+    /// the sink carrying exactly this value, so engines can correlate
+    /// `seek_with_generation()` calls with their barriers and discard
+    /// any payloads/barriers from earlier generations as stale.
+    ///
+    /// Generations are assigned by an internal `AtomicU32` counter
+    /// (starting at 1; wrapping at `u32::MAX`) so concurrent callers
+    /// on the same handle each get a unique value. The demuxer copies
+    /// the value verbatim into the resulting barrier — no separate
+    /// counter is maintained on the demuxer side, so the handle's
+    /// return value and the barrier's `generation` field are
+    /// guaranteed to match.
+    ///
+    /// Returns the assigned generation on success, or an error if the
+    /// executor thread has already exited (e.g. EOF was reached
+    /// concurrently with the seek dispatch).
+    pub fn seek_with_generation(
+        &self,
+        stream_idx: u32,
+        pts: i64,
+        time_base: oxideav_core::TimeBase,
+    ) -> Result<u32> {
+        // `fetch_add` returns the value BEFORE the add, so the very
+        // first call returns 0 — but the contract is "generations
+        // start at 1" (mirroring the demuxer's pre-fix behaviour and
+        // matching every existing test). Pre-increment to keep parity
+        // with the prior demuxer-side counter that called
+        // `wrapping_add(1)` before stamping the barrier.
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            .wrapping_add(1);
         self.seek_tx
             .send(crate::staged::SeekCmd {
                 stream_idx,
                 pts,
                 time_base,
+                generation,
             })
-            .map_err(|_| Error::other("ExecutorHandle: seek channel closed (executor exited)"))
+            .map_err(|_| Error::other("ExecutorHandle: seek channel closed (executor exited)"))?;
+        Ok(generation)
     }
 
     /// Non-blocking poll of the most recent progress message. Returns

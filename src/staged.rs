@@ -86,13 +86,29 @@ pub enum BarrierKind {
 }
 
 /// Command sent to the demuxer stage by [`crate::ExecutorHandle::seek`].
-/// The demuxer increments its local generation, broadcasts a
-/// `SeekFlush` barrier on every route, then calls `demuxer.seek_to`.
+/// Carries the `generation` value that the demuxer will stamp on the
+/// resulting `SeekFlush` / `SeekRejected` barrier — assigned by the
+/// handle's atomic counter at `seek()` time so the caller can correlate
+/// its dispatch with the eventual barrier (returned from
+/// [`crate::ExecutorHandle::seek_with_generation`]).
+///
+/// The demuxer no longer keeps its own private counter — every barrier
+/// it emits in response to a `SeekCmd` carries this exact value
+/// verbatim. This guarantees `handle.seek_with_generation(...)?` and
+/// `BarrierKind::Seek* { generation, .. }` are in lockstep even under
+/// rapid bursts of seeks (e.g. the user holding `→` for a half-second
+/// scrubbing across a video — pre-fix the handle had to mirror the
+/// demuxer's counter and any dropped / out-of-order delivery would
+/// silently desync the engine's seek-pending bookkeeping).
 #[derive(Clone, Copy, Debug)]
 pub struct SeekCmd {
     pub stream_idx: u32,
     pub pts: i64,
     pub time_base: TimeBase,
+    /// Caller-assigned generation; the demuxer copies this value into
+    /// every resulting barrier so the caller can match its dispatch
+    /// with the corresponding `SeekFlush` / `SeekRejected`.
+    pub generation: u32,
 }
 
 /// Per-frame progress event consumed by [`crate::ExecutorHandle::try_progress`].
@@ -607,7 +623,6 @@ fn run_demuxer_stage(
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
 ) -> Result<()> {
-    let mut generation: u32 = 0;
     loop {
         if abort.is_aborted() {
             break;
@@ -628,16 +643,23 @@ fn run_demuxer_stage(
         // keep the pipeline alive on rejection and signal the engine
         // via a dedicated barrier kind so it can disable seek UI for
         // the session.
+        //
+        // Generation comes from the caller (`cmd.generation`, assigned
+        // by `ExecutorHandle::seek_with_generation`'s atomic counter)
+        // rather than a local counter, so the handle's returned value
+        // and the resulting barrier's `generation` are guaranteed to
+        // match in lockstep regardless of how many seeks are queued.
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
-                generation = generation.wrapping_add(1);
                 let kind = match dmx.seek_to(cmd.stream_idx, cmd.pts) {
                     Ok(landed_pts) => BarrierKind::SeekFlush {
-                        generation,
+                        generation: cmd.generation,
                         landed_pts,
                         time_base: cmd.time_base,
                     },
-                    Err(_e) => BarrierKind::SeekRejected { generation },
+                    Err(_e) => BarrierKind::SeekRejected {
+                        generation: cmd.generation,
+                    },
                 };
                 for (_, tx) in &routes {
                     if tx.send(Msg::Barrier(kind)).is_err() {

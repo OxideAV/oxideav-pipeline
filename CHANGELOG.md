@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `ExecutorHandle::seek_with_generation(stream_idx, pts, tb) -> Result<u32>`.
+  The handle now owns the monotonic generation counter (previously
+  private to the demuxer stage) and returns the assigned value to the
+  caller. The demuxer copies it verbatim into the resulting
+  `BarrierKind::SeekFlush` / `SeekRejected`, so callers can correlate
+  their dispatches with the corresponding barriers without
+  maintaining a parallel mirror counter that could silently desync.
+  `SeekCmd` gains a `pub generation: u32` field to carry the value
+  through the seek channel. Background: oxideplay's seek-pending
+  bookkeeping kept a private `seek_gen_counter` that mirrored what
+  the demuxer was about to do — a fragile arrangement where any
+  dropped seek (channel saturated, executor torn down mid-press)
+  silently desynchronised the two counters and the engine started
+  treating fresh barriers as stale (or vice versa). With the
+  generation returned from `seek_with_generation`, the engine just
+  records the value the handle gave it and compares barriers
+  one-to-one. The shorter `seek(...) -> Result<()>` form is retained
+  as a discard wrapper for callers that don't need correlation, so
+  this is **additive** — existing users (oxideplay's
+  `apply_seek`) keep compiling unchanged. Regression coverage:
+  `tests/seek_with_generation.rs` asserts (a) the first call returns
+  `1` matching the prior demuxer-side counter contract, (b) the
+  returned value equals the barrier's `generation` field, and (c) a
+  burst of five back-to-back seeks produces barriers carrying the
+  full set `{1, 2, 3, 4, 5}` with no duplicates.
 - `BarrierKind::SeekRejected { generation }` variant. Emitted by the
   demuxer stage when `Demuxer::seek_to` returns an error (the typical
   case for a container that hasn't implemented seek yet, e.g. MP3 /

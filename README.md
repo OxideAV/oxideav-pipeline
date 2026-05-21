@@ -42,6 +42,20 @@ lands on the next packet (≥ target). With the payload extension,
 position display reads the new position the instant the barrier fires.
 See `tests/seek_flush_carries_landed_pts.rs`.
 
+## Seek correlation
+
+`ExecutorHandle::seek_with_generation(stream_idx, pts, tb)` returns the
+`generation: u32` the handle assigned to the dispatch; the resulting
+`BarrierKind::SeekFlush { generation, .. }` / `SeekRejected { generation }`
+carries the exact same value. Engines that need to ignore stale
+pre-seek payloads (or detect a missed seek across a burst — holding
+`→` during scrubbing fires several seeks per second) compare against
+the returned value rather than maintaining a parallel mirror counter
+that could silently desync with the demuxer's. The shorter
+`seek(...) -> Result<()>` form is retained as a discard wrapper for
+callers that don't need correlation. See
+`tests/seek_with_generation.rs`.
+
 ## Usage
 
 ```toml
