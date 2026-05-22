@@ -9,6 +9,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Executor::with_max_queue_bytes(n)`. An orthogonal *byte* ceiling on
+  the demuxer→worker packet queues for the pipelined runner.
+  `with_channel_caps` bounds those queues by *element count* (at most
+  `packets` packets per track), which is the right knob when packet
+  sizes are uniform — but a single outsized packet (a tracker module
+  delivered whole in one packet, a 4K intra keyframe, a JPEG-2000
+  codestream) can be megabytes on its own, so the count cap alone lets
+  resident memory swing widely with content. The byte ceiling makes the
+  demuxer park before reading the next packet while the aggregate
+  in-flight packet bytes are at or above `n`; the consuming stage (copy
+  or decode) frees the bytes the instant it pulls the packet off the
+  channel (a shared `AtomicU64` accounts admit/release). The two knobs
+  compose — whichever binds first applies. A lone packet larger than
+  `n` is still admitted (we cross the line by one packet rather than
+  deadlock on a packet bigger than the whole budget), so `n` is a soft
+  target. **Additive** — `0` (the default) disables the byte ceiling
+  entirely: admit/release short-circuit and the demuxer never parks, so
+  existing callers get unchanged behaviour, leaving only the count caps.
+  The serial path uses no channels and ignores the ceiling. Threaded
+  through `PreparedRun` / `PipelineControl` alongside `channel_caps`, so
+  both `Executor::run` and `Executor::spawn` honour it. Regression
+  coverage: `tests/max_queue_bytes.rs` asserts (a) a sub-packet ceiling
+  (1 byte) runs to completion without deadlocking, (b) `0` matches an
+  unconfigured run, (c) a tight ceiling preserves the exact payload
+  count (no drops/dupes), and (d) the byte ceiling composes with the
+  count caps; plus five `QueueBudget` unit tests for the admit/release/
+  saturate/abort-bail accounting.
 - `Executor::with_channel_caps(ChannelCaps { packets, frames })`. The
   pipelined staged executor's per-track packet- and frame-channel depth
   were previously hard-coded constants (`PACKET_CAP = 16`,

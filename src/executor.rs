@@ -134,6 +134,11 @@ pub struct Executor<'a> {
     /// packets, 8 frames). Ignored on the serial path. Set via
     /// [`Self::with_channel_caps`].
     channel_caps: Option<staged::ChannelCaps>,
+    /// Aggregate byte ceiling on the demuxer→worker packet queues for
+    /// the pipelined runner. `0` (the default) disables the byte
+    /// ceiling, leaving only the count caps. Ignored on the serial
+    /// path. Set via [`Self::with_max_queue_bytes`].
+    max_queue_bytes: u64,
 }
 
 impl<'a> Executor<'a> {
@@ -148,6 +153,7 @@ impl<'a> Executor<'a> {
             sink_overrides: HashMap::new(),
             explicit_threads: None,
             channel_caps: None,
+            max_queue_bytes: 0,
         }
     }
 
@@ -188,6 +194,34 @@ impl<'a> Executor<'a> {
     ///   queue rather than blocking on the encoder.
     pub fn with_channel_caps(mut self, caps: staged::ChannelCaps) -> Self {
         self.channel_caps = Some(caps);
+        self
+    }
+
+    /// Cap the aggregate bytes buffered in the demuxer→worker packet
+    /// queues for the pipelined runner. `0` (the default) disables the
+    /// ceiling, leaving only the element-count caps from
+    /// [`Self::with_channel_caps`].
+    ///
+    /// [`with_channel_caps`](Self::with_channel_caps) bounds the queues
+    /// by *element count* — at most `packets` packets per track. That is
+    /// the right knob when packet sizes are uniform, but a single
+    /// outsized packet (a tracker module delivered whole in one packet,
+    /// a 4K intra keyframe, a JPEG-2000 codestream) can be megabytes on
+    /// its own, so the count cap alone can let resident memory swing
+    /// widely with content. `with_max_queue_bytes` adds an orthogonal
+    /// byte ceiling: the demuxer parks before reading the next packet
+    /// while the in-flight packet bytes are at or above `n`, and the
+    /// consuming stage (copy or decode) frees the bytes the instant it
+    /// pulls the packet off the channel.
+    ///
+    /// The two knobs compose — whichever binds first applies. A lone
+    /// packet larger than `n` is still admitted (we cross the line by
+    /// one packet rather than deadlock), so `n` is a soft target, not a
+    /// hard never-exceed.
+    ///
+    /// Has no effect on the serial path — that path uses no channels.
+    pub fn with_max_queue_bytes(mut self, n: u64) -> Self {
+        self.max_queue_bytes = n;
         self
     }
 
@@ -666,6 +700,7 @@ impl<'a> Executor<'a> {
             prep.sink,
             prep.out_streams,
             prep.channel_caps,
+            prep.max_queue_bytes,
         )
     }
 
@@ -733,6 +768,7 @@ impl<'a> Executor<'a> {
             sink,
             out_streams,
             channel_caps: self.channel_caps,
+            max_queue_bytes: self.max_queue_bytes,
         })
     }
 
@@ -1714,6 +1750,10 @@ pub(crate) struct PreparedRun {
     /// onto the background thread used by [`ExecutorHandle`] and the
     /// `run_output_pipelined` call site. `None` keeps the defaults.
     pub(crate) channel_caps: Option<staged::ChannelCaps>,
+    /// Aggregate byte ceiling on the demuxer→worker packet queues.
+    /// `0` keeps the byte ceiling disabled. Threaded alongside
+    /// `channel_caps`.
+    pub(crate) max_queue_bytes: u64,
 }
 
 /// Live handle to a background-running [`Executor`]. Returned by
@@ -1748,6 +1788,7 @@ impl ExecutorHandle {
         let abort_t = abort.clone();
         let finished_t = finished.clone();
         let caps = prep.channel_caps;
+        let max_queue_bytes = prep.max_queue_bytes;
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
             .spawn(move || {
@@ -1761,6 +1802,7 @@ impl ExecutorHandle {
                         progress_tx: Some(progress_tx),
                         abort: Some(abort_t),
                         caps,
+                        max_queue_bytes,
                     },
                 );
                 finished_t.store(true, std::sync::atomic::Ordering::SeqCst);

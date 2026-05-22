@@ -66,6 +66,26 @@ rendezvous channel and would serialise the entire pipeline). The serial
 path uses no channels and ignores the cap. See
 `tests/channel_caps.rs`.
 
+## Memory-bounded packet queue
+
+`Executor::with_max_queue_bytes(n)` adds an orthogonal *byte* ceiling on
+the demuxer→worker packet queues. The channel-depth caps bound those
+queues by element count — fine when packet sizes are uniform, but a
+single outsized packet (a tracker module delivered whole in one packet,
+a 4K intra keyframe, a JPEG-2000 codestream) can be megabytes on its
+own, so the count cap alone lets resident memory swing widely with
+content. The byte ceiling makes the demuxer park before reading the
+next packet while the aggregate in-flight packet bytes are at or above
+`n`; the consuming stage (copy or decode) frees the bytes the instant
+it pulls the packet off the channel.
+
+The two knobs compose — whichever binds first applies. A lone packet
+larger than `n` is still admitted (the demuxer crosses the line by one
+packet rather than deadlock on a packet bigger than the whole budget),
+so `n` is a soft target, not a hard never-exceed. `0` (the default)
+disables the ceiling entirely, leaving only the count caps; the serial
+path ignores it. See `tests/max_queue_bytes.rs`.
+
 ## Seek correlation
 
 `ExecutorHandle::seek_with_generation(stream_idx, pts, tb)` returns the

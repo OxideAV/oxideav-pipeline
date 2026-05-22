@@ -188,6 +188,96 @@ impl ChannelCaps {
     }
 }
 
+/// Memory-bounded back-pressure on the demuxer→worker packet queues.
+///
+/// [`ChannelCaps`] bounds the queues by *element count* — at most
+/// `packets` packets per track sit in the demuxer→worker channel. That
+/// is the right knob when packet sizes are uniform, but a single
+/// pathological packet (a tracker module that delivers the whole song
+/// in one packet, an intra-only keyframe of a 4K stream, a JPEG-2000
+/// codestream) can be megabytes on its own. Sixteen of those is a
+/// quarter-gigabyte resident before the count cap even notices.
+///
+/// `QueueBudget` adds an orthogonal *byte* ceiling. The demuxer adds
+/// each packet's `data.len()` to a shared atomic before fanning it out
+/// to its routes, and the consuming stage (copy or decode) subtracts
+/// the same count the instant it receives the packet. Before reading
+/// the next packet the demuxer parks while the running total is at or
+/// above `max`, so the bytes physically buffered in the packet channels
+/// never run far past the ceiling (one in-flight packet may straddle
+/// it — we admit the packet that crosses the line rather than deadlock
+/// on a lone packet larger than the whole budget).
+///
+/// `max == 0` means "no byte ceiling" — the count caps alone govern,
+/// preserving the historical behaviour for callers that never opt in.
+pub(crate) struct QueueBudget {
+    in_flight: AtomicU64,
+    max: u64,
+}
+
+impl QueueBudget {
+    /// `max` bytes; `0` disables the byte ceiling entirely.
+    pub(crate) fn new(max: u64) -> Arc<Self> {
+        Arc::new(Self {
+            in_flight: AtomicU64::new(0),
+            max,
+        })
+    }
+
+    /// Whether a byte ceiling is in force. When `false`, `admit` /
+    /// `release` are cheap no-ops and the demuxer never parks.
+    fn enabled(&self) -> bool {
+        self.max > 0
+    }
+
+    /// Account `n` bytes as entering the packet queues. Called by the
+    /// demuxer once per packet, just before it fans the packet out.
+    fn admit(&self, n: u64) {
+        if self.enabled() {
+            self.in_flight.fetch_add(n, Ordering::SeqCst);
+        }
+    }
+
+    /// Account `n` bytes as leaving the packet queues. Called by the
+    /// consuming stage the instant it receives a packet off the channel.
+    /// Saturating so a double-release (shouldn't happen) can't wrap.
+    fn release(&self, n: u64) {
+        if self.enabled() {
+            let mut cur = self.in_flight.load(Ordering::SeqCst);
+            loop {
+                let next = cur.saturating_sub(n);
+                match self.in_flight.compare_exchange_weak(
+                    cur,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break,
+                    Err(observed) => cur = observed,
+                }
+            }
+        }
+    }
+
+    /// Block the calling (demuxer) thread while the in-flight byte total
+    /// is at or above the ceiling. Returns early if `abort` is set so a
+    /// stop/quit doesn't strand the demuxer here. A short park (1 ms)
+    /// between polls keeps a stalled consumer from spinning a core; the
+    /// release path is event-light enough that a condvar would be
+    /// over-engineering for the ≤16-element queues this guards.
+    fn wait_below_ceiling(&self, abort: &AbortState) {
+        if !self.enabled() {
+            return;
+        }
+        while self.in_flight.load(Ordering::SeqCst) >= self.max {
+            if abort.is_aborted() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+    }
+}
+
 /// Messages across channels.
 ///
 /// * `Data` — payload (packet/frame).
@@ -294,6 +384,11 @@ pub(crate) struct PipelineControl {
     /// [`ChannelCaps::default()`] (16 packets, 8 frames). Threaded
     /// through from [`crate::Executor::with_channel_caps`].
     pub caps: Option<ChannelCaps>,
+    /// Aggregate byte ceiling on the demuxer→worker packet queues.
+    /// `0` (the default) disables the byte ceiling, leaving only the
+    /// count caps. Threaded through from
+    /// [`crate::Executor::with_max_queue_bytes`].
+    pub max_queue_bytes: u64,
 }
 
 /// Run one output's pipeline. The caller has already instantiated all
@@ -305,6 +400,7 @@ pub(crate) fn run_pipelined(
     sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     caps: Option<ChannelCaps>,
+    max_queue_bytes: u64,
 ) -> Result<ExecutorStats> {
     run_pipelined_inner(
         pipelines,
@@ -316,6 +412,7 @@ pub(crate) fn run_pipelined(
             progress_tx: None,
             abort: None,
             caps,
+            max_queue_bytes,
         },
     )
 }
@@ -350,6 +447,10 @@ pub(crate) fn run_pipelined_inner(
     let progress_tx = control.progress_tx;
     let mut seek_rx = control.seek_rx;
     let (pkt_cap, frame_cap) = control.caps.unwrap_or_default().resolved();
+    // Shared byte ceiling on the demuxer→worker packet queues. `0`
+    // (default) is a no-op: `admit` / `release` short-circuit and the
+    // demuxer never parks, so the count caps alone govern.
+    let budget = QueueBudget::new(control.max_queue_bytes);
 
     // Per-track output channel: stage workers send processed packets /
     // frames on tx; the mux loop on the caller thread reads rx.
@@ -386,9 +487,18 @@ pub(crate) fn run_pipelined_inner(
         if pl.copy {
             let abort_c = abort.clone();
             let counters_c = counters.clone();
+            let budget_c = budget.clone();
             let name = format!("copy-{track_idx}");
             handles.push(spawn_stage(abort_c, name, move |abort| {
-                run_copy_stage(pkt_rx, out_tx, track_idx as u32, kind, abort, counters_c)
+                run_copy_stage(
+                    pkt_rx,
+                    out_tx,
+                    track_idx as u32,
+                    kind,
+                    abort,
+                    counters_c,
+                    budget_c,
+                )
             }));
             continue;
         }
@@ -407,9 +517,10 @@ pub(crate) fn run_pipelined_inner(
         {
             let abort_d = abort.clone();
             let counters_d = counters.clone();
+            let budget_d = budget.clone();
             let name = format!("decode-{track_idx}");
             handles.push(spawn_stage(abort_d, name, move |abort| {
-                run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d)
+                run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
             }));
         }
 
@@ -504,10 +615,11 @@ pub(crate) fn run_pipelined_inner(
         }
         let abort_d = abort.clone();
         let counters_d = counters.clone();
+        let budget_d = budget.clone();
         let name = format!("demux-{uri}");
         let dmx_seek_rx = seek_rx.take();
         handles.push(spawn_stage(abort_d, name, move |abort| {
-            run_demuxer_stage(dmx, routes, abort, counters_d, dmx_seek_rx)
+            run_demuxer_stage(dmx, routes, abort, counters_d, dmx_seek_rx, budget_d)
         }));
     }
 
@@ -687,8 +799,18 @@ fn run_demuxer_stage(
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
+    budget: Arc<QueueBudget>,
 ) -> Result<()> {
     loop {
+        if abort.is_aborted() {
+            break;
+        }
+        // Memory-bounded back-pressure: hold off reading the next packet
+        // while the in-flight packet bytes are at or above the ceiling.
+        // A no-op when no `max_queue_bytes` was set. This sits BEFORE the
+        // seek drain so a parked demuxer still wakes promptly on abort
+        // (the wait itself bails on the abort flag).
+        budget.wait_below_ceiling(&abort);
         if abort.is_aborted() {
             break;
         }
@@ -737,9 +859,23 @@ fn run_demuxer_stage(
         match dmx.next_packet() {
             Ok(pkt) => {
                 counters.packets_read.fetch_add(1, Ordering::SeqCst);
+                let bytes = pkt.data.len() as u64;
                 for (stream_idx, tx) in &routes {
-                    if *stream_idx == pkt.stream_index && tx.send(Msg::Data(pkt.clone())).is_err() {
-                        // Consumer gone; likely aborted.
+                    if *stream_idx != pkt.stream_index {
+                        continue;
+                    }
+                    // Account this copy's bytes as in-flight BEFORE the
+                    // send so the running total never undershoots what's
+                    // physically queued. The consuming stage releases the
+                    // same count when it pulls the packet off the channel.
+                    // Each matched route gets its own `pkt.clone()`, hence
+                    // its own admit/release pair.
+                    budget.admit(bytes);
+                    if tx.send(Msg::Data(pkt.clone())).is_err() {
+                        // Consumer gone; likely aborted. The packet never
+                        // reached a receiver, so the consumer will never
+                        // release it — undo the admit here.
+                        budget.release(bytes);
                         abort.abort.store(true, Ordering::SeqCst);
                         break;
                     }
@@ -763,6 +899,7 @@ fn run_copy_stage(
     kind: MediaType,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
+    budget: Arc<QueueBudget>,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -770,6 +907,11 @@ fn run_copy_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
+                // The packet has left the demuxer→worker channel; release
+                // its bytes from the in-flight budget the instant we own
+                // it (before the possibly-blocking output send) so the
+                // demuxer can advance as soon as the channel drains.
+                budget.release(pkt.data.len() as u64);
                 if out_tx
                     .send(Msg::Data(OutputItem {
                         track_index,
@@ -802,6 +944,7 @@ fn run_decode_stage(
     tx: SyncSender<Msg<Frame>>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
+    budget: Arc<QueueBudget>,
 ) -> Result<()> {
     // Stream frames through `tx` as they're produced rather than
     // collecting into a `Vec` first. Bounded `tx.send` provides natural
@@ -834,6 +977,11 @@ fn run_decode_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(pkt)) => {
+                // Release the packet's bytes from the in-flight budget as
+                // soon as it leaves the demuxer→worker channel — before
+                // `send_packet` and before the per-packet skip branch, so
+                // a skipped packet still frees its budget slot.
+                budget.release(pkt.data.len() as u64);
                 if let Err(e) = decoder.send_packet(&pkt) {
                     eprintln!(
                         "pipeline: decoder skipped packet (stream {}, pts {:?}): {}",
@@ -1188,5 +1336,71 @@ mod tests {
         let (p, f) = caps.resolved();
         assert_eq!(p, 64);
         assert_eq!(f, 32);
+    }
+
+    #[test]
+    fn queue_budget_zero_is_disabled() {
+        // `0` means "no byte ceiling": `enabled()` is false, admit/release
+        // are no-ops, and the in-flight total never moves off zero. This
+        // is the default that preserves historical behaviour for callers
+        // who never opt in.
+        let b = QueueBudget::new(0);
+        assert!(!b.enabled());
+        b.admit(1_000_000);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 0);
+        b.release(1_000_000);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queue_budget_admit_release_balance() {
+        // With a ceiling in force, admit and release move the in-flight
+        // total symmetrically. After equal admit/release the total
+        // returns to zero.
+        let b = QueueBudget::new(4096);
+        assert!(b.enabled());
+        b.admit(100);
+        b.admit(50);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 150);
+        b.release(100);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 50);
+        b.release(50);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queue_budget_release_saturates_at_zero() {
+        // A release larger than the in-flight total must clamp to zero
+        // rather than wrap around `u64::MAX` — defensive against any
+        // accounting skew between the demuxer's admit and the consumer's
+        // release.
+        let b = QueueBudget::new(4096);
+        b.admit(10);
+        b.release(1_000);
+        assert_eq!(b.in_flight.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn queue_budget_wait_returns_when_below_ceiling() {
+        // Below the ceiling, `wait_below_ceiling` returns immediately —
+        // no parking. (We can't easily assert "blocks then unblocks"
+        // without a second thread; the integration test covers the
+        // back-pressure path end-to-end. Here we just confirm the
+        // no-park fast path.)
+        let abort = AbortState::new();
+        let b = QueueBudget::new(4096);
+        b.admit(100); // 100 < 4096
+        b.wait_below_ceiling(&abort); // must not hang
+    }
+
+    #[test]
+    fn queue_budget_wait_bails_on_abort() {
+        // At/above the ceiling the demuxer would normally park; an abort
+        // must release it so a stop/quit can't strand the demuxer.
+        let abort = AbortState::new();
+        let b = QueueBudget::new(100);
+        b.admit(200); // 200 >= 100 — would park
+        abort.request_abort();
+        b.wait_below_ceiling(&abort); // must return promptly, not hang
     }
 }
