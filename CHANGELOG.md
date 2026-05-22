@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Executor::with_channel_caps(ChannelCaps { packets, frames })`. The
+  pipelined staged executor's per-track packet- and frame-channel depth
+  were previously hard-coded constants (`PACKET_CAP = 16`,
+  `FRAME_CAP = 8`); the new builder exposes them to callers. Embedded
+  playback can clamp to `{ packets: 1, frames: 1 }` (every queue
+  degenerates to one element, source thread blocks until consumer has
+  drained — smallest legal depth, since `sync_channel(0)` would be a
+  rendezvous channel that serialises the entire pipeline);
+  high-throughput offline transcodes can raise to e.g.
+  `{ packets: 64, frames: 32 }` to let bursty decoders coast on the
+  queue depth instead of blocking on the encoder. Zero is clamped up to
+  one rather than panicking. The serial path uses no channels and
+  ignores the cap. **Additive** — every existing caller (no
+  `with_channel_caps()`) gets the historical depth via the new
+  `Option<ChannelCaps>::None` plumbing through `PreparedRun` /
+  `PipelineControl`. Regression coverage: `tests/channel_caps.rs`
+  asserts (a) the tightest `{1, 1}` configuration runs to completion
+  without deadlocking, (b) zero is clamped up to one (no panic from the
+  underlying `sync_channel`), and (c) a default-via-None run processes
+  the same payload count as a default-via-Some run.
 - `ExecutorHandle::seek_with_generation(stream_idx, pts, tb) -> Result<u32>`.
   The handle now owns the monotonic generation counter (previously
   private to the demuxer stage) and returns the assigned value to the

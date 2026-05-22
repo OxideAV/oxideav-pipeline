@@ -42,6 +42,30 @@ lands on the next packet (≥ target). With the payload extension,
 position display reads the new position the instant the barrier fires.
 See `tests/seek_flush_carries_landed_pts.rs`.
 
+## Channel-depth budget
+
+`Executor::with_channel_caps(ChannelCaps { packets, frames })` overrides
+the per-track packet- and frame-channel depth for the pipelined runner.
+Defaults are 16 packets / 8 frames — back-pressures a stalled consumer
+before memory blows up, large enough to amortise the channel mutex cost
+on each send.
+
+Memory upper bound per output (rough):
+
+```text
+N_tracks * (packets * packet_size + frames * frame_size)
+```
+
+Tight (`{ packets: 1, frames: 1 }`) is the smallest legal depth — every
+queue degenerates to one element so the source thread blocks until the
+consumer has drained. Useful for embedded playback. Loosened
+(`{ packets: 64, frames: 32 }`) lets bursty decoders coast on the queue
+depth instead of blocking on the encoder — useful for high-throughput
+offline transcodes. Zero is clamped up to one (`sync_channel(0)` is a
+rendezvous channel and would serialise the entire pipeline). The serial
+path uses no channels and ignores the cap. See
+`tests/channel_caps.rs`.
+
 ## Seek correlation
 
 `ExecutorHandle::seek_with_generation(stream_idx, pts, tb)` returns the

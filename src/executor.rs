@@ -129,6 +129,11 @@ pub struct Executor<'a> {
     /// Explicit thread budget from the caller. `None` = resolve from
     /// `job.threads` or autodetect. `Some(0)` is treated as auto as well.
     explicit_threads: Option<usize>,
+    /// Optional per-track channel-depth budget for the pipelined runner.
+    /// `None` means "use [`staged::ChannelCaps::default()`]" (16
+    /// packets, 8 frames). Ignored on the serial path. Set via
+    /// [`Self::with_channel_caps`].
+    channel_caps: Option<staged::ChannelCaps>,
 }
 
 impl<'a> Executor<'a> {
@@ -142,6 +147,7 @@ impl<'a> Executor<'a> {
             ctx,
             sink_overrides: HashMap::new(),
             explicit_threads: None,
+            channel_caps: None,
         }
     }
 
@@ -163,6 +169,25 @@ impl<'a> Executor<'a> {
     /// `1` forces strictly serial execution; `≥ 2` requests pipelined.
     pub fn with_threads(mut self, n: usize) -> Self {
         self.explicit_threads = Some(n);
+        self
+    }
+
+    /// Override the per-track channel-depth budget for the pipelined
+    /// runner. See [`staged::ChannelCaps`] for the memory-bound model.
+    ///
+    /// Has no effect on the serial path — that path uses no channels.
+    ///
+    /// Typical uses:
+    /// * `ChannelCaps { packets: 1, frames: 1 }` — tightest possible
+    ///   bound for embedded playback (the queues degenerate to one
+    ///   element each, so the source thread blocks until the consumer
+    ///   has drained).
+    /// * `ChannelCaps { packets: 64, frames: 32 }` — loosened for
+    ///   high-throughput offline transcodes where bursty decoders /
+    ///   filters can amortise their per-call overhead on a deeper
+    ///   queue rather than blocking on the encoder.
+    pub fn with_channel_caps(mut self, caps: staged::ChannelCaps) -> Self {
+        self.channel_caps = Some(caps);
         self
     }
 
@@ -635,7 +660,13 @@ impl<'a> Executor<'a> {
         // Bytes-only path — everything below is unchanged.
         drop(opened);
         let prep = self.prepare_pipelined_run(dag, name, threads)?;
-        staged::run_pipelined(prep.pipelines, prep.dmx_by_uri, prep.sink, prep.out_streams)
+        staged::run_pipelined(
+            prep.pipelines,
+            prep.dmx_by_uri,
+            prep.sink,
+            prep.out_streams,
+            prep.channel_caps,
+        )
     }
 
     /// Shared prep used by both [`Self::run_output_pipelined`] and
@@ -701,6 +732,7 @@ impl<'a> Executor<'a> {
             dmx_by_uri,
             sink,
             out_streams,
+            channel_caps: self.channel_caps,
         })
     }
 
@@ -1678,6 +1710,10 @@ pub(crate) struct PreparedRun {
     pub(crate) dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
     pub(crate) sink: Box<dyn JobSink + Send>,
     pub(crate) out_streams: Vec<StreamInfo>,
+    /// Per-track channel-depth budget threaded from the [`Executor`]
+    /// onto the background thread used by [`ExecutorHandle`] and the
+    /// `run_output_pipelined` call site. `None` keeps the defaults.
+    pub(crate) channel_caps: Option<staged::ChannelCaps>,
 }
 
 /// Live handle to a background-running [`Executor`]. Returned by
@@ -1711,6 +1747,7 @@ impl ExecutorHandle {
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let abort_t = abort.clone();
         let finished_t = finished.clone();
+        let caps = prep.channel_caps;
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
             .spawn(move || {
@@ -1723,6 +1760,7 @@ impl ExecutorHandle {
                         seek_rx: Some(seek_rx),
                         progress_tx: Some(progress_tx),
                         abort: Some(abort_t),
+                        caps,
                     },
                 );
                 finished_t.store(true, std::sync::atomic::Ordering::SeqCst);

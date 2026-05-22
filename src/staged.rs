@@ -130,6 +130,64 @@ const PACKET_CAP: usize = 16;
 /// are much larger than compressed packets.
 const FRAME_CAP: usize = 8;
 
+/// Per-track channel-depth budget for the pipelined staged executor.
+///
+/// Each track in a pipelined run is plumbed by two bounded
+/// `mpsc::sync_channel`s:
+/// * a **packet** channel between the demuxer and the per-track copy /
+///   decode worker, and one between every output worker and the mux
+///   loop (sized at `packets`);
+/// * a **frame** channel between every pair of frame stages
+///   (decode → filter / pix-convert → encode), sized at `frames`.
+///
+/// The defaults — 16 packets and 8 frames — back-pressure a stalled
+/// consumer before memory blows up while still amortising the channel's
+/// mutex cost on each send. Operators with tight memory budgets (e.g.
+/// embedded playback) can shrink the depth via
+/// [`Executor::with_channel_caps`](crate::Executor::with_channel_caps);
+/// high-throughput offline transcodes can raise it to let bursty
+/// decoders coast on the queue depth instead of blocking on the
+/// downstream encoder.
+///
+/// **Memory upper bound (per output, rough):**
+/// ```text
+///     N_tracks * (packets * packet_size + frames * frame_size)
+/// ```
+/// — every track holds at most `packets` packets in its demuxer→worker
+/// queue and at most `frames` frames in its inter-stage queues.
+///
+/// Both fields must be ≥ 1. Zero is silently promoted to one (the
+/// underlying `sync_channel` rejects a depth of zero — that's a
+/// rendezvous channel and would serialise the entire pipeline).
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelCaps {
+    /// Depth of the per-track packet channels (demuxer → worker, and
+    /// worker → mux loop). Default: 16.
+    pub packets: usize,
+    /// Depth of the per-stage frame channels (decode → filter →
+    /// pix-convert → encode). Default: 8.
+    pub frames: usize,
+}
+
+impl Default for ChannelCaps {
+    fn default() -> Self {
+        Self {
+            packets: PACKET_CAP,
+            frames: FRAME_CAP,
+        }
+    }
+}
+
+impl ChannelCaps {
+    /// Sanitised values that the staged runner actually uses. Both
+    /// fields are clamped to a minimum of 1 so a caller passing `0`
+    /// gets the smallest non-rendezvous queue rather than a panic
+    /// from `sync_channel(0)` being a rendezvous channel.
+    pub(crate) fn resolved(&self) -> (usize, usize) {
+        (self.packets.max(1), self.frames.max(1))
+    }
+}
+
 /// Messages across channels.
 ///
 /// * `Data` — payload (packet/frame).
@@ -232,6 +290,10 @@ pub(crate) struct PipelineControl {
     pub seek_rx: Option<Receiver<SeekCmd>>,
     pub progress_tx: Option<SyncSender<Progress>>,
     pub abort: Option<Arc<AbortState>>,
+    /// Per-track channel-depth budget. `None` means use the
+    /// [`ChannelCaps::default()`] (16 packets, 8 frames). Threaded
+    /// through from [`crate::Executor::with_channel_caps`].
+    pub caps: Option<ChannelCaps>,
 }
 
 /// Run one output's pipeline. The caller has already instantiated all
@@ -242,6 +304,7 @@ pub(crate) fn run_pipelined(
     dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
     sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
+    caps: Option<ChannelCaps>,
 ) -> Result<ExecutorStats> {
     run_pipelined_inner(
         pipelines,
@@ -252,6 +315,7 @@ pub(crate) fn run_pipelined(
             seek_rx: None,
             progress_tx: None,
             abort: None,
+            caps,
         },
     )
 }
@@ -285,13 +349,14 @@ pub(crate) fn run_pipelined_inner(
     let mut handles: Vec<JoinHandle<()>> = Vec::new();
     let progress_tx = control.progress_tx;
     let mut seek_rx = control.seek_rx;
+    let (pkt_cap, frame_cap) = control.caps.unwrap_or_default().resolved();
 
     // Per-track output channel: stage workers send processed packets /
     // frames on tx; the mux loop on the caller thread reads rx.
     let mut track_output_rx: Vec<Receiver<Msg<OutputItem>>> = Vec::new();
     let mut track_output_tx: Vec<SyncSender<Msg<OutputItem>>> = Vec::new();
     for _ in 0..pipelines.len() {
-        let (tx, rx) = mpsc::sync_channel::<Msg<OutputItem>>(PACKET_CAP);
+        let (tx, rx) = mpsc::sync_channel::<Msg<OutputItem>>(pkt_cap);
         track_output_tx.push(tx);
         track_output_rx.push(rx);
     }
@@ -312,7 +377,7 @@ pub(crate) fn run_pipelined_inner(
         // Every track has a packet-input channel from the demuxer
         // regardless of copy / transcode — the demuxer thread doesn't
         // need to know which mode each consumer uses.
-        let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(PACKET_CAP);
+        let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
         routes_by_uri
             .entry(source_uri)
             .or_default()
@@ -338,7 +403,7 @@ pub(crate) fn run_pipelined_inner(
         let frame_stages = std::mem::take(&mut pl.frame_stages);
         let encoder = pl.encoder.take();
 
-        let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(FRAME_CAP);
+        let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
         {
             let abort_d = abort.clone();
             let counters_d = counters.clone();
@@ -360,7 +425,7 @@ pub(crate) fn run_pipelined_inner(
 
         let mut upstream: Receiver<Msg<Frame>> = frame0_rx;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
-            let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(FRAME_CAP);
+            let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
             let label = match &stage {
                 FrameStage::Filter(_) => "filter",
                 FrameStage::PixConvert { .. } => "convert",
@@ -1076,5 +1141,52 @@ fn drain_and_send(
             Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
             Err(e) => return Err(e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn channel_caps_default_matches_internal_constants() {
+        // The default constructor must surface the same depth the
+        // module previously hard-coded; existing callers (which pass
+        // `None` for `caps`) get unchanged behaviour.
+        let caps = ChannelCaps::default();
+        assert_eq!(caps.packets, PACKET_CAP);
+        assert_eq!(caps.frames, FRAME_CAP);
+        let (p, f) = caps.resolved();
+        assert_eq!(p, PACKET_CAP);
+        assert_eq!(f, FRAME_CAP);
+    }
+
+    #[test]
+    fn channel_caps_zero_promoted_to_one() {
+        // `sync_channel(0)` is a rendezvous channel (every send blocks
+        // until the consumer rendezvous-recv'd) and would serialise the
+        // entire staged pipeline. `resolved()` clamps a request of 0 up
+        // to 1 to give callers a meaningful "tightest legal" budget.
+        let caps = ChannelCaps {
+            packets: 0,
+            frames: 0,
+        };
+        let (p, f) = caps.resolved();
+        assert_eq!(p, 1, "packets=0 must be promoted to 1");
+        assert_eq!(f, 1, "frames=0 must be promoted to 1");
+    }
+
+    #[test]
+    fn channel_caps_arbitrary_values_round_trip() {
+        // Above the clamp threshold the request is honoured verbatim
+        // — operators picking `(64, 32)` for high-throughput offline
+        // transcodes must see exactly that depth.
+        let caps = ChannelCaps {
+            packets: 64,
+            frames: 32,
+        };
+        let (p, f) = caps.resolved();
+        assert_eq!(p, 64);
+        assert_eq!(f, 32);
     }
 }

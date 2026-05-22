@@ -31,7 +31,7 @@ pub use selection::{
     make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
 };
 pub use sinks::{FileSink, NullSink};
-pub use staged::{BarrierKind, Progress, SeekCmd};
+pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
 
 use oxideav_core::{
     CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
