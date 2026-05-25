@@ -86,6 +86,19 @@ so `n` is a soft target, not a hard never-exceed. `0` (the default)
 disables the ceiling entirely, leaving only the count caps; the serial
 path ignores it. See `tests/max_queue_bytes.rs`.
 
+## Back-pressure visibility
+
+`ExecutorHandle::try_progress()` returns a `Progress { pts, frames, eof,
+queue_bytes }`. `queue_bytes` reports the current in-flight packet-byte
+total tracked by the `with_max_queue_bytes(n)` budget — a value pinned
+to `n` indicates the demuxer is parking on the byte ceiling waiting for
+the consumer to drain, a value hovering near zero means the ceiling
+isn't binding (the count caps or downstream block first). When no
+ceiling is configured the field is always `0` (the budget short-circuits
+its accounting); at EOF the field returns to `0` because every admitted
+packet has a matching release by the time workers join. See
+`tests/progress_reports_queue_bytes.rs`.
+
 ## Seek correlation
 
 `ExecutorHandle::seek_with_generation(stream_idx, pts, tb)` returns the

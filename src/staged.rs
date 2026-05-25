@@ -114,11 +114,30 @@ pub struct SeekCmd {
 /// Per-frame progress event consumed by [`crate::ExecutorHandle::try_progress`].
 /// Updated by the mux loop on every `Msg::Data` carrying frame/packet pts;
 /// the engine polls this once per tick for the status bar.
+///
+/// `queue_bytes` reports the current in-flight packet-byte total tracked by
+/// [`crate::Executor::with_max_queue_bytes`]'s shared accountant. This gives
+/// the engine a diagnostic surface for back-pressure: a value that pins to
+/// the configured ceiling indicates the demuxer is parking on the byte
+/// budget waiting for the consumer to drain, whereas a value that hovers
+/// near zero means the byte ceiling isn't binding (the count caps or
+/// downstream blocks first). When `with_max_queue_bytes(0)` (the default,
+/// no byte ceiling) is in effect, this field is always `0` — the budget
+/// short-circuits its accounting and the demuxer never parks.
+///
+/// **Pattern-match consumers**: new fields will land here as the engine
+/// surface grows. Use the struct-update syntax (`Progress { pts, .. }`)
+/// or read fields by name to stay forward-compatible.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Progress {
     pub pts: Option<i64>,
     pub frames: u64,
     pub eof: bool,
+    /// Current in-flight packet-byte total (sum of `Packet::data.len()`
+    /// for every packet that has left the demuxer but not yet been
+    /// consumed by the next stage). Always `0` when no byte ceiling is
+    /// configured via [`crate::Executor::with_max_queue_bytes`].
+    pub queue_bytes: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -228,6 +247,19 @@ impl QueueBudget {
     /// `release` are cheap no-ops and the demuxer never parks.
     fn enabled(&self) -> bool {
         self.max > 0
+    }
+
+    /// Current in-flight packet-byte total. Returned verbatim to the
+    /// engine via [`Progress::queue_bytes`] so callers can observe how
+    /// close the demuxer is to the byte ceiling. Returns `0` when the
+    /// ceiling is disabled (`max == 0`) — the accountant short-circuits
+    /// in that mode and the counter never moves off zero.
+    pub(crate) fn in_flight(&self) -> u64 {
+        if self.enabled() {
+            self.in_flight.load(Ordering::SeqCst)
+        } else {
+            0
+        }
     }
 
     /// Account `n` bytes as entering the packet queues. Called by the
@@ -688,6 +720,7 @@ pub(crate) fn run_pipelined_inner(
                             pts,
                             frames,
                             eof: false,
+                            queue_bytes: budget.in_flight(),
                         });
                     }
                 }
@@ -748,10 +781,15 @@ pub(crate) fn run_pipelined_inner(
     sink.finish()?;
     if let Some(tx) = &progress_tx {
         let frames = counters.frames_written.load(Ordering::SeqCst);
+        // At EOF the demuxer has drained all packets and every consuming
+        // stage has released its bytes, so `in_flight()` should be 0 —
+        // but we read it rather than hard-code 0 so a late drain race
+        // reports the actual observable value instead of lying.
         let _ = tx.try_send(Progress {
             pts: None,
             frames,
             eof: true,
+            queue_bytes: budget.in_flight(),
         });
     }
     Ok(counters.snapshot())

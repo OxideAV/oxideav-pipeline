@@ -9,6 +9,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::queue_bytes` — back-pressure visibility for the pipelined
+  runner. The `Progress` event returned by
+  `ExecutorHandle::try_progress()` now carries the current in-flight
+  packet-byte total tracked by `Executor::with_max_queue_bytes(n)`'s
+  shared accountant. A value pinned to the configured ceiling indicates
+  the demuxer is parking on the byte budget waiting for the consumer
+  to drain; a value hovering near zero means the ceiling isn't binding
+  (the count caps or downstream block first). When no ceiling is
+  configured (`with_max_queue_bytes(0)`, the default) the field is
+  always `0` — the budget short-circuits its accounting and the
+  demuxer never parks. At EOF the field returns to `0` because every
+  admitted packet has a matching release by the time workers join.
+  This gives engines a diagnostic surface for back-pressure without
+  poking at private state: an operator can correlate audio-ring
+  draining with the actual byte-budget pressure rather than guessing
+  whether the demuxer or the encoder is the bottleneck. Threaded
+  through the existing `QueueBudget::in_flight()` accessor + the two
+  `Progress::try_send` call-sites in the mux loop. **Additive** — the
+  new field defaults to `0` for any pattern-match consumer using the
+  struct-update syntax (`Progress { pts, .. }`); the type doc-comment
+  recommends that idiom for forward compatibility. Regression
+  coverage: `tests/progress_reports_queue_bytes.rs` asserts (a) the
+  field stays at `0` when no ceiling is configured (even under
+  packet-flowing load — the accountant must short-circuit), (b) it
+  returns to `0` at EOF (every admit has a matching release), and
+  (c) it surfaces a non-zero value mid-run when back-pressure is
+  actively engaged (a tight 4096-byte ceiling + a 5ms-per-write
+  throttled sink).
 - `Executor::with_max_queue_bytes(n)`. An orthogonal *byte* ceiling on
   the demuxer→worker packet queues for the pipelined runner.
   `with_channel_caps` bounds those queues by *element count* (at most
