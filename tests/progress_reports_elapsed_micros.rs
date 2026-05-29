@@ -114,12 +114,19 @@ fn spawn_simple(name: &str) -> (oxideav_pipeline::ExecutorHandle, Receiver<()>) 
 /// reliably recovers every event the mux loop emitted.
 fn collect_all_progress(name: &str) -> Vec<oxideav_pipeline::staged::Progress> {
     let (handle, write_rx) = spawn_simple(name);
-    let _drain = std::thread::spawn(
-        move || {
-            while write_rx.recv_timeout(Duration::from_secs(2)).is_ok() {}
-        },
-    );
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // 30s no-activity timeout on the drain matches the outer deadline below;
+    // a 2s value (the historical default in `queue_bytes` tests) is fine
+    // for those tests because they intentionally throttle the sink, but
+    // here we want the stub run to actually complete on a slow CI runner
+    // and a 2s gap between writes could fire on a constrained Windows
+    // worker even though the pipeline is still making progress.
+    let _drain =
+        std::thread::spawn(
+            move || {
+                while write_rx.recv_timeout(Duration::from_secs(30)).is_ok() {}
+            },
+        );
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut events = Vec::new();
     while Instant::now() < deadline {
         while let Some(p) = handle.try_progress() {
@@ -156,7 +163,7 @@ fn elapsed_micros_is_non_decreasing() {
     let events = collect_all_progress("elapsed_micros_monotone");
     assert!(
         events.iter().any(|p| p.eof),
-        "never observed an eof:true progress event within 5s — pipeline stalled"
+        "never observed an eof:true progress event within 30s — pipeline stalled"
     );
     assert!(
         events.len() >= 2,
