@@ -171,6 +171,22 @@ pub struct Progress {
     /// "no progress wired" path used by `Executor::run` (the serial
     /// runner doesn't emit `Progress` at all).
     pub elapsed_micros: u64,
+    /// Cumulative count of packets the decoder skipped because of a
+    /// recoverable per-packet error — either `send_packet` returned an
+    /// error (the packet never produced a frame) or the subsequent
+    /// `receive_frame` errored before yielding any output. Each event
+    /// is logged via the existing `eprintln!` path; this counter lets an
+    /// engine surface the same information in its status bar without
+    /// scraping stderr, and lets a stress harness assert on the
+    /// tolerance contract pinned by `tests/decoder_error_tolerance.rs`.
+    ///
+    /// Monotonically non-decreasing across consecutive emissions from
+    /// the same handle. Always `0` on copy-only outputs (no decoder is
+    /// instantiated) and on a clean stream (no skips occurred). The
+    /// serial path (`Executor::run`) doesn't emit `Progress` at all,
+    /// so this field is only ever non-zero on the pipelined runner
+    /// reached via `Executor::spawn`.
+    pub packets_skipped: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -365,6 +381,13 @@ struct PipelineCounters {
     packets_encoded: AtomicU64,
     frames_decoded: AtomicU64,
     frames_written: AtomicU64,
+    /// Decoder-skip counter. Bumped by the decode stage on every
+    /// packet whose `send_packet` errored, and on every packet whose
+    /// downstream `receive_frame` errored before yielding a frame —
+    /// matching the two `eprintln!` branches in `run_decode_stage`.
+    /// Surfaced to the engine via [`Progress::packets_skipped`] and
+    /// to the final stats via [`ExecutorStats::packets_skipped`].
+    packets_skipped: AtomicU64,
 }
 
 impl PipelineCounters {
@@ -375,6 +398,7 @@ impl PipelineCounters {
             packets_encoded: self.packets_encoded.load(Ordering::SeqCst),
             frames_decoded: self.frames_decoded.load(Ordering::SeqCst),
             frames_written: self.frames_written.load(Ordering::SeqCst),
+            packets_skipped: self.packets_skipped.load(Ordering::SeqCst),
         }
     }
 }
@@ -757,12 +781,14 @@ pub(crate) fn run_pipelined_inner(
                     }
                     if let Some(tx) = &progress_tx {
                         let frames = counters.frames_written.load(Ordering::SeqCst);
+                        let skipped = counters.packets_skipped.load(Ordering::SeqCst);
                         let _ = tx.try_send(Progress {
                             pts,
                             frames,
                             eof: false,
                             queue_bytes: budget.in_flight(),
                             elapsed_micros: started_at.elapsed().as_micros() as u64,
+                            packets_skipped: skipped,
                         });
                     }
                 }
@@ -833,12 +859,14 @@ pub(crate) fn run_pipelined_inner(
         // to `sink.finish()` returning. CLI tools that wrap a transcode in
         // a status line can read this off the EOF progress event instead of
         // bracketing `executor.spawn()/.stop()` with their own `Instant`.
+        let skipped = counters.packets_skipped.load(Ordering::SeqCst);
         let _ = tx.try_send(Progress {
             pts: None,
             frames,
             eof: true,
             queue_bytes: budget.in_flight(),
             elapsed_micros: started_at.elapsed().as_micros() as u64,
+            packets_skipped: skipped,
         });
     }
     Ok(counters.snapshot())
@@ -1070,12 +1098,14 @@ fn run_decode_stage(
                 // a skipped packet still frees its budget slot.
                 budget.release(pkt.data.len() as u64);
                 if let Err(e) = decoder.send_packet(&pkt) {
+                    counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
                     eprintln!(
                         "pipeline: decoder skipped packet (stream {}, pts {:?}): {}",
                         pkt.stream_index, pkt.pts, e
                     );
                     continue;
                 }
+                let mut produced_any = false;
                 loop {
                     if abort.is_aborted() {
                         break 'outer;
@@ -1083,6 +1113,7 @@ fn run_decode_stage(
                     match decoder.receive_frame() {
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                            produced_any = true;
                             if tx.send(Msg::Data(frame)).is_err() {
                                 abort.abort.store(true, Ordering::SeqCst);
                                 break 'outer;
@@ -1100,6 +1131,19 @@ fn run_decode_stage(
                             // will surface this and the stream will
                             // stay silent / black, which is better
                             // than a wedged player.
+                            //
+                            // Count as `packets_skipped` only when the
+                            // packet yielded no frames at all. A failure
+                            // *after* one or more frames already streamed
+                            // is end-of-output for this packet (partial
+                            // output landed — the packet wasn't lost), and
+                            // counting it would inflate the skip count
+                            // relative to what the user-facing symptom
+                            // actually is. Mirrors the inherent path in
+                            // `executor.rs::pump_packet`.
+                            if !produced_any {
+                                counters.packets_skipped.fetch_add(1, Ordering::SeqCst);
+                            }
                             eprintln!(
                                 "pipeline: decoder skipped frame after packet (stream {}, pts {:?}): {}",
                                 pkt.stream_index, pkt.pts, e

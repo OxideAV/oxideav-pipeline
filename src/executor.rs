@@ -1207,6 +1207,7 @@ impl TrackRuntime {
                     // Same rationale as `staged.rs::run_decode_stage`: a
                     // single recoverable bit-stream glitch should be
                     // logged and skipped, not propagated to the executor.
+                    stats.packets_skipped += 1;
                     eprintln!(
                         "executor: decoder skipped packet (track {}, pts {:?}): {}",
                         track_index, pkt.pts, e
@@ -1214,11 +1215,22 @@ impl TrackRuntime {
                     return Ok(());
                 }
             }
+            let mut produced_any = false;
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
                     Ok(f) => f,
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
                     Err(e) => {
+                        // No frames produced for this packet — count it as
+                        // skipped so the same per-packet tolerance contract
+                        // surfaces on `stats.packets_skipped` regardless of
+                        // which decoder error branch fired. A receive_frame
+                        // error *after* one or more frames already streamed
+                        // is treated as end-of-output for this packet only
+                        // (the packet wasn't lost — partial output landed).
+                        if !produced_any {
+                            stats.packets_skipped += 1;
+                        }
                         eprintln!(
                             "executor: decoder receive_frame error (track {}, pts {:?}): {}",
                             track_index, pkt.pts, e
@@ -1226,6 +1238,7 @@ impl TrackRuntime {
                         break;
                     }
                 };
+                produced_any = true;
                 stats.frames_decoded += 1;
                 self.pump_frame(frame, track_index, sink, stats)?;
             }
@@ -1947,6 +1960,14 @@ pub struct ExecutorStats {
     pub packets_encoded: u64,
     pub frames_decoded: u64,
     pub frames_written: u64,
+    /// Decoder skipped packets — the per-packet error-tolerance contract
+    /// pinned by `tests/decoder_error_tolerance.rs` lets a recoverable
+    /// `send_packet` / `receive_frame` error on a single packet log + skip
+    /// instead of killing the stream. This counter records every such
+    /// event so a CLI can report "decoded N packets, skipped K" without
+    /// scraping the stderr log. Always `0` on a clean stream and on
+    /// copy-only outputs (no decoder instantiated).
+    pub packets_skipped: u64,
 }
 
 impl ExecutorStats {
@@ -1956,6 +1977,7 @@ impl ExecutorStats {
         self.packets_encoded += other.packets_encoded;
         self.frames_decoded += other.frames_decoded;
         self.frames_written += other.frames_written;
+        self.packets_skipped += other.packets_skipped;
     }
 }
 

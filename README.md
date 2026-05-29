@@ -115,6 +115,30 @@ runner reached via `Executor::spawn`. Values are guaranteed
 non-decreasing across consecutive emissions because `Instant::elapsed`
 is monotonic. See `tests/progress_reports_elapsed_micros.rs`.
 
+## Decoder-skip visibility
+
+`Progress::packets_skipped` and `ExecutorStats::packets_skipped`
+expose the same cumulative count of packets the decoder swallowed
+under the per-packet error-tolerance contract (see the
+"Per-packet decoder error tolerance" section above). Pre-fix the
+only signal that a stream was quietly going bad was an `eprintln!`
+line on stderr — an engine had no programmatic way to display "N
+decode errors" on its status bar, and a stress harness had to
+reverse-engineer the skip count from `packets_read - frames_decoded`.
+Both decode paths (`staged::run_decode_stage` and the inherent
+`executor::pump_packet`) increment a shared counter on every
+`send_packet` error and on every `receive_frame` error that landed
+before a frame was produced for that packet; a `produced_any` flag
+prevents double-counting when a `receive_frame` error fires *after*
+partial output already streamed (the packet wasn't lost — partial
+output landed). The counter is monotonically non-decreasing, equals
+`0` on a clean stream and on copy-only outputs (no decoder
+instantiated), and the EOF `Progress` emission's value always
+matches the final `ExecutorStats` value (both read from the same
+atomic; EOF emission is sent after the worker threads join). See
+`tests/progress_reports_packets_skipped.rs` plus the two new stats
+assertions in `tests/decoder_error_tolerance.rs`.
+
 ## Seek correlation
 
 `ExecutorHandle::seek_with_generation(stream_idx, pts, tb)` returns the

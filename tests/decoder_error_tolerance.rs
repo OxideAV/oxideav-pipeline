@@ -215,7 +215,7 @@ impl JobSink for CountingSink {
     }
 }
 
-fn run_with_threads(threads: usize) -> usize {
+fn run_with_threads(threads: usize) -> (usize, u64) {
     let ctx = make_ctx();
     let job_json = format!(
         r#"{{"@display":{{"audio":[{{"from":"{FLAKY_SCHEME}://x/data.{FLAKY_SCHEME}"}}]}}}}"#
@@ -225,14 +225,14 @@ fn run_with_threads(threads: usize) -> usize {
     let counters = Arc::new(Mutex::new(Counters::default()));
     let sink = Box::new(CountingSink(counters.clone()));
 
-    Executor::new(&job, &ctx)
+    let stats = Executor::new(&job, &ctx)
         .with_threads(threads)
         .with_sink_override("@display", sink)
         .run()
         .expect("executor must finish even with per-packet decoder errors");
 
     let frames = counters.lock().unwrap().frames;
-    frames
+    (frames, stats.packets_skipped)
 }
 
 #[test]
@@ -244,7 +244,7 @@ fn flaky_decoder_does_not_kill_serial_stream() {
     // Post-fix: per-packet errors are logged (eprintln) and the
     // executor continues. With a decoder that errors on every 5th
     // packet (5,10,15,...,50), we should see ~40 of 50 frames.
-    let frames = run_with_threads(1);
+    let (frames, _) = run_with_threads(1);
     assert!(
         frames >= 35,
         "serial path: expected at least 35 frames out of 50 packets despite per-packet errors; got {frames}"
@@ -259,7 +259,7 @@ fn flaky_decoder_does_not_kill_serial_stream() {
 fn flaky_decoder_does_not_kill_pipelined_stream() {
     // Same contract for the pipelined path (`staged.rs::run_decode_stage`).
     // This is the path oxideplay uses by default.
-    let frames = run_with_threads(2);
+    let (frames, _) = run_with_threads(2);
     assert!(
         frames >= 35,
         "pipelined path: expected at least 35 frames out of 50 packets despite per-packet errors; got {frames}"
@@ -267,5 +267,47 @@ fn flaky_decoder_does_not_kill_pipelined_stream() {
     assert!(
         frames > 10,
         "regression: pipelined executor bailed early on first decoder error; only got {frames} frames"
+    );
+}
+
+#[test]
+fn serial_stats_count_skipped_packets() {
+    // `ExecutorStats::packets_skipped` must reflect every packet whose
+    // decoder error was logged-and-swallowed by the per-packet tolerance
+    // contract. With the FlakyDecoder erroring on every 5th packet of
+    // 50, exactly 10 skips should be reported — without this counter
+    // the eprintln stream is the only signal an engine has that a
+    // stream is quietly going bad.
+    let (frames, skipped) = run_with_threads(1);
+    assert_eq!(
+        skipped, 10,
+        "serial path: 50 packets, every 5th errors -> 10 skips expected, got {skipped} (frames={frames})"
+    );
+    // Sanity: frames + skipped must equal the total packet count when
+    // the decoder produces exactly one frame per non-failing packet.
+    // FlakyDecoder yields one frame per `send_packet` (the pending slot
+    // takes a single packet), so frames == 40 and skipped == 10.
+    assert_eq!(
+        frames as u64 + skipped,
+        TOTAL_PACKETS as u64,
+        "serial path: frames + skipped should equal total packets ({TOTAL_PACKETS})"
+    );
+}
+
+#[test]
+fn pipelined_stats_count_skipped_packets() {
+    // Same contract for the pipelined runner. `run_decode_stage` shares
+    // its `PipelineCounters::packets_skipped` accountant with the mux
+    // loop's `Progress` emission and with `snapshot()` into
+    // `ExecutorStats` at join time.
+    let (frames, skipped) = run_with_threads(2);
+    assert_eq!(
+        skipped, 10,
+        "pipelined path: 50 packets, every 5th errors -> 10 skips expected, got {skipped} (frames={frames})"
+    );
+    assert_eq!(
+        frames as u64 + skipped,
+        TOTAL_PACKETS as u64,
+        "pipelined path: frames + skipped should equal total packets ({TOTAL_PACKETS})"
     );
 }

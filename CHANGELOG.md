@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::packets_skipped` and `ExecutorStats::packets_skipped` —
+  cumulative count of packets the decoder swallowed under the
+  per-packet error-tolerance contract pinned by
+  `tests/decoder_error_tolerance.rs`. Pre-r184 the only signal that a
+  decoder was log-and-skipping packets (`send_packet` errored, or the
+  subsequent `receive_frame` errored before yielding a single frame)
+  was an `eprintln!` line on stderr — an engine had no programmatic
+  way to detect a stream that was quietly going bad, and a stress
+  harness had to reverse-engineer the skip count from the gap between
+  `packets_read` and `frames_decoded`. Both decode paths
+  (`run_decode_stage` in `staged.rs` and `pump_packet` in
+  `executor.rs`) now increment a shared counter — a thread-local
+  `produced_any` flag suppresses double-counting on a `receive_frame`
+  error that lands *after* one or more frames already streamed (the
+  packet wasn't lost — partial output landed). The counter is read
+  out on every `Progress` emission (mid-run and EOF) and on the final
+  `ExecutorStats` snapshot at join time. **Additive on `Progress`** —
+  the field defaults to `0` for any pattern-match consumer using the
+  struct-update syntax (`Progress { pts, .. }`). **Additive on
+  `ExecutorStats`** — `merge()` now sums the new field across outputs.
+  Always `0` on copy-only outputs (no decoder is instantiated) and on
+  a clean stream (no skips occurred). Regression coverage:
+  `tests/progress_reports_packets_skipped.rs` asserts (a) the field is
+  `0` end-to-end on a non-erroring decoder, (b) the counter is
+  monotonically non-decreasing across consecutive emissions, and (c)
+  the EOF emission's value equals the final `ExecutorStats` value
+  (both read from the same atomic; the EOF emission is sent after the
+  worker threads join, so any drift would mean the two paths are
+  wired to different counters). `tests/decoder_error_tolerance.rs`
+  adds two stats assertions: a `FlakyDecoder` that errors on every
+  5th of 50 packets must report exactly 10 skips on both the serial
+  and pipelined paths, and `frames + skipped` must equal the total
+  packet count.
 - `Progress::elapsed_micros` — wall-clock progress for the pipelined
   runner. The `Progress` event returned by
   `ExecutorHandle::try_progress()` now carries the wall-clock
