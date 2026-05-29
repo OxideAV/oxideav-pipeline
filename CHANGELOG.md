@@ -9,6 +9,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::elapsed_micros` — wall-clock progress for the pipelined
+  runner. The `Progress` event returned by
+  `ExecutorHandle::try_progress()` now carries the wall-clock
+  microseconds since the runner's baseline `Instant`, captured just
+  before the first worker thread spawns (and therefore just before
+  any packet starts flowing). Engines use this to derive three
+  headline diagnostics without bracketing `spawn()`/`stop()` with
+  their own `Instant::now()`: the realtime ratio
+  (`pts_micros / elapsed_micros`) for a transcode-speed indicator,
+  realtime-drift detection on live sources (the engine compares the
+  latest `pts` to `elapsed_micros` to spot the pipeline falling behind
+  the source clock before audio-ring drain surfaces it), and the EOF
+  wall-clock total (the `eof: true` progress event carries the total
+  runtime, so a CLI tool can print "encoded N frames in 4.21 s" by
+  reading the field off the EOF event instead of wrapping the spawn).
+  Values are guaranteed non-decreasing across consecutive emissions
+  from the same handle (`Instant::elapsed` is monotonic). The serial
+  path (`Executor::run`) doesn't wire a progress channel and never
+  emits `Progress`, so the field is only ever non-zero on the
+  pipelined runner reached via `Executor::spawn`. **Additive** — the
+  field defaults to `0` for any pattern-match consumer using the
+  struct-update syntax (`Progress { pts, .. }`); the type doc-comment
+  already documents that idiom for forward compatibility. Threaded
+  through the two `Progress::try_send` call-sites in the mux loop
+  alongside `queue_bytes`. Regression coverage:
+  `tests/progress_reports_elapsed_micros.rs` asserts (a)
+  `elapsed_micros` is non-decreasing across consecutive emissions,
+  (b) `elapsed_micros` is non-zero on the EOF event (a zero would
+  mean the field isn't being populated), and (c) the peak mid-run
+  sample is bounded above by the EOF sample (catches a refactor that
+  reads two independent `started_at` baselines on the mid-run and EOF
+  paths).
 - `Progress::queue_bytes` — back-pressure visibility for the pipelined
   runner. The `Progress` event returned by
   `ExecutorHandle::try_progress()` now carries the current in-flight

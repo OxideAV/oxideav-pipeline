@@ -89,15 +89,31 @@ path ignores it. See `tests/max_queue_bytes.rs`.
 ## Back-pressure visibility
 
 `ExecutorHandle::try_progress()` returns a `Progress { pts, frames, eof,
-queue_bytes }`. `queue_bytes` reports the current in-flight packet-byte
-total tracked by the `with_max_queue_bytes(n)` budget — a value pinned
-to `n` indicates the demuxer is parking on the byte ceiling waiting for
-the consumer to drain, a value hovering near zero means the ceiling
-isn't binding (the count caps or downstream block first). When no
-ceiling is configured the field is always `0` (the budget short-circuits
-its accounting); at EOF the field returns to `0` because every admitted
-packet has a matching release by the time workers join. See
-`tests/progress_reports_queue_bytes.rs`.
+queue_bytes, elapsed_micros }`. `queue_bytes` reports the current
+in-flight packet-byte total tracked by the `with_max_queue_bytes(n)`
+budget — a value pinned to `n` indicates the demuxer is parking on the
+byte ceiling waiting for the consumer to drain, a value hovering near
+zero means the ceiling isn't binding (the count caps or downstream
+block first). When no ceiling is configured the field is always `0`
+(the budget short-circuits its accounting); at EOF the field returns
+to `0` because every admitted packet has a matching release by the
+time workers join. See `tests/progress_reports_queue_bytes.rs`.
+
+## Wall-clock progress
+
+`elapsed_micros` reports the monotonic wall-clock microseconds since
+the pipelined runner's baseline `Instant`, captured just before the
+first worker thread spawns. Engines use this to derive the realtime
+ratio (`pts_micros / elapsed_micros`) without bracketing
+`spawn()`/`stop()` with their own `Instant::now()`, to detect when a
+live source is outpacing the pipeline (`pts < elapsed_micros` and
+falling further behind every poll), and to print the EOF wall-clock
+total from the `eof: true` progress event. The serial path
+(`Executor::run`) doesn't wire a progress channel and never emits
+`Progress`, so the field is only ever non-zero on the pipelined
+runner reached via `Executor::spawn`. Values are guaranteed
+non-decreasing across consecutive emissions because `Instant::elapsed`
+is monotonic. See `tests/progress_reports_elapsed_micros.rs`.
 
 ## Seek correlation
 

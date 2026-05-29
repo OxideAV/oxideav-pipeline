@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use oxideav_core::Demuxer;
 use oxideav_core::{Decoder, Encoder};
@@ -125,6 +125,31 @@ pub struct SeekCmd {
 /// no byte ceiling) is in effect, this field is always `0` — the budget
 /// short-circuits its accounting and the demuxer never parks.
 ///
+/// `elapsed_micros` reports the wall-clock microseconds since the pipelined
+/// runner started — specifically since the `Instant` taken just before the
+/// first worker thread spawned, which is also when the demuxer begins
+/// reading. The mux loop stamps this value on every `Progress` it emits
+/// (mid-run and at EOF) so engines can derive headline diagnostics without
+/// keeping their own wall-clock parallel to `pts`:
+///
+/// * **Realtime ratio.** For a single time_base, an engine can compute
+///   `pts_micros / elapsed_micros` and read off transcode speed (`> 1.0`
+///   = faster than realtime; `< 1.0` = slower). The serial path doesn't
+///   emit progress at all so this is only meaningful on the pipelined
+///   runner — which is the only one anyone watches anyway.
+/// * **Realtime drift on live sources.** For a real-time source (RTMP,
+///   capture card), the engine compares the latest `pts` to
+///   `elapsed_micros` and detects when the pipeline is falling behind
+///   the source clock before audio-ring drain surfaces it.
+/// * **EOF wall-clock total.** The `eof: true` progress event reports
+///   the total wall-clock the run took, so a CLI tool doesn't need to
+///   wrap `executor.run()` in its own `Instant::now()` bracket just to
+///   report "encoded N frames in 4.21 s".
+///
+/// The serial path doesn't emit `Progress` (no progress channel is wired
+/// in `Executor::run`), so this field is only ever non-zero on the
+/// pipelined runner reached via `Executor::spawn` + `ExecutorHandle`.
+///
 /// **Pattern-match consumers**: new fields will land here as the engine
 /// surface grows. Use the struct-update syntax (`Progress { pts, .. }`)
 /// or read fields by name to stay forward-compatible.
@@ -138,6 +163,14 @@ pub struct Progress {
     /// consumed by the next stage). Always `0` when no byte ceiling is
     /// configured via [`crate::Executor::with_max_queue_bytes`].
     pub queue_bytes: u64,
+    /// Wall-clock microseconds since the pipelined runner's baseline
+    /// `Instant` — captured just before the first worker thread spawns
+    /// (which is also when the demuxer begins reading). Always
+    /// monotonically non-decreasing across consecutive emissions from
+    /// the same handle. `Default::default()` is `0`, which matches the
+    /// "no progress wired" path used by `Executor::run` (the serial
+    /// runner doesn't emit `Progress` at all).
+    pub elapsed_micros: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -483,6 +516,14 @@ pub(crate) fn run_pipelined_inner(
     // (default) is a no-op: `admit` / `release` short-circuit and the
     // demuxer never parks, so the count caps alone govern.
     let budget = QueueBudget::new(control.max_queue_bytes);
+    // Wall-clock baseline used to populate `Progress::elapsed_micros`.
+    // Captured here — just before the first worker thread spawns and
+    // therefore just before any packet starts flowing — so the value
+    // surfaced on `Progress` is "microseconds since the runner began
+    // doing work", not "since the caller called `Executor::spawn`".
+    // `Instant::elapsed()` is saturating + monotonic so consecutive
+    // emissions are non-decreasing even under heavy clock skew.
+    let started_at = Instant::now();
 
     // Per-track output channel: stage workers send processed packets /
     // frames on tx; the mux loop on the caller thread reads rx.
@@ -721,6 +762,7 @@ pub(crate) fn run_pipelined_inner(
                             frames,
                             eof: false,
                             queue_bytes: budget.in_flight(),
+                            elapsed_micros: started_at.elapsed().as_micros() as u64,
                         });
                     }
                 }
@@ -785,11 +827,18 @@ pub(crate) fn run_pipelined_inner(
         // stage has released its bytes, so `in_flight()` should be 0 —
         // but we read it rather than hard-code 0 so a late drain race
         // reports the actual observable value instead of lying.
+        //
+        // `elapsed_micros` here is the total wall-clock the pipelined run
+        // took, from the baseline taken just before workers spawned through
+        // to `sink.finish()` returning. CLI tools that wrap a transcode in
+        // a status line can read this off the EOF progress event instead of
+        // bracketing `executor.spawn()/.stop()` with their own `Instant`.
         let _ = tx.try_send(Progress {
             pts: None,
             frames,
             eof: true,
             queue_bytes: budget.in_flight(),
+            elapsed_micros: started_at.elapsed().as_micros() as u64,
         });
     }
     Ok(counters.snapshot())
