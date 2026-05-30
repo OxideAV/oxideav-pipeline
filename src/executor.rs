@@ -585,6 +585,20 @@ impl<'a> Executor<'a> {
                 let streams = vec![synth_stream_info(f.params())];
                 Ok(SourcePump::Frames { source: f, streams })
             }
+            // Multi-title sources don't fit the single-stream
+            // pipeline shape — the CLI fans them out into N pipelines
+            // via `oxideav remux %s.<ext>`. A direct pipeline open
+            // here is a usage error.
+            SourceOutput::MultiTitle(_) => Err(Error::unsupported(format!(
+                "{uri}: this URI opens a multi-title source; use \
+                 `oxideav remux <uri> <pattern-with-%s>` to fan out \
+                 one output file per title"
+            ))),
+            // Any future source variant added behind `#[non_exhaustive]`
+            // lands here until the pipeline executor is extended.
+            _ => Err(Error::unsupported(format!(
+                "{uri}: source kind not yet supported by the pipeline executor"
+            ))),
         }
     }
 
