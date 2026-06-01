@@ -884,7 +884,18 @@ pub(crate) fn run_pipelined_inner(
         // bracketing `executor.spawn()/.stop()` with their own `Instant`.
         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
         let read = counters.packets_read.load(Ordering::SeqCst);
-        let _ = tx.try_send(Progress {
+        // EOF emission. We want this event to reach the receiver
+        // reliably — engines rely on the final `packets_read` /
+        // `packets_skipped` / wall-clock totals it carries — but a
+        // blocking `send` would deadlock if the engine never polled
+        // progress, which is fine for handles that opt out of progress
+        // observation entirely (e.g. `tests/seek_with_generation.rs`).
+        // Strategy: try a bounded number of `try_send` attempts with a
+        // short park between, giving any backed-up receiver a window
+        // to drain. Drop on saturation rather than wait forever — the
+        // engine still observes completion via `has_finished()` even
+        // if this exact event was lost on a full channel.
+        let eof_evt = Progress {
             pts: None,
             frames,
             eof: true,
@@ -892,7 +903,21 @@ pub(crate) fn run_pipelined_inner(
             elapsed_micros: started_at.elapsed().as_micros() as u64,
             packets_skipped: skipped,
             packets_read: read,
-        });
+        };
+        for attempt in 0..100 {
+            match tx.try_send(eof_evt) {
+                Ok(_) => break,
+                Err(mpsc::TrySendError::Full(_)) => {
+                    if attempt == 99 {
+                        // 100 ms total — give up and let the engine
+                        // observe completion via `has_finished()` only.
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(1));
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => break,
+            }
+        }
     }
     Ok(counters.snapshot())
 }
