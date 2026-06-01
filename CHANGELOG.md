@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::packets_read` — demuxer-progress visibility on the
+  pipelined runner. The `Progress` event returned by
+  `ExecutorHandle::try_progress()` now carries the cumulative count of
+  packets the demuxer has read from the source, sampled live from the
+  shared `PipelineCounters::packets_read` atomic on every emission.
+  This mirrors `ExecutorStats::packets_read` but is sampled before EOF,
+  so an engine can detect a stalled decoder while the run is still in
+  flight: the demuxer keeps reading (`packets_read` climbs) but
+  `frames` and `packets_skipped` stay flat, indicating the decode
+  stage is wedged on a pathological packet rather than the source
+  being slow. Headroom = `packets_read - frames - packets_skipped` is
+  the count of demuxed packets the decode stage hasn't yet resolved
+  (still in the queue, or pending inside the decoder waiting for more
+  input); a value pinned at the channel-depth budget combined with a
+  flat `frames` field is the diagnostic signature of a wedged
+  decoder. Pre-r205 the only way to compute that was to maintain a
+  parallel counter outside the executor — the `Progress` stream gave
+  `frames` but not the demuxer's side of the same ratio. **Additive
+  on `Progress`** — the new field defaults to `0` for any
+  pattern-match consumer using the struct-update syntax
+  (`Progress { pts, .. }`); the type doc-comment already documents
+  that idiom for forward compatibility. Threaded through the two
+  `Progress::try_send` call-sites in the mux loop alongside
+  `queue_bytes` / `elapsed_micros` / `packets_skipped`. The serial
+  path (`Executor::run`) doesn't wire a progress channel and never
+  emits `Progress`, so the field is only ever non-zero on the
+  pipelined runner reached via `Executor::spawn`. Regression coverage:
+  `tests/progress_reports_packets_read.rs` asserts (a) `packets_read`
+  is monotonically non-decreasing across consecutive emissions, (b)
+  it is non-zero on the EOF event (catches a refactor that drops the
+  thread-through), and (c) the EOF emission's value equals the final
+  `ExecutorStats::packets_read` snapshot (both read from the same
+  atomic; the EOF emission is sent after worker threads join, so any
+  drift would mean the two paths are wired to different counters).
 - `Progress::packets_skipped` and `ExecutorStats::packets_skipped` —
   cumulative count of packets the decoder swallowed under the
   per-packet error-tolerance contract pinned by

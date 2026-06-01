@@ -115,6 +115,20 @@ runner reached via `Executor::spawn`. Values are guaranteed
 non-decreasing across consecutive emissions because `Instant::elapsed`
 is monotonic. See `tests/progress_reports_elapsed_micros.rs`.
 
+## Demuxer-progress visibility
+
+`Progress::packets_read` mirrors `ExecutorStats::packets_read` but is
+sampled on every `Progress` emission, so engines can distinguish a
+stalled decoder from a stalled source without waiting for EOF.
+Headroom = `packets_read - frames - packets_skipped` is the count of
+demuxed packets the decode stage hasn't yet resolved; pinned at the
+channel-depth budget with a flat `frames` field is the diagnostic
+signature of a wedged decoder. The field is monotonically
+non-decreasing, the EOF emission's value matches the final
+`ExecutorStats::packets_read`, and the serial path (no progress
+channel wired) never populates it. See
+`tests/progress_reports_packets_read.rs`.
+
 ## Decoder-skip visibility
 
 `Progress::packets_skipped` and `ExecutorStats::packets_skipped`

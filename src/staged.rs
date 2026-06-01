@@ -187,6 +187,27 @@ pub struct Progress {
     /// so this field is only ever non-zero on the pipelined runner
     /// reached via `Executor::spawn`.
     pub packets_skipped: u64,
+    /// Cumulative count of packets the demuxer has read from the source.
+    /// This mirrors [`crate::executor::ExecutorStats::packets_read`] but
+    /// is sampled live on every `Progress` emission so an engine can
+    /// detect a stalled decoder (the demuxer keeps reading — `packets_read`
+    /// climbs — but `frames` and `packets_skipped` stay flat, so the
+    /// decode stage isn't draining its inbox).
+    ///
+    /// Headroom = `packets_read - frames - packets_skipped` is the count
+    /// of demuxed packets the decode stage hasn't yet resolved (still in
+    /// the queue, or still pending inside the decoder waiting for more
+    /// input). A value pinned at the channel-depth budget combined with
+    /// a flat `frames` field is the diagnostic signature of a wedged
+    /// decoder.
+    ///
+    /// Monotonically non-decreasing across consecutive emissions from
+    /// the same handle. The serial path (`Executor::run`) doesn't emit
+    /// `Progress` at all, so this field is only ever non-zero on the
+    /// pipelined runner reached via `Executor::spawn`. At EOF the
+    /// `packets_read` value matches the final
+    /// [`crate::executor::ExecutorStats::packets_read`] snapshot.
+    pub packets_read: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -782,6 +803,7 @@ pub(crate) fn run_pipelined_inner(
                     if let Some(tx) = &progress_tx {
                         let frames = counters.frames_written.load(Ordering::SeqCst);
                         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
+                        let read = counters.packets_read.load(Ordering::SeqCst);
                         let _ = tx.try_send(Progress {
                             pts,
                             frames,
@@ -789,6 +811,7 @@ pub(crate) fn run_pipelined_inner(
                             queue_bytes: budget.in_flight(),
                             elapsed_micros: started_at.elapsed().as_micros() as u64,
                             packets_skipped: skipped,
+                            packets_read: read,
                         });
                     }
                 }
@@ -860,6 +883,7 @@ pub(crate) fn run_pipelined_inner(
         // a status line can read this off the EOF progress event instead of
         // bracketing `executor.spawn()/.stop()` with their own `Instant`.
         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
+        let read = counters.packets_read.load(Ordering::SeqCst);
         let _ = tx.try_send(Progress {
             pts: None,
             frames,
@@ -867,6 +891,7 @@ pub(crate) fn run_pipelined_inner(
             queue_bytes: budget.in_flight(),
             elapsed_micros: started_at.elapsed().as_micros() as u64,
             packets_skipped: skipped,
+            packets_read: read,
         });
     }
     Ok(counters.snapshot())
@@ -1076,12 +1101,13 @@ fn run_decode_stage(
     // the player never started.
     // Tolerance bookkeeping: a single per-packet decode glitch (e.g.
     // an AAC frame where the bit-stream has a recoverable parse error)
-    // must NOT abort the entire stream. ffmpeg's `decode_audio` /
-    // `decode_video` log + skip the offending packet and keep going;
-    // the H.264 decoder in this workspace already follows this pattern
-    // internally (`eprintln!("h264 slice skipped: {e}")`). Pre-fix the
-    // audio path here would `return Err(e)` on the first transient
-    // codec error and kill the entire stream — the user-reported
+    // must NOT abort the entire stream. Real-world playback expects a
+    // single corrupted packet to mean a single skipped frame rather
+    // than a wedged player; the H.264 decoder in this workspace
+    // already follows this pattern internally
+    // (`eprintln!("h264 slice skipped: {e}")`). Pre-fix the audio
+    // path here would `return Err(e)` on the first transient codec
+    // error and kill the entire stream — the user-reported
     // congress_mtgox_coins.mp4 hang at 00:00 was exactly that: AAC
     // packet #3 returned an "out of bits" error after producing 2
     // frames, the executor exited the worker, the engine never got
