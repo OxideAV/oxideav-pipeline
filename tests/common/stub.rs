@@ -17,13 +17,19 @@
 
 use oxideav_core::{
     packet::PacketFlags, AudioFrame, CodecCapabilities, CodecId, CodecParameters, CodecResolver,
-    Error, Frame, Packet, Result, SampleFormat, StreamInfo, TimeBase,
+    Encoder, EncoderFactory, Error, Frame, Packet, Result, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{registry::CodecInfo, CodecRegistry, Decoder, DecoderFactory};
 use oxideav_core::{ContainerRegistry, Demuxer, OpenDemuxerFn, ReadSeek};
 
 /// Codec id for the stub passthrough decoder.
 pub const CODEC_ID: &str = "stub_pcm";
+/// Codec id for the stub passthrough encoder. Distinct from
+/// [`CODEC_ID`] so a transcode route (decode `stub_pcm` → encode
+/// `stub_pcm_out`) is plumbed through the staged executor's
+/// `run_encode_stage`, which is where the `packets_encoded` counter
+/// gets bumped. See `tests/progress_reports_packets_encoded.rs`.
+pub const ENC_CODEC_ID: &str = "stub_pcm_out";
 /// Container name registered into [`ContainerRegistry`].
 pub const CONTAINER: &str = "stub_audio";
 /// Extension that triggers the stub container via the registry's
@@ -61,6 +67,16 @@ pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) 
         .capabilities(CodecCapabilities::audio(CODEC_ID).with_decode())
         .decoder(make_decoder as DecoderFactory);
     codecs.register(info);
+
+    // Distinct encoder codec id so a Job with `"codec": "stub_pcm_out"`
+    // exercises the decode → encode transcode path under the staged
+    // executor. `packets_encoded` only ticks when `run_encode_stage`
+    // is wired in, which only happens when the schema picks up an
+    // encoder for the track.
+    let enc_info = CodecInfo::new(CodecId::new(ENC_CODEC_ID))
+        .capabilities(CodecCapabilities::audio(ENC_CODEC_ID).with_encode())
+        .encoder(make_encoder as EncoderFactory);
+    codecs.register(enc_info);
 
     containers.register_demuxer(CONTAINER, open_demuxer as OpenDemuxerFn);
     containers.register_extension(EXT, CONTAINER);
@@ -110,6 +126,15 @@ pub fn touch(name: &str) -> std::path::PathBuf {
 
 fn make_decoder(_params: &CodecParameters) -> Result<Box<dyn Decoder>> {
     Ok(Box::new(StubDecoder { pending: None }))
+}
+
+fn make_encoder(params: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    let mut out = params.clone();
+    out.codec_id = CodecId::new(ENC_CODEC_ID);
+    Ok(Box::new(StubEncoder {
+        out_params: out,
+        queue: std::collections::VecDeque::new(),
+    }))
 }
 
 fn open_demuxer(
@@ -291,6 +316,51 @@ impl Decoder for StubDecoder {
     }
     fn reset(&mut self) -> Result<()> {
         self.pending = None;
+        Ok(())
+    }
+}
+
+/// Stub encoder: 1:1 AudioFrame → Packet passthrough. Produces a
+/// keyframe-flagged packet per `send_frame` invocation, draining
+/// instantly on `receive_packet`. Mirrors the `StubDecoder` shape so a
+/// pipeline integration test can chain decode → encode without
+/// dragging a real codec into the dev-deps.
+pub struct StubEncoder {
+    out_params: CodecParameters,
+    queue: std::collections::VecDeque<Packet>,
+}
+
+impl Encoder for StubEncoder {
+    fn codec_id(&self) -> &CodecId {
+        &self.out_params.codec_id
+    }
+    fn output_params(&self) -> &CodecParameters {
+        &self.out_params
+    }
+    fn send_frame(&mut self, frame: &Frame) -> Result<()> {
+        let Frame::Audio(a) = frame else {
+            return Err(Error::invalid("stub encoder: audio only"));
+        };
+        let sr = self.out_params.sample_rate.unwrap_or(SAMPLE_RATE);
+        let mut pkt = Packet::new(
+            // The staged executor's mux loop rewrites `stream_index`
+            // from the per-track index on `OutputItem`, so the value
+            // we emit here is immaterial.
+            0,
+            TimeBase::new(1, sr as i64),
+            a.data.first().cloned().unwrap_or_default(),
+        );
+        pkt.pts = a.pts;
+        pkt.dts = a.pts;
+        pkt.duration = Some(a.samples as i64);
+        pkt.flags.keyframe = true;
+        self.queue.push_back(pkt);
+        Ok(())
+    }
+    fn receive_packet(&mut self) -> Result<Packet> {
+        self.queue.pop_front().ok_or(Error::NeedMore)
+    }
+    fn flush(&mut self) -> Result<()> {
         Ok(())
     }
 }

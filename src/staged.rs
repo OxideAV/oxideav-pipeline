@@ -208,6 +208,28 @@ pub struct Progress {
     /// `packets_read` value matches the final
     /// [`crate::executor::ExecutorStats::packets_read`] snapshot.
     pub packets_read: u64,
+    /// Cumulative count of packets the encoder has produced. Mirrors
+    /// [`crate::executor::ExecutorStats::packets_encoded`] but sampled
+    /// live on every `Progress` emission so an engine can detect a
+    /// stalled encoder without waiting for EOF: the decoder is making
+    /// progress (`frames` and/or upstream stages keep ticking) but the
+    /// encoder isn't emitting packets (`packets_encoded` stays flat).
+    /// Pre-r209 `packets_encoded` was only readable on the final
+    /// `ExecutorStats` snapshot, so a stress harness had to wait for
+    /// the run to finish before it could even tell whether the encode
+    /// stage had been running at all — and a CLI status bar couldn't
+    /// surface "encoded N packets / decoded M frames" without
+    /// instrumenting the encoder externally.
+    ///
+    /// Monotonically non-decreasing across consecutive emissions from
+    /// the same handle. Always `0` on copy-only outputs (no encoder is
+    /// instantiated — the staged runner skips `run_encode_stage` and
+    /// the counter is never bumped). The serial path (`Executor::run`)
+    /// doesn't emit `Progress` at all, so this field is only ever
+    /// non-zero on the pipelined runner reached via `Executor::spawn`.
+    /// At EOF the `packets_encoded` value matches the final
+    /// [`crate::executor::ExecutorStats::packets_encoded`] snapshot.
+    pub packets_encoded: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -804,6 +826,7 @@ pub(crate) fn run_pipelined_inner(
                         let frames = counters.frames_written.load(Ordering::SeqCst);
                         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
                         let read = counters.packets_read.load(Ordering::SeqCst);
+                        let encoded = counters.packets_encoded.load(Ordering::SeqCst);
                         let _ = tx.try_send(Progress {
                             pts,
                             frames,
@@ -812,6 +835,7 @@ pub(crate) fn run_pipelined_inner(
                             elapsed_micros: started_at.elapsed().as_micros() as u64,
                             packets_skipped: skipped,
                             packets_read: read,
+                            packets_encoded: encoded,
                         });
                     }
                 }
@@ -884,17 +908,19 @@ pub(crate) fn run_pipelined_inner(
         // bracketing `executor.spawn()/.stop()` with their own `Instant`.
         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
         let read = counters.packets_read.load(Ordering::SeqCst);
+        let encoded = counters.packets_encoded.load(Ordering::SeqCst);
         // EOF emission. We want this event to reach the receiver
         // reliably — engines rely on the final `packets_read` /
-        // `packets_skipped` / wall-clock totals it carries — but a
-        // blocking `send` would deadlock if the engine never polled
-        // progress, which is fine for handles that opt out of progress
-        // observation entirely (e.g. `tests/seek_with_generation.rs`).
-        // Strategy: try a bounded number of `try_send` attempts with a
-        // short park between, giving any backed-up receiver a window
-        // to drain. Drop on saturation rather than wait forever — the
-        // engine still observes completion via `has_finished()` even
-        // if this exact event was lost on a full channel.
+        // `packets_skipped` / `packets_encoded` / wall-clock totals it
+        // carries — but a blocking `send` would deadlock if the engine
+        // never polled progress, which is fine for handles that opt
+        // out of progress observation entirely (e.g.
+        // `tests/seek_with_generation.rs`). Strategy: try a bounded
+        // number of `try_send` attempts with a short park between,
+        // giving any backed-up receiver a window to drain. Drop on
+        // saturation rather than wait forever — the engine still
+        // observes completion via `has_finished()` even if this exact
+        // event was lost on a full channel.
         let eof_evt = Progress {
             pts: None,
             frames,
@@ -903,6 +929,7 @@ pub(crate) fn run_pipelined_inner(
             elapsed_micros: started_at.elapsed().as_micros() as u64,
             packets_skipped: skipped,
             packets_read: read,
+            packets_encoded: encoded,
         };
         for attempt in 0..100 {
             match tx.try_send(eof_evt) {

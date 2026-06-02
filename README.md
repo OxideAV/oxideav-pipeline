@@ -115,6 +115,26 @@ runner reached via `Executor::spawn`. Values are guaranteed
 non-decreasing across consecutive emissions because `Instant::elapsed`
 is monotonic. See `tests/progress_reports_elapsed_micros.rs`.
 
+## Encoder-progress visibility
+
+`Progress::packets_encoded` mirrors `ExecutorStats::packets_encoded`
+but is sampled on every `Progress` emission, so engines can
+distinguish a stalled encoder from a stalled decoder without waiting
+for EOF. Pre-r209 `packets_encoded` was only readable on the final
+stats snapshot returned by `Executor::stop()`, so a stress harness
+had to wait for the run to finish before it could even tell whether
+the encode stage had been running at all — and a CLI status bar
+couldn't surface "encoded N packets / decoded M frames" without
+instrumenting the encoder externally. With the field live-sampled,
+the diagnostic signature of a wedged encoder is `frames` and
+`packets_read` both climbing while `packets_encoded` stays flat. The
+field is monotonically non-decreasing, the EOF emission's value
+matches the final `ExecutorStats::packets_encoded`, and the field is
+always `0` on copy-only outputs (the staged runner skips
+`run_encode_stage` when no encoder is named) and on the serial path
+(no progress channel wired). See
+`tests/progress_reports_packets_encoded.rs`.
+
 ## Demuxer-progress visibility
 
 `Progress::packets_read` mirrors `ExecutorStats::packets_read` but is

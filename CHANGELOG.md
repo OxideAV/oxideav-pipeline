@@ -9,6 +9,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::packets_encoded` — encoder-progress visibility on the
+  pipelined runner. The `Progress` event returned by
+  `ExecutorHandle::try_progress()` now carries the cumulative count of
+  packets the encoder has produced, sampled live from the shared
+  `PipelineCounters::packets_encoded` atomic on every emission. Pre-r209
+  `packets_encoded` was only readable on the final
+  `ExecutorStats::packets_encoded` snapshot returned by
+  `Executor::stop()`, so a stress harness had to wait for the run to
+  finish before it could even tell whether the encode stage had been
+  running at all — and a CLI status bar couldn't surface "encoded N
+  packets / decoded M frames" without instrumenting the encoder
+  externally. The live-sampled field also lets an engine detect a
+  stalled encoder while the run is still in flight: upstream stages
+  keep ticking (`frames` and the demuxer's `packets_read` both climb)
+  but the encoder isn't draining its inbox (`packets_encoded` stays
+  flat), indicating the encode stage is wedged on a pathological frame
+  rather than the source being slow. **Additive on `Progress`** — the
+  new field defaults to `0` for any pattern-match consumer using the
+  struct-update syntax (`Progress { pts, .. }`); the type doc-comment
+  already documents that idiom for forward compatibility. Threaded
+  through the two `Progress::try_send` call-sites in the mux loop
+  alongside `queue_bytes` / `elapsed_micros` / `packets_skipped` /
+  `packets_read`. Always `0` on copy-only outputs (no encoder is
+  instantiated — the staged runner skips `run_encode_stage` and the
+  counter is never bumped). The serial path (`Executor::run`) doesn't
+  wire a progress channel and never emits `Progress`, so the field is
+  only ever non-zero on the pipelined runner reached via
+  `Executor::spawn`. Regression coverage:
+  `tests/progress_reports_packets_encoded.rs` asserts (a) the field is
+  non-zero at EOF on a transcode run (catches a refactor that drops
+  the thread-through), (b) it is monotonically non-decreasing across
+  consecutive emissions, (c) the EOF emission's value equals the final
+  `ExecutorStats::packets_encoded` snapshot (both read from the same
+  atomic; EOF emission is sent after worker threads join, so any drift
+  would mean the two paths are wired to different counters), and (d)
+  it stays at `0` end-to-end on a copy-only output. The in-tree stub
+  source gains a stub encoder for codec id `stub_pcm_out` so the
+  transcode path can be exercised without dragging a real codec into
+  the crate's dev-deps.
 - `Progress::packets_read` — demuxer-progress visibility on the
   pipelined runner. The `Progress` event returned by
   `ExecutorHandle::try_progress()` now carries the cumulative count of
