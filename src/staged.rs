@@ -230,6 +230,27 @@ pub struct Progress {
     /// At EOF the `packets_encoded` value matches the final
     /// [`crate::executor::ExecutorStats::packets_encoded`] snapshot.
     pub packets_encoded: u64,
+    /// Cumulative count of packets the copy stage forwarded into the mux
+    /// loop. Mirrors [`crate::executor::ExecutorStats::packets_copied`]
+    /// but sampled live on every `Progress` emission so an engine can
+    /// distinguish the copy and transcode sides of a mixed output without
+    /// waiting for EOF — e.g. a remux job whose audio track copies while
+    /// the video track transcodes will see `packets_copied` and
+    /// `packets_encoded` advance independently, and a wedged copy stage
+    /// shows up as a flat `packets_copied` while `packets_read` keeps
+    /// climbing (the demuxer is still serving packets but they're not
+    /// reaching the mux loop).
+    ///
+    /// Monotonically non-decreasing across consecutive emissions from
+    /// the same handle. Always `0` on transcode-only outputs (every
+    /// track instantiates a decoder + encoder and no track uses the
+    /// copy path) and on outputs whose every track is rejected. The
+    /// serial path (`Executor::run`) doesn't emit `Progress` at all,
+    /// so this field is only ever non-zero on the pipelined runner
+    /// reached via `Executor::spawn`. At EOF the `packets_copied` value
+    /// matches the final
+    /// [`crate::executor::ExecutorStats::packets_copied`] snapshot.
+    pub packets_copied: u64,
 }
 
 /// Packet-channel depth. Small enough that a stalled consumer back-pressures
@@ -827,6 +848,7 @@ pub(crate) fn run_pipelined_inner(
                         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
                         let read = counters.packets_read.load(Ordering::SeqCst);
                         let encoded = counters.packets_encoded.load(Ordering::SeqCst);
+                        let copied = counters.packets_copied.load(Ordering::SeqCst);
                         let _ = tx.try_send(Progress {
                             pts,
                             frames,
@@ -836,6 +858,7 @@ pub(crate) fn run_pipelined_inner(
                             packets_skipped: skipped,
                             packets_read: read,
                             packets_encoded: encoded,
+                            packets_copied: copied,
                         });
                     }
                 }
@@ -909,6 +932,7 @@ pub(crate) fn run_pipelined_inner(
         let skipped = counters.packets_skipped.load(Ordering::SeqCst);
         let read = counters.packets_read.load(Ordering::SeqCst);
         let encoded = counters.packets_encoded.load(Ordering::SeqCst);
+        let copied = counters.packets_copied.load(Ordering::SeqCst);
         // EOF emission. We want this event to reach the receiver
         // reliably — engines rely on the final `packets_read` /
         // `packets_skipped` / `packets_encoded` / wall-clock totals it
@@ -930,6 +954,7 @@ pub(crate) fn run_pipelined_inner(
             packets_skipped: skipped,
             packets_read: read,
             packets_encoded: encoded,
+            packets_copied: copied,
         };
         for attempt in 0..100 {
             match tx.try_send(eof_evt) {

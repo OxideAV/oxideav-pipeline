@@ -115,6 +115,22 @@ runner reached via `Executor::spawn`. Values are guaranteed
 non-decreasing across consecutive emissions because `Instant::elapsed`
 is monotonic. See `tests/progress_reports_elapsed_micros.rs`.
 
+## Copy-stage-progress visibility
+
+`Progress::packets_copied` mirrors `ExecutorStats::packets_copied` but
+is sampled on every `Progress` emission, so engines can distinguish
+the copy and transcode sides of a mixed output without waiting for
+EOF. A remux job whose audio track copies while the video track
+transcodes will see `packets_copied` and `packets_encoded` advance
+independently; a wedged copy stage shows up as a flat
+`packets_copied` while `packets_read` keeps climbing (the demuxer is
+still serving packets but they're not reaching the mux loop). The
+field is monotonically non-decreasing, the EOF emission's value
+matches the final `ExecutorStats::packets_copied`, and the field is
+always `0` on transcode-only outputs (no track uses the copy path)
+and on the serial path (no progress channel wired). See
+`tests/progress_reports_packets_copied.rs`.
+
 ## Encoder-progress visibility
 
 `Progress::packets_encoded` mirrors `ExecutorStats::packets_encoded`

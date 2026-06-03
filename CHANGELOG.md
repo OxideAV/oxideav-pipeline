@@ -9,6 +9,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `Progress::packets_copied` — copy-stage progress visibility on the
+  pipelined runner. The `Progress` event returned by
+  `ExecutorHandle::try_progress()` now carries the cumulative count of
+  packets the copy stage has forwarded into the mux loop, sampled live
+  from the shared `PipelineCounters::packets_copied` atomic on every
+  emission. This mirrors `ExecutorStats::packets_copied` but is sampled
+  before EOF, so an engine can distinguish the copy and transcode
+  sides of a mixed output without waiting for EOF: a remux job whose
+  audio track copies while the video track transcodes will see
+  `packets_copied` and `packets_encoded` advance independently, and a
+  wedged copy stage shows up as a flat `packets_copied` while
+  `packets_read` keeps climbing (the demuxer is still serving packets
+  but they're not reaching the mux loop). Pre-r222 the only way to
+  surface the live copy-count was to maintain a parallel counter
+  outside the executor — the `Progress` stream gave `frames` and
+  `packets_encoded` but nothing on the copy path. **Additive on
+  `Progress`** — the new field defaults to `0` for any pattern-match
+  consumer using the struct-update syntax (`Progress { pts, .. }`);
+  the type doc-comment already documents that idiom for forward
+  compatibility. Threaded through the two `Progress::try_send`
+  call-sites in the mux loop alongside `queue_bytes` /
+  `elapsed_micros` / `packets_skipped` / `packets_read` /
+  `packets_encoded`. Always `0` on transcode-only outputs (every
+  track instantiates a decoder + encoder and no track uses the copy
+  path). The serial path (`Executor::run`) doesn't wire a progress
+  channel and never emits `Progress`, so the field is only ever
+  non-zero on the pipelined runner reached via `Executor::spawn`.
+  Regression coverage:
+  `tests/progress_reports_packets_copied.rs` asserts (a) the field is
+  monotonically non-decreasing across consecutive emissions, (b) it
+  is non-zero at EOF on a copy-only run via the `@null` reserved
+  sink (`@display` would auto-insert a decode stage and zero the
+  field), and (c) the EOF emission's value equals the final
+  `ExecutorStats::packets_copied` snapshot (both read from the same
+  atomic; EOF emission is sent after worker threads join, so any
+  drift would mean the two paths are wired to different counters).
+
 - `Progress::packets_encoded` — encoder-progress visibility on the
   pipelined runner. The `Progress` event returned by
   `ExecutorHandle::try_progress()` now carries the cumulative count of
