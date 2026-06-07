@@ -29,6 +29,29 @@ use crate::selection::{make_decoder, make_encoder};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
+/// User-installable factory that builds a [`FrameSource`] for a
+/// [`DagNode::Render3D`] node. Pipeline does not depend on
+/// `oxideav-render`; the consumer (e.g. `oxideav-cli-convert`)
+/// installs this callback at startup, bridging pipeline's name-and-JSON
+/// description of a render request to a concrete `oxideav-render` +
+/// `oxideav-mesh3d` setup.
+///
+/// Arguments: `(source_uri, backend_name, opts_json)` taken verbatim
+/// from the [`DagNode::Render3D`] variant. The factory returns a
+/// `Box<dyn FrameSource>` that the executor wraps in a
+/// [`SourcePump::Frames`] and drives like any other frame-shape source.
+///
+/// Installed on the [`Executor`] via
+/// [`Executor::with_render_source_factory`]. When unset, any
+/// `Render3D` node in the DAG fails with an `Unsupported` error
+/// pointing at the installation API — see the executor arm in
+/// [`Executor::resolve_source_shapes`].
+pub type RenderSourceFactory = Box<
+    dyn Fn(&str, &str, &serde_json::Value) -> oxideav_core::Result<Box<dyn FrameSource>>
+        + Send
+        + Sync,
+>;
+
 /// One opened source, branched on the registered shape. Held in the
 /// executor's per-URI map so the run loops can pump packets or frames
 /// straight into the per-track stages without re-opening the source.
@@ -139,6 +162,16 @@ pub struct Executor<'a> {
     /// ceiling, leaving only the count caps. Ignored on the serial
     /// path. Set via [`Self::with_max_queue_bytes`].
     max_queue_bytes: u64,
+    /// Optional factory for [`DagNode::Render3D`] nodes. When `None`,
+    /// any `Render3D` node in the DAG fails source-shape resolution
+    /// with an `Unsupported` error pointing at where to install the
+    /// callback. Set via [`Self::with_render_source_factory`].
+    ///
+    /// Phase C-3c of the render-pipeline integration: pipeline does
+    /// not depend on `oxideav-render`. The consumer installs the
+    /// closure to bridge `(source_uri, backend_name, opts_json)` to a
+    /// concrete `Box<dyn FrameSource>`.
+    render_source_factory: Option<RenderSourceFactory>,
 }
 
 impl<'a> Executor<'a> {
@@ -154,6 +187,7 @@ impl<'a> Executor<'a> {
             explicit_threads: None,
             channel_caps: None,
             max_queue_bytes: 0,
+            render_source_factory: None,
         }
     }
 
@@ -222,6 +256,20 @@ impl<'a> Executor<'a> {
     /// Has no effect on the serial path — that path uses no channels.
     pub fn with_max_queue_bytes(mut self, n: u64) -> Self {
         self.max_queue_bytes = n;
+        self
+    }
+
+    /// Install the render-source factory used to materialise
+    /// [`DagNode::Render3D`] leaves into a [`FrameSource`]. Pipeline
+    /// does not depend on `oxideav-render`; the consumer (e.g.
+    /// `oxideav-cli-convert`) installs this callback at startup so the
+    /// executor can call into it when the DAG walk reaches a
+    /// `Render3D` node. See [`RenderSourceFactory`].
+    ///
+    /// When unset, any `Render3D` node fails source-shape resolution
+    /// with an `Unsupported` error pointing at this very method.
+    pub fn with_render_source_factory(mut self, f: RenderSourceFactory) -> Self {
+        self.render_source_factory = Some(f);
         self
     }
 
@@ -486,18 +534,21 @@ impl<'a> Executor<'a> {
                     leaf_is_frames = true;
                     break (source.clone(), ResolvedSelector::any());
                 }
-                DagNode::Render3D { .. } => {
-                    // Phase C-2 scaffold — the executor cannot resolve
-                    // the named backend until the consumer (e.g.
-                    // `oxideav-cli-convert`) wires a render-backend
-                    // lookup callback through Phase C-3. Refuse here
-                    // rather than further down so the error message
-                    // points at the configuration mismatch directly.
-                    return Err(Error::unsupported(
-                        "Render3D DAG node is configured but no render backend registry has \
-                         been wired into the executor — the consumer (oxideav-cli-convert) \
-                         must install a backend lookup callback first",
-                    ));
+                DagNode::Render3D {
+                    source, backend, ..
+                } => {
+                    // Phase C-3c: `resolve_source_shapes` runs ahead of
+                    // `build_track_runtime` and either rewrites
+                    // `Render3D` nodes to `FrameSource { source }` (when
+                    // a `render_source_factory` is installed) or fails
+                    // up front with an `Unsupported` error. Reaching
+                    // this arm means the resolver was skipped — an
+                    // internal pipeline-resolver bug, not a user error.
+                    return Err(Error::other(format!(
+                        "internal: Render3D node for source {source:?} (backend \
+                         {backend:?}) reached build_track_runtime — \
+                         resolve_source_shapes should have rewritten it first"
+                    )));
                 }
                 DagNode::Select { upstream, selector } => match dag.node(*upstream) {
                     DagNode::Demuxer { source } | DagNode::PacketSource { source } => {
@@ -646,9 +697,19 @@ impl<'a> Executor<'a> {
         // the same source appears in multiple places (alias inlining,
         // multi-track outputs all reading the same input).
         let mut uris: Vec<(usize, String)> = Vec::new();
+        // Render3D nodes carry an extra backend + opts payload that
+        // doesn't live on `Demuxer` — collect them separately so the
+        // factory call sees the full argument triple verbatim.
+        let mut render_nodes: Vec<(usize, String, String, serde_json::Value)> = Vec::new();
         for (idx, node) in dag.nodes().iter().enumerate() {
-            if let DagNode::Demuxer { source } = node {
-                uris.push((idx, source.clone()));
+            match node {
+                DagNode::Demuxer { source } => uris.push((idx, source.clone())),
+                DagNode::Render3D {
+                    source,
+                    backend,
+                    opts,
+                } => render_nodes.push((idx, source.clone(), backend.clone(), opts.clone())),
+                _ => {}
             }
         }
         let mut opened: HashMap<String, SourcePump> = HashMap::new();
@@ -673,6 +734,40 @@ impl<'a> Executor<'a> {
                     };
                 }
             }
+        }
+        // Phase C-3c: materialise Render3D leaves through the installed
+        // `render_source_factory`. Each (source, backend, opts) triple
+        // becomes a `SourcePump::Frames` keyed by source URI; the DAG
+        // node is rewritten in place to `FrameSource { source }` so the
+        // rest of the executor treats it as any other frame leaf.
+        //
+        // Multiple `Render3D` nodes sharing the same `source` URI are a
+        // user error — the factory would be called twice and we'd have
+        // to pick which pump wins. Detect and refuse explicitly.
+        for (node_idx, source, backend, opts) in render_nodes {
+            let factory = self.render_source_factory.as_ref().ok_or_else(|| {
+                Error::unsupported(format!(
+                    "Render3D node for source {source:?} (backend {backend:?}) requires a \
+                     render_source_factory on the Executor — install via \
+                     Executor::with_render_source_factory(...)"
+                ))
+            })?;
+            if opened.contains_key(&source) {
+                return Err(Error::invalid(format!(
+                    "Render3D node for source {source:?} collides with an already-opened \
+                     source URI; each source URI must be unique in the DAG"
+                )));
+            }
+            let frames = factory(&source, &backend, &opts)?;
+            let streams = vec![synth_stream_info(frames.params())];
+            opened.insert(
+                source.clone(),
+                SourcePump::Frames {
+                    source: frames,
+                    streams,
+                },
+            );
+            dag.nodes_mut()[node_idx] = DagNode::FrameSource { source };
         }
         Ok(opened)
     }
@@ -2025,4 +2120,178 @@ mod tests {
     // Legacy `build_video_filter` / `build_audio_filter` unit tests
     // were removed when filter dispatch moved to `FilterRegistry`.
     // See `filter_registry::tests::*` for the current equivalents.
+
+    // ───────────────── Phase C-3c: render_source_factory ─────────────────
+    //
+    // The wiring under test is `Executor::resolve_source_shapes`:
+    //  - With NO factory installed, a `DagNode::Render3D` leaf fails with
+    //    `Error::Unsupported` pointing at `with_render_source_factory`.
+    //  - With a stub factory installed, the DAG node is rewritten to
+    //    `DagNode::FrameSource { source }` and the returned map carries a
+    //    `SourcePump::Frames { source, streams }` whose `streams` was
+    //    synthesised from the stub's `params()`.
+    //
+    // The tests bypass `Job::from_json` (no JSON producer for `Render3D`
+    // exists yet) and build the DAG by hand using `Dag::push`.
+
+    use crate::dag::NodeId;
+    use oxideav_core::{AudioFrame, CodecId, CodecParameters, SampleFormat};
+
+    /// Minimal stub: one audio frame, then EOF. Tiny on purpose so the
+    /// test asserts the wiring (factory invocation + DAG rewrite), not
+    /// codec-shaped behaviour.
+    struct StubFrameSource {
+        params: CodecParameters,
+        emitted: bool,
+    }
+
+    impl StubFrameSource {
+        fn new() -> Self {
+            let mut params = CodecParameters::audio(CodecId::new("pcm_s16le"));
+            params.sample_rate = Some(8_000);
+            params.channels = Some(1);
+            params.sample_format = Some(SampleFormat::S16);
+            Self {
+                params,
+                emitted: false,
+            }
+        }
+    }
+
+    impl FrameSource for StubFrameSource {
+        fn params(&self) -> &CodecParameters {
+            &self.params
+        }
+        fn next_frame(&mut self) -> Result<Frame> {
+            if self.emitted {
+                return Err(Error::Eof);
+            }
+            self.emitted = true;
+            Ok(Frame::Audio(AudioFrame {
+                samples: 1,
+                pts: Some(0),
+                data: vec![vec![0u8, 0u8]],
+            }))
+        }
+    }
+
+    /// Hand-build a one-node DAG containing exactly a `Render3D` leaf
+    /// plus a stub `Mux` root, so `resolve_source_shapes` has something
+    /// to walk. We don't run `Executor::run` end-to-end because that
+    /// would also need a real codec registry — `resolve_source_shapes`
+    /// is the wiring under test here.
+    fn dag_with_render3d(source: &str, backend: &str) -> Dag {
+        let mut dag = Dag::default();
+        let render = dag.push(DagNode::Render3D {
+            source: source.to_string(),
+            backend: backend.to_string(),
+            opts: serde_json::json!({"width": 4, "height": 4}),
+        });
+        let mux = dag.push(DagNode::Mux {
+            target: "out".to_string(),
+            tracks: vec![MuxTrack {
+                kind: oxideav_core::MediaType::Video,
+                upstream: render,
+                copy: false,
+            }],
+        });
+        dag.roots.insert("out".to_string(), mux);
+        dag
+    }
+
+    #[test]
+    fn render3d_without_factory_errors_with_pointer_to_install_api() {
+        // No `with_render_source_factory` call → `resolve_source_shapes`
+        // must report `Unsupported` and name the API the caller should
+        // reach for. We use `Job::from_json` only to obtain a valid
+        // `Job` value to satisfy `Executor::new`; the actual DAG under
+        // test is built by hand below.
+        let job = Job::from_json(r#"{"out.wav": {"audio": [{"from": "in.wav"}]}}"#).unwrap();
+        let ctx = RuntimeContext::new();
+        let executor = Executor::new(&job, &ctx);
+        let mut dag = dag_with_render3d("scene.gltf", "scanline");
+        let err = match executor.resolve_source_shapes(&mut dag) {
+            Ok(_) => panic!("resolve_source_shapes should fail with no factory"),
+            Err(e) => e,
+        };
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("render_source_factory"),
+            "error message must name the factory slot, got: {msg}"
+        );
+        assert!(
+            msg.contains("with_render_source_factory"),
+            "error message must point at the install API, got: {msg}"
+        );
+        // Confirm error kind is Unsupported, not Other / Invalid.
+        match err {
+            Error::Unsupported(_) => {}
+            other => panic!("expected Error::Unsupported, got {other:?}"),
+        }
+        // DAG must NOT have been mutated when resolution fails.
+        match dag.node(NodeId(0)) {
+            DagNode::Render3D {
+                source, backend, ..
+            } => {
+                assert_eq!(source, "scene.gltf");
+                assert_eq!(backend, "scanline");
+            }
+            other => panic!("DAG was mutated despite factory error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render3d_with_factory_rewrites_to_frame_source_pump() {
+        // A stub factory is installed: it must be invoked with the
+        // exact (source, backend, opts) triple from the DAG node, the
+        // returned `FrameSource` must wind up wrapped in a
+        // `SourcePump::Frames`, and the DAG node must be rewritten to
+        // `FrameSource { source }` so downstream resolution treats it
+        // as a normal frame leaf.
+        use std::sync::Arc;
+        use std::sync::Mutex;
+        let captured: Arc<Mutex<Option<(String, String, serde_json::Value)>>> =
+            Arc::new(Mutex::new(None));
+        let captured_c = captured.clone();
+        let factory: RenderSourceFactory = Box::new(move |s, b, o| {
+            *captured_c.lock().unwrap() = Some((s.to_string(), b.to_string(), o.clone()));
+            Ok(Box::new(StubFrameSource::new()) as Box<dyn FrameSource>)
+        });
+
+        let job = Job::from_json(r#"{"out.wav": {"audio": [{"from": "in.wav"}]}}"#).unwrap();
+        let ctx = RuntimeContext::new();
+        let executor = Executor::new(&job, &ctx).with_render_source_factory(factory);
+        let mut dag = dag_with_render3d("scene.gltf", "scanline");
+        let opened = executor
+            .resolve_source_shapes(&mut dag)
+            .expect("resolve should succeed with factory installed");
+
+        // (a) factory invoked exactly once with the verbatim triple
+        let cap = captured.lock().unwrap().clone();
+        let (s, b, o) = cap.expect("factory was not called");
+        assert_eq!(s, "scene.gltf");
+        assert_eq!(b, "scanline");
+        assert_eq!(o["width"], 4);
+        assert_eq!(o["height"], 4);
+
+        // (b) opened map keyed by source URI, value is Frames pump with
+        // a synthesised single-stream descriptor
+        assert_eq!(opened.len(), 1);
+        let pump = opened.get("scene.gltf").expect("pump for source uri");
+        match pump {
+            SourcePump::Frames { streams, .. } => {
+                assert_eq!(streams.len(), 1);
+                assert_eq!(streams[0].index, 0);
+                assert_eq!(streams[0].params.codec_id.as_str(), "pcm_s16le");
+            }
+            SourcePump::Demuxer(_) => panic!("expected SourcePump::Frames, got Demuxer"),
+            SourcePump::Packets(_) => panic!("expected SourcePump::Frames, got Packets"),
+        }
+
+        // (c) DAG node rewritten in place to FrameSource { source }
+        match dag.node(NodeId(0)) {
+            DagNode::FrameSource { source } => assert_eq!(source, "scene.gltf"),
+            other => panic!("expected FrameSource after resolve, got {other:?}"),
+        }
+    }
 }

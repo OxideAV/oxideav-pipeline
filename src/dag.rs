@@ -155,7 +155,7 @@ impl Dag {
         &mut self.nodes
     }
 
-    fn push(&mut self, node: DagNode) -> NodeId {
+    pub(crate) fn push(&mut self, node: DagNode) -> NodeId {
         let id = NodeId(self.nodes.len());
         self.nodes.push(node);
         id
