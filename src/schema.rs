@@ -100,6 +100,23 @@ pub enum TrackInput {
     /// untagged-enum dispatch so the `convert` key wins over a hypothetical
     /// `filter: "convert"` (not used today, but keeps the routing honest).
     Convert(ConvertNode),
+    /// 3D-asset source: open `source` (URI / path) as a Scene3D via the
+    /// caller-supplied Mesh3D registry, then rasterise via the renderer
+    /// named by `backend` (e.g. `"scanline"`). The executor handles this
+    /// by calling the user-installed
+    /// [`crate::executor::RenderSourceFactory`] closure on the
+    /// [`crate::executor::Executor`] — pipeline does not depend on any
+    /// specific renderer crate; the consumer installs the factory at
+    /// runtime.
+    ///
+    /// In JSON jobs this is `{ "render3d": "<uri>", "backend": "scanline",
+    /// "opts": { ... } }`. `opts` is opaque to pipeline — it's
+    /// round-tripped verbatim through the factory.
+    ///
+    /// Listed before `Filter` in the untagged dispatch so the unique
+    /// `render3d` discriminator field is matched before serde considers
+    /// the `filter` shape.
+    Render3D(Render3DNode),
     /// `{"filter": "name", "params": {...}, "input": <TrackInput>}`.
     Filter(FilterNode),
 }
@@ -139,6 +156,27 @@ pub struct ConvertNode {
     pub convert: String,
     /// Upstream node.
     pub input: Box<TrackInput>,
+}
+
+/// [`TrackInput::Render3D`] payload.
+///
+/// JSON shape: `{ "render3d": "<uri>", "backend": "<name>", "opts": { ... } }`.
+/// The `render3d` field serves as the discriminator for the untagged
+/// [`TrackInput`] enum — see the variant docs for details.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Render3DNode {
+    /// Source URI / path for the 3D scene file.
+    #[serde(rename = "render3d")]
+    pub source: String,
+    /// Backend name, e.g. `"scanline"`. Looked up at runtime via the
+    /// installed
+    /// [`RenderSourceFactory`](crate::executor::RenderSourceFactory).
+    pub backend: String,
+    /// Opaque opts JSON; round-tripped verbatim through the factory.
+    /// The consumer's factory deserialises this back into its own
+    /// renderer options struct.
+    #[serde(default, skip_serializing_if = "is_null_or_empty")]
+    pub opts: serde_json::Value,
 }
 
 /// Parse an ffmpeg-style pixel format name (case-insensitive) into a
@@ -437,6 +475,94 @@ mod tests {
     fn rejects_non_object_top_level() {
         assert!(Job::from_json("42").is_err());
         assert!(Job::from_json("[]").is_err());
+    }
+
+    #[test]
+    fn parses_render3d_variant_with_opts() {
+        // Phase C-3f schema bridge: a track whose input is the new
+        // Render3D variant must parse into `TrackInput::Render3D` and
+        // carry the `source`, `backend`, and `opts` fields verbatim.
+        let j = Job::from_json(
+            r#"{
+                "out.mp4": {
+                    "video": [{
+                        "render3d": "scene.gltf",
+                        "backend": "scanline",
+                        "opts": {"width": 64, "height": 64},
+                        "codec": "h264"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let track = &j.outputs["out.mp4"].video[0];
+        match &track.input {
+            TrackInput::Render3D(node) => {
+                assert_eq!(node.source, "scene.gltf");
+                assert_eq!(node.backend, "scanline");
+                assert_eq!(node.opts["width"], 64);
+                assert_eq!(node.opts["height"], 64);
+            }
+            other => panic!("expected TrackInput::Render3D, got {other:?}"),
+        }
+        assert_eq!(track.codec.as_deref(), Some("h264"));
+    }
+
+    #[test]
+    fn render3d_node_round_trips_through_json() {
+        // Direct round-trip of the Render3DNode struct itself, so we can
+        // assert the serde shape (discriminator key + sibling fields)
+        // without relying on the surrounding TrackSpec flatten.
+        let node = Render3DNode {
+            source: "in.gltf".into(),
+            backend: "scanline".into(),
+            opts: serde_json::json!({"width": 64, "height": 64}),
+        };
+        let s = serde_json::to_string(&node).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        // The discriminator key on the wire is `render3d`, not `source`.
+        assert_eq!(v["render3d"], "in.gltf");
+        assert_eq!(v["backend"], "scanline");
+        assert_eq!(v["opts"]["width"], 64);
+        let back: Render3DNode = serde_json::from_value(v).unwrap();
+        assert_eq!(back, node);
+    }
+
+    #[test]
+    fn render3d_variant_dispatches_via_untagged_discriminator() {
+        // Parsing the bare TrackInput must route the `render3d` key to
+        // the Render3D variant ahead of Filter / Source / Convert.
+        let v = serde_json::json!({
+            "render3d": "x.gltf",
+            "backend": "scanline"
+        });
+        let ti: TrackInput = serde_json::from_value(v).unwrap();
+        match ti {
+            TrackInput::Render3D(n) => {
+                assert_eq!(n.source, "x.gltf");
+                assert_eq!(n.backend, "scanline");
+                assert!(n.opts.is_null() || n.opts.as_object().is_some_and(|m| m.is_empty()));
+            }
+            other => panic!("expected Render3D, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pre_existing_track_inputs_still_parse_unchanged() {
+        // Backward-compat guard: adding the Render3D variant must NOT
+        // change how `from` / `filter` / `convert` shaped JSON dispatches.
+        let src: TrackInput = serde_json::from_str(r#"{"from": "in.wav"}"#).unwrap();
+        assert!(matches!(src, TrackInput::Source(_)));
+
+        let flt: TrackInput = serde_json::from_str(
+            r#"{"filter": "volume", "params": {}, "input": {"from": "in.wav"}}"#,
+        )
+        .unwrap();
+        assert!(matches!(flt, TrackInput::Filter(_)));
+
+        let cvt: TrackInput =
+            serde_json::from_str(r#"{"convert": "yuv420p", "input": {"from": "in.mp4"}}"#).unwrap();
+        assert!(matches!(cvt, TrackInput::Convert(_)));
     }
 
     #[test]

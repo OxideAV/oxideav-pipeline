@@ -78,6 +78,24 @@ impl Job {
                     .map_err(|e| Error::invalid(format!("job: {ctx}: convert: {e}")))?;
                 self.check_refs_in_input(ctx, c.input.as_ref())
             }
+            TrackInput::Render3D(node) => {
+                // Phase C-3f: structural validation only. The backend
+                // name + scene URI are opaque strings here; resolution
+                // happens at executor run-time via the installed
+                // `RenderSourceFactory`. We reject empty fields up
+                // front so the failure points at the track context.
+                if node.source.trim().is_empty() {
+                    return Err(Error::invalid(format!(
+                        "job: {ctx}: render3d node has empty `render3d` source"
+                    )));
+                }
+                if node.backend.trim().is_empty() {
+                    return Err(Error::invalid(format!(
+                        "job: {ctx}: render3d node has empty `backend`"
+                    )));
+                }
+                Ok(())
+            }
         }
     }
 
@@ -140,6 +158,10 @@ fn walk_input(input: &TrackInput, out: &mut Vec<String>) {
         }
         TrackInput::Filter(f) => walk_input(f.input.as_ref(), out),
         TrackInput::Convert(c) => walk_input(c.input.as_ref(), out),
+        TrackInput::Render3D(_) => {
+            // Render3D is a leaf — it carries no upstream `TrackInput`
+            // sub-tree, so there are no alias references to collect.
+        }
     }
 }
 

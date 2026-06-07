@@ -21,11 +21,11 @@ pub mod staged;
 pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
-pub use executor::{Executor, ExecutorHandle, JobSink};
+pub use executor::{Executor, ExecutorHandle, JobSink, RenderSourceFactory};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
 pub use schema::{
-    parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, SourceRef, StreamSelector,
-    TrackInput, TrackSpec,
+    parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, Render3DNode, SourceRef,
+    StreamSelector, TrackInput, TrackSpec,
 };
 pub use selection::{
     make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,

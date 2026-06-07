@@ -7,21 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `TrackInput::Render3D { source, backend, opts }` schema variant +
+  `Render3DNode` payload — Phase C-3f schema bridge from `Job` to
+  `DagNode::Render3D`. JSON shape:
+  `{ "render3d": "<uri>", "backend": "<name>", "opts": { ... } }`.
+  `Job::build_input` lowers this directly to the runtime DAG node;
+  the executor still relies on the user-installed
+  `RenderSourceFactory` (Phase C-3c) to instantiate the actual
+  `FrameSource`. Unlocks consumer crates (e.g. oxideav-cli-convert)
+  building Jobs that produce Render3D nodes via the standard
+  `Job::to_dag()` path.
+
 ## [0.1.9](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.8...v0.1.9) - 2026-06-07
 
 ### Added
 
 - render_source_factory callback — Phase C-3c wires Render3D execution
-
-### Added
-
-- `RenderSourceFactory` type alias + optional `render_source_factory`
-  slot on the runtime context (RunContext or equivalent). Phase C-3c
-  of the render-pipeline integration. When set, `DagNode::Render3D`
-  executor arms call the closure to instantiate a `FrameSource`
-  without pipeline depending on `oxideav-render` directly. When unset,
-  Render3D nodes still error cleanly with a message pointing at the
-  installation API.
 
 ## [0.1.8](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.7...v0.1.8) - 2026-06-07
 

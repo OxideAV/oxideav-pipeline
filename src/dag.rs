@@ -331,6 +331,17 @@ impl Job {
                     target,
                 }))
             }
+            // Phase C-3f: schema bridge from `TrackInput::Render3D` to the
+            // `DagNode::Render3D` leaf the executor already knows how to
+            // resolve via the installed `RenderSourceFactory`. The
+            // selector is consumed by the executor's run-loop directly
+            // off the synthesised single-stream descriptor — no `Select`
+            // node is needed here (the source has exactly one stream).
+            TrackInput::Render3D(node) => Ok(dag.push(DagNode::Render3D {
+                source: node.source.clone(),
+                backend: node.backend.clone(),
+                opts: node.opts.clone(),
+            })),
         }
     }
 
@@ -686,6 +697,95 @@ mod tests {
             }
             other => panic!("expected Render3D, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn render3d_track_input_lowers_to_render3d_dag_node() {
+        // Phase C-3f: a `Job` whose track input is `TrackInput::Render3D`
+        // must produce a `Dag` containing a `DagNode::Render3D` leaf
+        // carrying the same (source, backend, opts) triple verbatim.
+        // We also assert that wiring a codec around it inserts the
+        // expected `Encode` node above the Render3D leaf (no `Decode`
+        // — Render3D is frame-producing).
+        let j = Job::from_json(
+            r#"{
+                "out.mp4": {
+                    "video": [{
+                        "render3d": "scene.gltf",
+                        "backend": "scanline",
+                        "opts": {"width": 64, "height": 64},
+                        "codec": "h264"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let dag = j.to_dag().unwrap();
+        let root = dag.roots["out.mp4"];
+        let tracks = match dag.node(root) {
+            DagNode::Mux { tracks, .. } => tracks,
+            n => panic!("expected Mux root, got {n:?}"),
+        };
+        assert_eq!(tracks.len(), 1);
+        let enc_up = match dag.node(tracks[0].upstream) {
+            DagNode::Encode {
+                upstream, codec, ..
+            } => {
+                assert_eq!(codec, "h264");
+                *upstream
+            }
+            n => panic!("expected Encode above Render3D, got {n:?}"),
+        };
+        match dag.node(enc_up) {
+            DagNode::Render3D {
+                source,
+                backend,
+                opts,
+            } => {
+                assert_eq!(source, "scene.gltf");
+                assert_eq!(backend, "scanline");
+                assert_eq!(opts["width"], 64);
+                assert_eq!(opts["height"], 64);
+            }
+            n => panic!("expected Render3D leaf, got {n:?}"),
+        }
+        // Frame-producing leaf → not a copy path.
+        assert!(!tracks[0].copy);
+    }
+
+    #[test]
+    fn render3d_track_input_no_codec_to_playback_sink_skips_decode() {
+        // Sanity check: a no-codec `@display` job over a Render3D source
+        // must NOT insert a Decode node — the source already emits
+        // frames. The Mux track upstream is the bare `Render3D` leaf
+        // and `copy` is false (frame-shape, not packet-copy).
+        let j = Job::from_json(
+            r#"{
+                "@display": {
+                    "video": [{
+                        "render3d": "scene.gltf",
+                        "backend": "scanline"
+                    }]
+                }
+            }"#,
+        )
+        .unwrap();
+        let dag = j.to_dag().unwrap();
+        let root = dag.roots["@display"];
+        let tracks = match dag.node(root) {
+            DagNode::Mux { tracks, .. } => tracks,
+            n => panic!("expected Mux root, got {n:?}"),
+        };
+        match dag.node(tracks[0].upstream) {
+            DagNode::Render3D {
+                source, backend, ..
+            } => {
+                assert_eq!(source, "scene.gltf");
+                assert_eq!(backend, "scanline");
+            }
+            n => panic!("expected bare Render3D leaf, got {n:?}"),
+        }
+        assert!(!tracks[0].copy);
     }
 
     #[test]
