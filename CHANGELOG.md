@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.8](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.7...v0.1.8) - 2026-06-07
+
+### Added
+
+- DagNode::Render3D — Phase C-2 source variant for the 3D-render path
+
+### Other
+
+- surface copy-stage packets_copied via Progress
+- surface encoder packets_encoded via Progress
+- retry EOF Progress send to ride out backed-up receivers
+- surface demuxer packets_read via Progress
+- handle SourceOutput::MultiTitle + non-exhaustive wildcard
+- surface decoder-skip count via Progress + ExecutorStats
+- bump elapsed_micros drain + deadline timeouts for slow CI
+- surface wall-clock progress via Progress::elapsed_micros
+- surface in-flight packet bytes via Progress::queue_bytes
+- memory-bounded packet queue (Executor::with_max_queue_bytes)
+- configurable per-track channel-depth budget
+- seek_with_generation returns the assigned generation
+- extend BarrierKind::SeekFlush with landed_pts + time_base
+- drain sink channel in background to unblock executor.finish
+- graceful seek failure via BarrierKind::SeekRejected
+
 ### Added
 
 - `DagNode::Render3D { source, backend, opts }` variant — Phase C-2
