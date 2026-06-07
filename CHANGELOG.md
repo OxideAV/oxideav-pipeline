@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `DagNode::Render3D { source, backend, opts }` variant — Phase C-2
+  scaffold for the 3D-scene → raster source path. Executor arm
+  currently returns `Unsupported` until the consumer wires a backend
+  lookup callback in Phase C-3. The pipeline DOES NOT depend on
+  `oxideav-render`; backend resolution happens at run time via name.
 - `Progress::packets_copied` — copy-stage progress visibility on the
   pipelined runner. The `Progress` event returned by
   `ExecutorHandle::try_progress()` now carries the cumulative count of

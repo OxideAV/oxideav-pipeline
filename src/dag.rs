@@ -39,6 +39,23 @@ pub enum DagNode {
     /// Downstream `Filter` / `PixConvert` / `Encode` nodes consume frames
     /// directly without an intervening `Decode` node.
     FrameSource { source: String },
+    /// 3D-asset source: open `source` (URI / path) as a Scene3D via the
+    /// caller-supplied Mesh3D registry, then rasterise via the renderer
+    /// named by `backend` (e.g. `"scanline"`). Emits `Frame::Video`
+    /// downstream — pipeline treats this as a `FrameSource` shape so
+    /// downstream `Filter` / `PixConvert` / `Encode` consume rendered
+    /// frames directly without an intervening `Decode` node.
+    ///
+    /// Like `Demuxer { source }`, the executor resolves the actual
+    /// backend lookup at run-time — pipeline carries the backend NAME
+    /// (string) and opaque opts JSON, not an `oxideav-render` type, so
+    /// the dependency arrow stays one-way (pipeline does not depend on
+    /// `oxideav-render`).
+    Render3D {
+        source: String,
+        backend: String,
+        opts: serde_json::Value,
+    },
     /// Constrain upstream streams to those matching `selector`.
     Select {
         upstream: NodeId,
@@ -475,6 +492,15 @@ impl Dag {
             DagNode::FrameSource { source } => {
                 out.push_str(&format!("{pad}frame-source({source})\n"));
             }
+            DagNode::Render3D {
+                source,
+                backend,
+                opts,
+            } => {
+                out.push_str(&format!(
+                    "{pad}render-3d({source}, backend={backend}, {opts})\n"
+                ));
+            }
             DagNode::Select { upstream, selector } => {
                 out.push_str(&format!(
                     "{pad}select(kind={:?}, index={:?})\n",
@@ -628,6 +654,37 @@ mod tests {
                 _ => panic!(),
             },
             n => panic!("unexpected top node {n:?}"),
+        }
+    }
+
+    #[test]
+    fn render3d_variant_round_trips_clone_and_debug() {
+        // Phase C-2 scaffold: the variant is constructable, clonable,
+        // and Debug-printable. The actual executor arm returns
+        // `Unsupported` until a backend lookup callback is wired in
+        // Phase C-3; this test only asserts the data-shape compiles
+        // and round-trips through the derive impls.
+        let node = DagNode::Render3D {
+            source: "in.gltf".into(),
+            backend: "scanline".into(),
+            opts: serde_json::json!({"width": 64, "height": 64}),
+        };
+        let cloned = node.clone();
+        let dbg_orig = format!("{node:?}");
+        let dbg_clone = format!("{cloned:?}");
+        assert_eq!(dbg_orig, dbg_clone);
+        match cloned {
+            DagNode::Render3D {
+                source,
+                backend,
+                opts,
+            } => {
+                assert_eq!(source, "in.gltf");
+                assert_eq!(backend, "scanline");
+                assert_eq!(opts["width"], 64);
+                assert_eq!(opts["height"], 64);
+            }
+            other => panic!("expected Render3D, got {other:?}"),
         }
     }
 

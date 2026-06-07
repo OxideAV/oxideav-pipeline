@@ -486,6 +486,19 @@ impl<'a> Executor<'a> {
                     leaf_is_frames = true;
                     break (source.clone(), ResolvedSelector::any());
                 }
+                DagNode::Render3D { .. } => {
+                    // Phase C-2 scaffold — the executor cannot resolve
+                    // the named backend until the consumer (e.g.
+                    // `oxideav-cli-convert`) wires a render-backend
+                    // lookup callback through Phase C-3. Refuse here
+                    // rather than further down so the error message
+                    // points at the configuration mismatch directly.
+                    return Err(Error::unsupported(
+                        "Render3D DAG node is configured but no render backend registry has \
+                         been wired into the executor — the consumer (oxideav-cli-convert) \
+                         must install a backend lookup callback first",
+                    ));
+                }
                 DagNode::Select { upstream, selector } => match dag.node(*upstream) {
                     DagNode::Demuxer { source } | DagNode::PacketSource { source } => {
                         break (source.clone(), selector.clone());
