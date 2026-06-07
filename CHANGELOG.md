@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.9](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.8...v0.1.9) - 2026-06-07
+
+### Added
+
+- render_source_factory callback — Phase C-3c wires Render3D execution
+
 ### Added
 
 - `RenderSourceFactory` type alias + optional `render_source_factory`
