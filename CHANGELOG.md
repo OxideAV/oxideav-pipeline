@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.10](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.9...v0.1.10) - 2026-06-07
+
+### Added
+
+- TrackInput::Render3D — Phase C-3f schema bridge from Job to Render3D DAG
+
 ### Added
 
 - `TrackInput::Render3D { source, backend, opts }` schema variant +
