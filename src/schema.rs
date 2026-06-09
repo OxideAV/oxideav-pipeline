@@ -179,6 +179,125 @@ pub struct Render3DNode {
     pub opts: serde_json::Value,
 }
 
+impl TrackInput {
+    /// Discriminator tag for diagnostics. Stable string per variant —
+    /// useful for log lines and error messages that need to name the
+    /// node shape without printing the entire enum via `{:?}` (which
+    /// recurses through the upstream tree).
+    pub fn kind_str(&self) -> &'static str {
+        match self {
+            TrackInput::Source(_) => "source",
+            TrackInput::Filter(_) => "filter",
+            TrackInput::Convert(_) => "convert",
+            TrackInput::Render3D(_) => "render3d",
+        }
+    }
+
+    /// `true` when the node is a [`TrackInput::Source`] leaf.
+    pub fn is_source(&self) -> bool {
+        matches!(self, TrackInput::Source(_))
+    }
+
+    /// `true` when the node is a [`TrackInput::Filter`] wrapper.
+    pub fn is_filter(&self) -> bool {
+        matches!(self, TrackInput::Filter(_))
+    }
+
+    /// `true` when the node is a [`TrackInput::Convert`] wrapper.
+    pub fn is_convert(&self) -> bool {
+        matches!(self, TrackInput::Convert(_))
+    }
+
+    /// `true` when the node is a [`TrackInput::Render3D`] leaf.
+    pub fn is_render3d(&self) -> bool {
+        matches!(self, TrackInput::Render3D(_))
+    }
+
+    /// Borrow the [`SourceRef`] payload if this node is a `Source`,
+    /// else `None`. Returns the inner reference so callers can read
+    /// `from` without re-matching.
+    pub fn as_source(&self) -> Option<&SourceRef> {
+        match self {
+            TrackInput::Source(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// Borrow the [`FilterNode`] payload if this node is a `Filter`,
+    /// else `None`.
+    pub fn as_filter(&self) -> Option<&FilterNode> {
+        match self {
+            TrackInput::Filter(f) => Some(f),
+            _ => None,
+        }
+    }
+
+    /// Borrow the [`ConvertNode`] payload if this node is a `Convert`,
+    /// else `None`.
+    pub fn as_convert(&self) -> Option<&ConvertNode> {
+        match self {
+            TrackInput::Convert(c) => Some(c),
+            _ => None,
+        }
+    }
+
+    /// Borrow the [`Render3DNode`] payload if this node is a
+    /// `Render3D`, else `None`.
+    pub fn as_render3d(&self) -> Option<&Render3DNode> {
+        match self {
+            TrackInput::Render3D(n) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Borrow the direct upstream input of this node, if any.
+    ///
+    /// `Filter` and `Convert` are wrapper nodes that carry exactly one
+    /// upstream `TrackInput` (today — multi-input fan-in is a future
+    /// extension); both `Source` and `Render3D` are leaves and return
+    /// `None`. Use [`Self::leaf`] to descend all the way to the
+    /// terminal node in one call, or [`Self::walk`] to visit every
+    /// node along the chain.
+    pub fn upstream(&self) -> Option<&TrackInput> {
+        match self {
+            TrackInput::Filter(f) => Some(f.input.as_ref()),
+            TrackInput::Convert(c) => Some(c.input.as_ref()),
+            TrackInput::Source(_) | TrackInput::Render3D(_) => None,
+        }
+    }
+
+    /// Walk wrapper nodes (`Filter` / `Convert`) until a leaf
+    /// (`Source` / `Render3D`) is reached and return a borrow of the
+    /// leaf. The wrapper-chain depth is bounded by the JSON-parsed
+    /// schema, so the traversal is O(chain length) and never panics.
+    pub fn leaf(&self) -> &TrackInput {
+        let mut cur = self;
+        while let Some(up) = cur.upstream() {
+            cur = up;
+        }
+        cur
+    }
+
+    /// Visit every node in the wrapper chain in order from outermost
+    /// (this node) to the terminal leaf. The visitor sees each node
+    /// exactly once and the iteration order matches `self`,
+    /// `self.upstream()`, `self.upstream().upstream()`, …, leaf.
+    ///
+    /// Convenient for collectors that need to inspect every filter +
+    /// convert hop on a track without writing a recursive helper —
+    /// see [`crate::validate`] for the analogous internal walker.
+    pub fn walk<F: FnMut(&TrackInput)>(&self, mut f: F) {
+        let mut cur = self;
+        loop {
+            f(cur);
+            match cur.upstream() {
+                Some(up) => cur = up,
+                None => break,
+            }
+        }
+    }
+}
+
 /// Parse an ffmpeg-style pixel format name (case-insensitive) into a
 /// [`PixelFormat`]. Extend the match arms as new variants land in the
 /// enum — unknown names return an [`Error::InvalidData`].
@@ -576,5 +695,171 @@ mod tests {
         let t = &j.outputs["o.mkv"].video[0];
         assert_eq!(t.codec.as_deref(), Some("h264"));
         assert_eq!(t.params, serde_json::json!({"crf": 23}));
+    }
+
+    // ─────── TrackInput typed-accessor primitives (r266) ───────
+
+    fn ti_source(from: &str) -> TrackInput {
+        TrackInput::Source(SourceRef { from: from.into() })
+    }
+    fn ti_filter(name: &str, upstream: TrackInput) -> TrackInput {
+        TrackInput::Filter(FilterNode {
+            filter: name.into(),
+            params: serde_json::Value::Null,
+            input: Box::new(upstream),
+        })
+    }
+    fn ti_convert(target: &str, upstream: TrackInput) -> TrackInput {
+        TrackInput::Convert(ConvertNode {
+            convert: target.into(),
+            input: Box::new(upstream),
+        })
+    }
+    fn ti_render3d(source: &str, backend: &str) -> TrackInput {
+        TrackInput::Render3D(Render3DNode {
+            source: source.into(),
+            backend: backend.into(),
+            opts: serde_json::Value::Null,
+        })
+    }
+
+    #[test]
+    fn track_input_kind_str_covers_every_variant() {
+        assert_eq!(ti_source("a").kind_str(), "source");
+        assert_eq!(ti_filter("v", ti_source("a")).kind_str(), "filter");
+        assert_eq!(ti_convert("yuv420p", ti_source("a")).kind_str(), "convert");
+        assert_eq!(ti_render3d("s.gltf", "scanline").kind_str(), "render3d");
+    }
+
+    #[test]
+    fn track_input_is_predicates_match_variant() {
+        let s = ti_source("a");
+        assert!(s.is_source());
+        assert!(!s.is_filter());
+        assert!(!s.is_convert());
+        assert!(!s.is_render3d());
+
+        let f = ti_filter("v", ti_source("a"));
+        assert!(f.is_filter());
+        assert!(!f.is_source());
+
+        let c = ti_convert("yuv420p", ti_source("a"));
+        assert!(c.is_convert());
+        assert!(!c.is_filter());
+
+        let r = ti_render3d("s.gltf", "scanline");
+        assert!(r.is_render3d());
+        assert!(!r.is_source());
+    }
+
+    #[test]
+    fn track_input_as_returns_some_on_match_none_otherwise() {
+        let s = ti_source("a.wav");
+        assert_eq!(s.as_source().map(|x| x.from.as_str()), Some("a.wav"));
+        assert!(s.as_filter().is_none());
+        assert!(s.as_convert().is_none());
+        assert!(s.as_render3d().is_none());
+
+        let f = ti_filter("volume", ti_source("a"));
+        assert_eq!(f.as_filter().map(|x| x.filter.as_str()), Some("volume"));
+        assert!(f.as_source().is_none());
+
+        let c = ti_convert("yuv420p", ti_source("a"));
+        assert_eq!(c.as_convert().map(|x| x.convert.as_str()), Some("yuv420p"));
+        assert!(c.as_render3d().is_none());
+
+        let r = ti_render3d("s.gltf", "scanline");
+        assert_eq!(r.as_render3d().map(|x| x.source.as_str()), Some("s.gltf"));
+        assert!(r.as_filter().is_none());
+    }
+
+    #[test]
+    fn track_input_upstream_descends_one_wrapper_at_a_time() {
+        // source / render3d are leaves — upstream() is None.
+        assert!(ti_source("a").upstream().is_none());
+        assert!(ti_render3d("x.gltf", "scanline").upstream().is_none());
+
+        // filter / convert each yield exactly their inner node, not the leaf.
+        let inner_src = ti_source("in.wav");
+        let f = ti_filter("volume", ti_filter("resample", inner_src));
+        let mid = f.upstream().expect("filter has an upstream");
+        assert_eq!(mid.kind_str(), "filter"); // not the leaf yet
+        let leaf = mid.upstream().expect("inner filter has an upstream");
+        assert!(leaf.is_source());
+    }
+
+    #[test]
+    fn track_input_leaf_descends_to_terminal_node() {
+        // Wrapper chains: convert(filter(filter(source))) — leaf is the source.
+        let chain = ti_convert(
+            "yuv420p",
+            ti_filter("scale", ti_filter("denoise", ti_source("a.mp4"))),
+        );
+        let leaf = chain.leaf();
+        assert!(leaf.is_source());
+        assert_eq!(leaf.as_source().unwrap().from, "a.mp4");
+
+        // A leaf node returns itself by value identity.
+        let s = ti_source("only.wav");
+        assert!(std::ptr::eq(s.leaf(), &s));
+    }
+
+    #[test]
+    fn track_input_leaf_terminates_at_render3d() {
+        // Render3D is also a leaf — leaf() walks the wrapper chain and stops
+        // there, even though there's a wrapper between the call site and it.
+        let chain = ti_filter("scale", ti_render3d("scene.gltf", "scanline"));
+        let leaf = chain.leaf();
+        assert!(leaf.is_render3d());
+        assert_eq!(leaf.as_render3d().unwrap().backend, "scanline");
+    }
+
+    #[test]
+    fn track_input_walk_visits_every_node_outer_to_leaf() {
+        let chain = ti_convert(
+            "yuv420p",
+            ti_filter("scale", ti_filter("denoise", ti_source("a.mp4"))),
+        );
+        let mut seen: Vec<&'static str> = Vec::new();
+        chain.walk(|node| seen.push(node.kind_str()));
+        assert_eq!(seen, vec!["convert", "filter", "filter", "source"]);
+    }
+
+    #[test]
+    fn track_input_walk_on_bare_leaf_visits_exactly_once() {
+        // A leaf-only node fires the visitor exactly once with the leaf itself.
+        let s = ti_source("only.wav");
+        let mut count = 0usize;
+        s.walk(|_| count += 1);
+        assert_eq!(count, 1);
+
+        let r = ti_render3d("only.gltf", "scanline");
+        let mut kinds: Vec<&'static str> = Vec::new();
+        r.walk(|n| kinds.push(n.kind_str()));
+        assert_eq!(kinds, vec!["render3d"]);
+    }
+
+    #[test]
+    fn track_input_walk_matches_manual_recursion() {
+        // The visitor sequence must equal what the historical
+        // hand-rolled match-then-recurse produced (see validate.rs
+        // walk_input) — same chain, same order.
+        let chain = ti_filter(
+            "outer",
+            ti_convert("rgb24", ti_filter("inner", ti_source("@in"))),
+        );
+        let mut via_walk: Vec<&'static str> = Vec::new();
+        chain.walk(|n| via_walk.push(n.kind_str()));
+
+        fn manual(node: &TrackInput, out: &mut Vec<&'static str>) {
+            out.push(node.kind_str());
+            if let Some(up) = node.upstream() {
+                manual(up, out);
+            }
+        }
+        let mut via_manual: Vec<&'static str> = Vec::new();
+        manual(&chain, &mut via_manual);
+
+        assert_eq!(via_walk, via_manual);
     }
 }

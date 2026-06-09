@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `TrackInput` typed accessors: `kind_str` (stable per-variant
+  discriminator string), `is_source` / `is_filter` / `is_convert` /
+  `is_render3d` predicates, `as_source` / `as_filter` / `as_convert` /
+  `as_render3d` borrowing accessors, `upstream` (single-step wrapper
+  descent), `leaf` (descend to terminal `Source` / `Render3D` node),
+  and `walk` (outer-to-leaf visitor). Consumers building lints,
+  diagnostics, or DAG transforms over a parsed `Job` no longer need
+  to re-match the enum themselves. Purely additive — no existing
+  variant / field / signature changed. Test count `schema::tests`
+  12 → 21.
+
 ## [0.1.10](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.9...v0.1.10) - 2026-06-07
 
 ### Added

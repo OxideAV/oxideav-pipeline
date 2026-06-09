@@ -203,6 +203,34 @@ that could silently desync with the demuxer's. The shorter
 callers that don't need correlation. See
 `tests/seek_with_generation.rs`.
 
+## TrackInput typed accessors
+
+The recursive [`TrackInput`] node carries four variants — `Source`,
+`Filter`, `Convert`, `Render3D` — and historically every consumer
+had to re-`match` the enum to inspect a node. The schema now
+exposes small typed primitives:
+
+- `kind_str() -> &'static str` — stable discriminator for log lines
+  + diagnostics (`"source"` / `"filter"` / `"convert"` / `"render3d"`).
+- `is_source()` / `is_filter()` / `is_convert()` / `is_render3d()` —
+  boolean predicates.
+- `as_source()` / `as_filter()` / `as_convert()` / `as_render3d()` —
+  borrowing accessors that return `Option<&Payload>` so callers can
+  read inner fields (`from`, `filter`, `convert`, `source`, …)
+  without re-matching.
+- `upstream() -> Option<&TrackInput>` — single-step descent through
+  the wrapper chain (`Filter` and `Convert` each carry exactly one
+  upstream input today; `Source` and `Render3D` are leaves).
+- `leaf() -> &TrackInput` — walk wrappers all the way to the
+  terminal node in one call.
+- `walk(|node| …)` — visitor that fires once per node from outermost
+  to leaf, matching the order historical hand-rolled recursions
+  use (see `validate::walk_input`).
+
+Purely additive: every existing match-on-`TrackInput` site keeps
+compiling. Consumer crates building lints, diagnostics, or DAG
+transforms over a parsed `Job` lose the boilerplate.
+
 ## Usage
 
 ```toml
