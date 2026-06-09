@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.11](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.10...v0.1.11) - 2026-06-09
+
+### Other
+
+- TrackInput typed accessors (kind_str / is_* / as_* / upstream / leaf / walk)
+- drop release-plz.toml — use release-plz defaults across the workspace
+
 ### Added
 
 - `TrackInput` typed accessors: `kind_str` (stable per-variant
