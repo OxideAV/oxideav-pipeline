@@ -35,12 +35,12 @@ for the contract test.
 `BarrierKind::SeekFlush` carries the demuxer's actual `landed_pts` plus
 the matching `time_base`, so consumers re-anchor at the precise landing
 position (typically the largest keyframe ≤ requested target) instead of
-guessing from the next packet's pts. Pre-fix the engine had to wait for
-the first post-barrier audio frame and re-anchor there — typically 50-
-200 ms off because video lands on a keyframe (≤ target) while audio
-lands on the next packet (≥ target). With the payload extension,
-position display reads the new position the instant the barrier fires.
-See `tests/seek_flush_carries_landed_pts.rs`.
+guessing from the next packet's pts. Without the carried payload an
+engine would have to wait for the first post-barrier audio frame and
+re-anchor there — typically 50-200 ms off because video lands on a
+keyframe (≤ target) while audio lands on the next packet (≥ target).
+With it, position display reads the new position the instant the barrier
+fires. See `tests/seek_flush_carries_landed_pts.rs`.
 
 ## Channel-depth budget
 
@@ -136,13 +136,11 @@ and on the serial path (no progress channel wired). See
 `Progress::packets_encoded` mirrors `ExecutorStats::packets_encoded`
 but is sampled on every `Progress` emission, so engines can
 distinguish a stalled encoder from a stalled decoder without waiting
-for EOF. Pre-r209 `packets_encoded` was only readable on the final
-stats snapshot returned by `Executor::stop()`, so a stress harness
-had to wait for the run to finish before it could even tell whether
-the encode stage had been running at all — and a CLI status bar
-couldn't surface "encoded N packets / decoded M frames" without
-instrumenting the encoder externally. With the field live-sampled,
-the diagnostic signature of a wedged encoder is `frames` and
+for EOF. Because the field is live-sampled rather than only readable on
+the final `Executor::stop()` snapshot, a CLI status bar can surface
+"encoded N packets / decoded M frames" without instrumenting the
+encoder externally, and the diagnostic signature of a wedged encoder is
+`frames` and
 `packets_read` both climbing while `packets_encoded` stays flat. The
 field is monotonically non-decreasing, the EOF emission's value
 matches the final `ExecutorStats::packets_encoded`, and the field is
@@ -170,11 +168,10 @@ channel wired) never populates it. See
 `Progress::packets_skipped` and `ExecutorStats::packets_skipped`
 expose the same cumulative count of packets the decoder swallowed
 under the per-packet error-tolerance contract (see the
-"Per-packet decoder error tolerance" section above). Pre-fix the
-only signal that a stream was quietly going bad was an `eprintln!`
-line on stderr — an engine had no programmatic way to display "N
-decode errors" on its status bar, and a stress harness had to
-reverse-engineer the skip count from `packets_read - frames_decoded`.
+"Per-packet decoder error tolerance" section above). This gives an
+engine a programmatic way to display "N decode errors" on its status
+bar instead of reverse-engineering the skip count from
+`packets_read - frames_decoded`.
 Both decode paths (`staged::run_decode_stage` and the inherent
 `executor::pump_packet`) increment a shared counter on every
 `send_packet` error and on every `receive_frame` error that landed
