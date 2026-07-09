@@ -89,16 +89,28 @@ pub struct TrackSpec {
 }
 
 /// Recursive input node.
-#[derive(Clone, Debug, Deserialize, Serialize)]
+///
+/// Deserialization is key-directed: the variant is picked by which
+/// discriminator key is present (`from` / `convert` / `render3d` /
+/// `filter`, checked in that priority order — mirroring the historical
+/// untagged declaration order). A `#[serde(untagged)]` derive would
+/// re-try every candidate variant at every nesting level, and because
+/// each `Filter` / `Convert` carries a recursive `input`, that made
+/// parse cost grow EXPONENTIALLY with filter-chain depth — a 64-deep
+/// chain effectively never finished parsing. See the manual
+/// [`Deserialize`] impl below; serialization stays a plain untagged
+/// derive (emit the inner struct's fields directly).
+#[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum TrackInput {
     /// `{"from": "path-or-@alias"}`.
     Source(SourceRef),
     /// `{"convert": "yuv420p", "input": <TrackInput>}`.
     ///
-    /// Explicit pixel-format conversion node. Parsed before `Filter` in the
-    /// untagged-enum dispatch so the `convert` key wins over a hypothetical
-    /// `filter: "convert"` (not used today, but keeps the routing honest).
+    /// Explicit pixel-format conversion node. The `convert` key is
+    /// checked before `filter` in the key-directed dispatch so it wins
+    /// over a hypothetical `filter: "convert"` (not used today, but
+    /// keeps the routing honest).
     Convert(ConvertNode),
     /// 3D-asset source: open `source` (URI / path) as a Scene3D via the
     /// caller-supplied Mesh3D registry, then rasterise via the renderer
@@ -113,12 +125,64 @@ pub enum TrackInput {
     /// "opts": { ... } }`. `opts` is opaque to pipeline — it's
     /// round-tripped verbatim through the factory.
     ///
-    /// Listed before `Filter` in the untagged dispatch so the unique
-    /// `render3d` discriminator field is matched before serde considers
-    /// the `filter` shape.
+    /// The unique `render3d` discriminator key is checked before
+    /// `filter` in the key-directed dispatch.
     Render3D(Render3DNode),
     /// `{"filter": "name", "params": {...}, "input": <TrackInput>}`.
     Filter(FilterNode),
+}
+
+impl<'de> Deserialize<'de> for TrackInput {
+    /// Key-directed variant dispatch.
+    ///
+    /// Buffers the node once as a [`serde_json::Value`], picks the
+    /// variant by discriminator key, and deserializes exactly that
+    /// variant — O(subtree) per nesting level, so a chain of N nested
+    /// filters parses in O(N²) worst case instead of the untagged
+    /// derive's exponential re-try cascade (each untagged attempt
+    /// re-deserialized the entire recursive `input` subtree per
+    /// candidate variant, at every level).
+    ///
+    /// Works under `#[serde(flatten)]` (as used by
+    /// [`TrackSpec::input`]) because `Value` deserializes from any
+    /// self-describing deserializer, including serde's internal
+    /// content buffer.
+    fn deserialize<D>(d: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+        let v = serde_json::Value::deserialize(d)?;
+        let Some(obj) = v.as_object() else {
+            return Err(D::Error::custom(
+                "track input must be an object carrying one of \
+                 `from` / `convert` / `render3d` / `filter`",
+            ));
+        };
+        // Priority order mirrors the historical untagged declaration
+        // order: Source, Convert, Render3D, Filter.
+        if obj.contains_key("from") {
+            serde_json::from_value::<SourceRef>(v)
+                .map(TrackInput::Source)
+                .map_err(D::Error::custom)
+        } else if obj.contains_key("convert") {
+            serde_json::from_value::<ConvertNode>(v)
+                .map(TrackInput::Convert)
+                .map_err(D::Error::custom)
+        } else if obj.contains_key("render3d") {
+            serde_json::from_value::<Render3DNode>(v)
+                .map(TrackInput::Render3D)
+                .map_err(D::Error::custom)
+        } else if obj.contains_key("filter") {
+            serde_json::from_value::<FilterNode>(v)
+                .map(TrackInput::Filter)
+                .map_err(D::Error::custom)
+        } else {
+            Err(D::Error::custom(
+                "track input needs one of `from` / `convert` / `render3d` / `filter`",
+            ))
+        }
+    }
 }
 
 /// Leaf input: either a file path or an alias reference.
@@ -661,6 +725,41 @@ mod tests {
         assert_eq!(v["opts"]["width"], 64);
         let back: Render3DNode = serde_json::from_value(v).unwrap();
         assert_eq!(back, node);
+    }
+
+    #[test]
+    fn deep_filter_chain_parses_in_linear_time() {
+        // Regression: the untagged-enum derive re-tried every candidate
+        // variant at every nesting level, so parse cost grew
+        // exponentially with filter-chain depth — a 64-deep chain
+        // effectively never finished. The key-directed Deserialize impl
+        // must handle it instantly.
+        let mut input = r#"{"from": "in.wav"}"#.to_string();
+        for i in 0..60 {
+            input = format!(r#"{{"filter": "f{i}", "params": {{"g": 1}}, "input": {input}}}"#);
+        }
+        let json = format!(r#"{{"out.mkv": {{"audio": [{input}]}}}}"#);
+        let start = std::time::Instant::now();
+        let j = Job::from_json(&json).unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "deep-chain parse took {:?} — exponential dispatch is back",
+            start.elapsed()
+        );
+        // Chain shape survived: 60 wrappers over a source leaf.
+        let mut depth = 0usize;
+        j.outputs["out.mkv"].audio[0].input.walk(|_| depth += 1);
+        assert_eq!(depth, 61);
+    }
+
+    #[test]
+    fn track_input_without_discriminator_reports_expected_keys() {
+        let e = Job::from_json(r#"{"out.mkv": {"audio": [{"codec": "flac"}]}}"#).unwrap_err();
+        let msg = format!("{e}");
+        assert!(
+            msg.contains("`from`") && msg.contains("`filter`"),
+            "error must name the discriminator keys, got: {msg}"
+        );
     }
 
     #[test]
