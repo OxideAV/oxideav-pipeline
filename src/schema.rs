@@ -208,7 +208,7 @@ pub struct FilterNode {
 
 /// Explicit pixel-format conversion node.
 ///
-/// The `convert` field carries an ffmpeg-style pixel format name
+/// The `convert` field carries a canonical short pixel-format name
 /// (`yuv420p`, `rgb24`, `rgba`, `pal8`, `gray8`, `nv12`, `rgb48le`, …).
 /// Names are accepted case-insensitively and parsed into
 /// [`oxideav_core::PixelFormat`] at DAG-build time — unknown names error
@@ -216,7 +216,7 @@ pub struct FilterNode {
 /// context.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConvertNode {
-    /// Target pixel format, as an ffmpeg-style string (`yuv420p`, etc.).
+    /// Target pixel format, as a canonical short-name string (`yuv420p`, etc.).
     pub convert: String,
     /// Upstream node.
     pub input: Box<TrackInput>,
@@ -362,7 +362,7 @@ impl TrackInput {
     }
 }
 
-/// Parse an ffmpeg-style pixel format name (case-insensitive) into a
+/// Parse a canonical short pixel-format name (case-insensitive) into a
 /// [`PixelFormat`]. Extend the match arms as new variants land in the
 /// enum — unknown names return an [`Error::InvalidData`].
 pub fn parse_pixel_format(s: &str) -> Result<PixelFormat> {
