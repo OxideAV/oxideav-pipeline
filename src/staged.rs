@@ -8,12 +8,21 @@
 //! Data flow per output:
 //!
 //! ```text
-//!   [one dmx thread per URI] ──► per-track packet channel ─┐
-//!                                                           ├─► decode ─► filter… ─► encode ─► output channel
-//!                                                           ┴─► (copy mode: output channel directly)
+//!   [one source thread per URI]
+//!     bytes / packet shape ──► per-track packet channel ─┐
+//!                                                         ├─► decode ─► filter… ─► encode ─► output channel
+//!                                                         ┴─► (copy mode: output channel directly)
+//!     frame shape ──────────► per-track frame channel ──► filter… ─► encode-or-fanout ─► output channel
 //!
-//!   main thread (mux loop): recv across all output channels → sink.write_packet
+//!   main thread (mux loop): recv across all output channels → sink.write_packet / write_frame
 //! ```
+//!
+//! Bytes-shape sources run a demuxer thread; packet-shape sources
+//! (RTMP, …) run the same fan-out without the container layer;
+//! frame-shape sources (generators, rendered scenes) feed the
+//! per-track frame chains directly — no demux, no decode. Seeks
+//! against packet- / frame-shape sources are answered with
+//! [`BarrierKind::SeekRejected`] (no seek surface on those traits).
 //!
 //! End-of-stream is signalled with [`Msg::Eof`] rather than by dropping
 //! the sender, so downstream stages can reliably flush their internal
@@ -29,10 +38,13 @@ use std::time::{Duration, Instant};
 
 use oxideav_core::Demuxer;
 use oxideav_core::{Decoder, Encoder};
-use oxideav_core::{Error, Frame, MediaType, Packet, Result, StreamInfo, TimeBase};
+use oxideav_core::{
+    Error, Frame, FrameSource, MediaType, Packet, PacketSource, Result, StreamInfo, TimeBase,
+};
 
 use crate::executor::{
-    flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage, JobSink, TrackRuntime,
+    flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage, JobSink, SourcePump,
+    TrackRuntime,
 };
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
@@ -546,10 +558,10 @@ pub(crate) struct PipelineControl {
 
 /// Run one output's pipeline. The caller has already instantiated all
 /// decoders/filters/encoders via `TrackRuntime::instantiate`, opened the
-/// demuxers, and prepared the sink (but not called `start` on it).
+/// sources, and prepared the sink (but not called `start` on it).
 pub(crate) fn run_pipelined(
     pipelines: Vec<TrackRuntime>,
-    dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    sources_by_uri: HashMap<String, SourcePump>,
     sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     caps: Option<ChannelCaps>,
@@ -557,7 +569,7 @@ pub(crate) fn run_pipelined(
 ) -> Result<ExecutorStats> {
     run_pipelined_inner(
         pipelines,
-        dmx_by_uri,
+        sources_by_uri,
         sink,
         out_streams,
         PipelineControl {
@@ -572,20 +584,20 @@ pub(crate) fn run_pipelined(
 
 /// Like [`run_pipelined`] but with explicit control wiring — used by
 /// [`crate::Executor::spawn`] to plumb the seek + progress + abort
-/// channels through to the demuxer / mux loop.
+/// channels through to the source-pump / mux loop.
 pub(crate) fn run_pipelined_with_control(
     pipelines: Vec<TrackRuntime>,
-    dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    sources_by_uri: HashMap<String, SourcePump>,
     sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
 ) -> Result<ExecutorStats> {
-    run_pipelined_inner(pipelines, dmx_by_uri, sink, out_streams, control)
+    run_pipelined_inner(pipelines, sources_by_uri, sink, out_streams, control)
 }
 
 pub(crate) fn run_pipelined_inner(
     mut pipelines: Vec<TrackRuntime>,
-    dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    sources_by_uri: HashMap<String, SourcePump>,
     mut sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
@@ -623,10 +635,14 @@ pub(crate) fn run_pipelined_inner(
         track_output_rx.push(rx);
     }
 
-    // Route table: per source URI, the list of (source_stream, packet_tx)
-    // pairs the demuxer thread fans packets out to.
+    // Route tables: per source URI, the list of (source_stream,
+    // packet_tx) pairs the demuxer / packet-pump thread fans packets
+    // out to, plus the list of frame_tx senders a frame-pump thread
+    // fans decoded frames out to (frame-shape sources have exactly one
+    // synthetic stream, so no per-stream index is needed).
     type Route = (u32, SyncSender<Msg<Packet>>);
     let mut routes_by_uri: HashMap<String, Vec<Route>> = HashMap::new();
+    let mut frame_routes_by_uri: HashMap<String, Vec<SyncSender<Msg<Frame>>>> = HashMap::new();
 
     // Build + spawn each track's stage chain. We consume the Vec so the
     // decoder/encoder/filters can be moved into worker threads.
@@ -635,47 +651,69 @@ pub(crate) fn run_pipelined_inner(
         let kind = pl.kind;
         let source_uri = pl.source_uri.clone();
         let source_stream = pl.source_stream;
+        let source_is_frames = matches!(
+            sources_by_uri.get(&pl.source_uri),
+            Some(SourcePump::Frames { .. })
+        );
 
-        // Every track has a packet-input channel from the demuxer
-        // regardless of copy / transcode — the demuxer thread doesn't
-        // need to know which mode each consumer uses.
-        let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
-        routes_by_uri
-            .entry(source_uri)
-            .or_default()
-            .push((source_stream, pkt_tx));
+        // Head of this track's frame chain. Packet-producing sources
+        // (Demuxer / Packets) wire a packet channel + a copy or decode
+        // stage in front; frame-shape sources feed the chain directly
+        // from the frame-pump thread.
+        let frame_head_rx: Receiver<Msg<Frame>> = if source_is_frames {
+            if pl.copy {
+                return Err(Error::other(
+                    "pipeline: copy track over a frame-shape source is not \
+                     representable (frames carry no packets to copy)",
+                ));
+            }
+            debug_assert!(
+                pl.decoder.is_none(),
+                "frame-shape track should not have instantiated a decoder"
+            );
+            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
+            frame_routes_by_uri
+                .entry(source_uri)
+                .or_default()
+                .push(frame0_tx);
+            frame0_rx
+        } else {
+            // Every packet-fed track has a packet-input channel from the
+            // source thread regardless of copy / transcode — the source
+            // thread doesn't need to know which mode each consumer uses.
+            let (pkt_tx, pkt_rx) = mpsc::sync_channel::<Msg<Packet>>(pkt_cap);
+            routes_by_uri
+                .entry(source_uri)
+                .or_default()
+                .push((source_stream, pkt_tx));
 
-        if pl.copy {
-            let abort_c = abort.clone();
-            let counters_c = counters.clone();
-            let budget_c = budget.clone();
-            let name = format!("copy-{track_idx}");
-            handles.push(spawn_stage(abort_c, name, move |abort| {
-                run_copy_stage(
-                    pkt_rx,
-                    out_tx,
-                    track_idx as u32,
-                    kind,
-                    abort,
-                    counters_c,
-                    budget_c,
-                )
-            }));
-            continue;
-        }
+            if pl.copy {
+                let abort_c = abort.clone();
+                let counters_c = counters.clone();
+                let budget_c = budget.clone();
+                let name = format!("copy-{track_idx}");
+                handles.push(spawn_stage(abort_c, name, move |abort| {
+                    run_copy_stage(
+                        pkt_rx,
+                        out_tx,
+                        track_idx as u32,
+                        kind,
+                        abort,
+                        counters_c,
+                        budget_c,
+                    )
+                }));
+                continue;
+            }
 
-        // Transcode: decoder → frame stages → encoder-or-fanout.
-        // Each FrameStage runs on its own worker thread so audio
-        // filters, pixel-format converts, and future video filters
-        // can overlap the encoder's back-pressure.
-        let decoder = pl.decoder.take().ok_or_else(|| {
-            Error::other("pipeline: non-copy track without a decoder is not supported")
-        })?;
-        let frame_stages = std::mem::take(&mut pl.frame_stages);
-        let encoder = pl.encoder.take();
-
-        let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
-        {
+            // Transcode: decoder → frame stages → encoder-or-fanout.
+            // Each FrameStage runs on its own worker thread so audio
+            // filters, pixel-format converts, and future video filters
+            // can overlap the encoder's back-pressure.
+            let decoder = pl.decoder.take().ok_or_else(|| {
+                Error::other("pipeline: non-copy track without a decoder is not supported")
+            })?;
+            let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
             let abort_d = abort.clone();
             let counters_d = counters.clone();
             let budget_d = budget.clone();
@@ -683,7 +721,10 @@ pub(crate) fn run_pipelined_inner(
             handles.push(spawn_stage(abort_d, name, move |abort| {
                 run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
             }));
-        }
+            frame0_rx
+        };
+        let frame_stages = std::mem::take(&mut pl.frame_stages);
+        let encoder = pl.encoder.take();
 
         // Count extras as we go: the first filter stage on this track
         // starts at the track's `extras_base_for_this_track`, the next
@@ -695,7 +736,7 @@ pub(crate) fn run_pipelined_inner(
         let extra_port_counts: Vec<u32> = pl.extra_output_port_counts.clone().into_iter().collect();
         let mut extra_counts_iter = extra_port_counts.into_iter();
 
-        let mut upstream: Receiver<Msg<Frame>> = frame0_rx;
+        let mut upstream: Receiver<Msg<Frame>> = frame_head_rx;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
             let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
             let label = match &stage {
@@ -765,23 +806,51 @@ pub(crate) fn run_pipelined_inner(
     // when every stage has finished.
     drop(track_output_tx);
 
-    // Spawn one demuxer thread per URI. The seek_rx (if any) is given
-    // to the FIRST demuxer that has routes — multi-URI seek is a
-    // follow-up (the engine only ever drives one source today, so a
+    // Spawn one source-pump thread per URI, shaped by the source kind:
+    // bytes-shape URIs get the demuxer stage, packet-shape URIs get the
+    // packet-pump stage (identical fan-out, no container layer, seeks
+    // rejected), frame-shape URIs get the frame-pump stage (frames fan
+    // straight into the per-track frame chains). The seek_rx (if any)
+    // is given to the FIRST source that has routes — multi-URI seek is
+    // a follow-up (the engine only ever drives one source today, so a
     // single seek receiver is enough to cover all of plain playback).
-    for (uri, dmx) in dmx_by_uri {
-        let routes = routes_by_uri.remove(&uri).unwrap_or_default();
-        if routes.is_empty() {
+    for (uri, pump) in sources_by_uri {
+        let pkt_routes = routes_by_uri.remove(&uri).unwrap_or_default();
+        let frame_routes = frame_routes_by_uri.remove(&uri).unwrap_or_default();
+        if pkt_routes.is_empty() && frame_routes.is_empty() {
             continue;
         }
         let abort_d = abort.clone();
         let counters_d = counters.clone();
         let budget_d = budget.clone();
-        let name = format!("demux-{uri}");
-        let dmx_seek_rx = seek_rx.take();
-        handles.push(spawn_stage(abort_d, name, move |abort| {
-            run_demuxer_stage(dmx, routes, abort, counters_d, dmx_seek_rx, budget_d)
-        }));
+        let src_seek_rx = seek_rx.take();
+        match pump {
+            SourcePump::Demuxer(dmx) => {
+                let name = format!("demux-{uri}");
+                handles.push(spawn_stage(abort_d, name, move |abort| {
+                    run_demuxer_stage(dmx, pkt_routes, abort, counters_d, src_seek_rx, budget_d)
+                }));
+            }
+            SourcePump::Packets(src) => {
+                let name = format!("packets-{uri}");
+                handles.push(spawn_stage(abort_d, name, move |abort| {
+                    run_packet_source_stage(
+                        src,
+                        pkt_routes,
+                        abort,
+                        counters_d,
+                        src_seek_rx,
+                        budget_d,
+                    )
+                }));
+            }
+            SourcePump::Frames { source, .. } => {
+                let name = format!("frames-{uri}");
+                handles.push(spawn_stage(abort_d, name, move |abort| {
+                    run_frame_source_stage(source, frame_routes, abort, counters_d, src_seek_rx)
+                }));
+            }
+        }
     }
 
     // Mux loop on the caller thread — drain across every track output
@@ -1103,6 +1172,126 @@ fn run_demuxer_stage(
         }
     }
     for (_, tx) in routes {
+        let _ = tx.send(Msg::Eof);
+    }
+    Ok(())
+}
+
+/// Packet-source thread: like [`run_demuxer_stage`] but drives a
+/// [`PacketSource`] (RTMP, future SRT / RTSP, …) — same per-stream
+/// fan-out, same byte-budget accounting, no container layer.
+///
+/// [`PacketSource`] has no seek surface, so every [`SeekCmd`] is
+/// answered with a [`BarrierKind::SeekRejected`] carrying the
+/// command's generation: the pipeline keeps producing packets from
+/// where it was and the engine learns to disable its seek UI, exactly
+/// as with a demuxer whose `seek_to` is unimplemented.
+fn run_packet_source_stage(
+    mut src: Box<dyn PacketSource>,
+    routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
+    abort: Arc<AbortState>,
+    counters: Arc<PipelineCounters>,
+    seek_rx: Option<Receiver<SeekCmd>>,
+    budget: Arc<QueueBudget>,
+) -> Result<()> {
+    loop {
+        if abort.is_aborted() {
+            break;
+        }
+        budget.wait_below_ceiling(&abort);
+        if abort.is_aborted() {
+            break;
+        }
+        if let Some(rx) = &seek_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                let kind = BarrierKind::SeekRejected {
+                    generation: cmd.generation,
+                };
+                for (_, tx) in &routes {
+                    if tx.send(Msg::Barrier(kind)).is_err() {
+                        abort.abort.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        match src.next_packet() {
+            Ok(pkt) => {
+                counters.packets_read.fetch_add(1, Ordering::SeqCst);
+                let bytes = pkt.data.len() as u64;
+                for (stream_idx, tx) in &routes {
+                    if *stream_idx != pkt.stream_index {
+                        continue;
+                    }
+                    budget.admit(bytes);
+                    if tx.send(Msg::Data(pkt.clone())).is_err() {
+                        budget.release(bytes);
+                        abort.abort.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            Err(Error::Eof) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    for (_, tx) in routes {
+        let _ = tx.send(Msg::Eof);
+    }
+    Ok(())
+}
+
+/// Frame-source thread: drives a [`FrameSource`] (synthetic generator,
+/// future capture-card driver, rendered 3D scene) and fans each frame
+/// out to every consuming track's frame chain — no demux stage, no
+/// decode stage. Mirrors the serial path's multi-consumer clone
+/// semantics: one `next_frame()` call per source frame, cloned per
+/// additional consumer; `frames_decoded` counts source frames once,
+/// matching [`crate::executor::ExecutorStats`] parity with the serial
+/// runner.
+///
+/// [`FrameSource`] has no seek surface, so every [`SeekCmd`] is
+/// answered with a [`BarrierKind::SeekRejected`] carrying the
+/// command's generation (see [`run_packet_source_stage`]).
+fn run_frame_source_stage(
+    mut src: Box<dyn FrameSource>,
+    routes: Vec<SyncSender<Msg<Frame>>>,
+    abort: Arc<AbortState>,
+    counters: Arc<PipelineCounters>,
+    seek_rx: Option<Receiver<SeekCmd>>,
+) -> Result<()> {
+    loop {
+        if abort.is_aborted() {
+            break;
+        }
+        if let Some(rx) = &seek_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                let kind = BarrierKind::SeekRejected {
+                    generation: cmd.generation,
+                };
+                for tx in &routes {
+                    if tx.send(Msg::Barrier(kind)).is_err() {
+                        abort.abort.store(true, Ordering::SeqCst);
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        match src.next_frame() {
+            Ok(frame) => {
+                counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                for tx in &routes {
+                    if tx.send(Msg::Data(frame.clone())).is_err() {
+                        abort.abort.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                }
+            }
+            Err(Error::Eof) => break,
+            Err(e) => return Err(e),
+        }
+    }
+    for tx in routes {
         let _ = tx.send(Msg::Eof);
     }
     Ok(())

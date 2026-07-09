@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- The staged (pipelined) runner now drives packet-shape and
+  frame-shape sources natively. Bytes-shape URIs keep their demuxer
+  thread; packet-shape URIs (RTMP-style) get an identical packet-pump
+  thread without the container layer; frame-shape URIs (generators,
+  rendered scenes) get a frame-pump thread that feeds the per-track
+  frame-stage chains directly — no demux, no decode stage.
+  Consequences: `Executor::spawn` (the playback path — live seek /
+  progress / abort handle) now works over typed sources instead of
+  failing with an internal "opener returned non-bytes shape" error,
+  and `Executor::run` with `threads ≥ 2` no longer silently degrades
+  typed-source jobs to the serial path. Seeks dispatched against a
+  typed source surface `BarrierKind::SeekRejected` with the dispatch
+  generation (`PacketSource` / `FrameSource` have no seek surface) and
+  the stream keeps flowing. Serial/pipelined stats parity for typed
+  sources is pinned by `tests/typed_source_staged.rs`.
 - Validation completeness: `Job::validate` now rejects an explicitly
   empty / whitespace `codec` string with the track context (previously
   it survived to codec resolution and failed with an opaque "no codec

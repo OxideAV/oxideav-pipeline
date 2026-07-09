@@ -666,20 +666,6 @@ impl<'a> Executor<'a> {
         }
     }
 
-    /// Convenience: open a source URI and assert it's bytes-shape.
-    /// Retained for callers that strictly want a `Box<dyn Demuxer>` —
-    /// today only a couple of legacy code paths and tests. New code
-    /// should prefer [`open_source`](Self::open_source) and branch on
-    /// the returned [`SourcePump`].
-    pub(crate) fn open_demuxer(&self, uri: &str) -> Result<Box<dyn Demuxer>> {
-        match self.open_source(uri)? {
-            SourcePump::Demuxer(d) => Ok(d),
-            SourcePump::Packets(_) | SourcePump::Frames { .. } => Err(Error::unsupported(format!(
-                "source {uri}: opener returned non-bytes shape; use open_source() instead"
-            ))),
-        }
-    }
-
     /// Open every unique source URI referenced by a `Demuxer` node in
     /// `dag`, then rewrite the node to `PacketSource` / `FrameSource`
     /// when the registry hands back a non-bytes shape. Returns the
@@ -773,52 +759,26 @@ impl<'a> Executor<'a> {
     }
 
     /// Pipelined counterpart to [`Self::run_output`]. Builds the same
-    /// per-track runtimes + demuxers + sink, then hands them off to
+    /// per-track runtimes + sources + sink, then hands them off to
     /// [`crate::staged::run_pipelined`] which spawns a stage-per-thread
     /// worker graph.
     ///
-    /// Falls back to [`Self::run_output`] when any source resolves to a
-    /// non-bytes shape (`PacketSource` / `FrameSource`). The pipelined
-    /// runner today only knows how to drive a `Box<dyn Demuxer>`; the
-    /// staged-worker variants for the typed-source shapes are tracked as
-    /// follow-up work and not blocking for the typed-source pipeline
-    /// to be useful (RTMP + generator both run fine on the serial path).
+    /// All three source shapes run pipelined: bytes-shape sources get
+    /// a demuxer thread, packet-shape sources get a packet-pump thread
+    /// (no container layer), and frame-shape sources get a frame-pump
+    /// thread feeding the per-track frame-stage chains directly (no
+    /// demux, no decode). Historically only bytes-shape was supported
+    /// and any typed source fell back to the serial [`Self::run_output`].
     fn run_output_pipelined(
         &mut self,
         dag: &Dag,
         name: &str,
         threads: usize,
     ) -> Result<ExecutorStats> {
-        // Probe sources without committing to the pipelined path —
-        // bytes-shape stays pipelined, anything else falls back.
-        let mut probed = dag.clone();
-        let opened = self.resolve_source_shapes(&mut probed)?;
-        let any_typed = opened
-            .values()
-            .any(|p| !matches!(p, SourcePump::Demuxer(_)));
-        if any_typed {
-            // Drop the pre-opened sources so `run_output` can re-open
-            // them itself. Re-opening is cheap for the in-tree drivers
-            // (file is mmap-friendly, generators are deterministic by
-            // URI, RTMP follow-up may need to refactor this when it
-            // lands as the second consumer).
-            //
-            // Pass the *original* `dag` (with its `Demuxer` leaves) — not
-            // the rewritten `probed` — so `run_output`'s own
-            // `resolve_source_shapes` call can find the Demuxer nodes and
-            // re-open them. `resolve_source_shapes` only collects URIs from
-            // `Demuxer` nodes, so handing it the already-rewritten DAG
-            // would silently produce an empty `sources_by_uri` and panic
-            // on the very next `.unwrap()`.
-            drop(opened);
-            return self.run_output(dag, name);
-        }
-        // Bytes-only path — everything below is unchanged.
-        drop(opened);
         let prep = self.prepare_pipelined_run(dag, name, threads)?;
         staged::run_pipelined(
             prep.pipelines,
-            prep.dmx_by_uri,
+            prep.sources_by_uri,
             prep.sink,
             prep.out_streams,
             prep.channel_caps,
@@ -827,16 +787,23 @@ impl<'a> Executor<'a> {
     }
 
     /// Shared prep used by both [`Self::run_output_pipelined`] and
-    /// [`Self::spawn`]. Builds + instantiates the per-track runtimes,
-    /// opens the demuxers, and resolves the sink. The returned struct
-    /// is fully owned (no `'a`-borrowed members) so it can be moved
-    /// onto a background thread.
+    /// [`Self::spawn`]. Resolves source shapes, builds + instantiates
+    /// the per-track runtimes, and resolves the sink. The returned
+    /// struct is fully owned (no `'a`-borrowed members) so it can be
+    /// moved onto a background thread.
     fn prepare_pipelined_run(
         &mut self,
         dag: &Dag,
         name: &str,
         threads: usize,
     ) -> Result<PreparedRun> {
+        // Probe every source leaf and rewrite `Demuxer` nodes to their
+        // typed variants — the same pass the serial path runs — so
+        // `build_track_runtime` sees the authoritative source shape
+        // (FrameSource leaves drop their Decode stages).
+        let mut dag = dag.clone();
+        let mut sources_by_uri = self.resolve_source_shapes(&mut dag)?;
+        let dag = &dag;
         let root_id = dag.roots[name];
         let tracks: Vec<MuxTrack> = match dag.node(root_id) {
             DagNode::Mux { tracks, .. } => tracks.clone(),
@@ -851,25 +818,24 @@ impl<'a> Executor<'a> {
         for t in &tracks {
             pipelines.push(self.build_track_runtime(dag, t)?);
         }
-        let mut dmx_by_uri: HashMap<String, Box<dyn Demuxer>> = HashMap::new();
-        for pl in &pipelines {
-            if !dmx_by_uri.contains_key(&pl.source_uri) {
-                let dmx = self.open_demuxer(&pl.source_uri)?;
-                dmx_by_uri.insert(pl.source_uri.clone(), dmx);
-            }
-        }
         // Expand `all:` tracks (kind == Unknown, selector == any) into
-        // one TrackRuntime per source stream. Done after demuxers open
+        // one TrackRuntime per source stream. Done after sources open
         // so the stream kinds are authoritative.
-        pipelines = expand_all_tracks(pipelines, &dmx_by_uri);
+        pipelines = expand_all_tracks_pump(pipelines, &sources_by_uri);
         for pl in &mut pipelines {
-            let dmx = dmx_by_uri.get(&pl.source_uri).unwrap();
-            pl.source_stream = select_stream(dmx.streams(), &pl.selector)?;
-            let info = dmx
+            let pump = sources_by_uri.get(&pl.source_uri).ok_or_else(|| {
+                Error::invalid(format!(
+                    "job: track references source {:?} but no source was opened for that \
+                     URI — this is an internal pipeline-resolver bug",
+                    pl.source_uri
+                ))
+            })?;
+            pl.source_stream = select_stream(pump.streams(), &pl.selector)?;
+            let info = pump
                 .streams()
                 .iter()
                 .find(|s| s.index == pl.source_stream)
-                .ok_or_else(|| Error::invalid("selected stream not in demuxer"))?;
+                .ok_or_else(|| Error::invalid("selected stream not in source"))?;
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
         }
@@ -884,9 +850,16 @@ impl<'a> Executor<'a> {
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
+        // Drop pumps no track of THIS output uses (the DAG probe opens
+        // every source leaf in the document, but prep is per-output).
+        // The staged runner would skip route-less pumps anyway;
+        // dropping here releases the handles promptly.
+        let used: std::collections::HashSet<&String> =
+            pipelines.iter().map(|pl| &pl.source_uri).collect();
+        sources_by_uri.retain(|uri, _| used.contains(uri));
         Ok(PreparedRun {
             pipelines,
-            dmx_by_uri,
+            sources_by_uri,
             sink,
             out_streams,
             channel_caps: self.channel_caps,
@@ -1087,7 +1060,7 @@ impl TrackRuntime {
     /// Clone a pre-instantiate TrackRuntime — only the metadata + stage
     /// list, not the decoder / encoder / filter-instance slots (which
     /// are `None` at this point anyway). Used by
-    /// [`expand_all_tracks`] when a `{kind: Unknown, selector: any}`
+    /// [`expand_all_tracks_pump`] when a `{kind: Unknown, selector: any}`
     /// track needs to fan out into one runtime per source stream.
     fn duplicate_pre_instantiate(&self, kind: MediaType, selector: ResolvedSelector) -> Self {
         assert!(
@@ -1627,34 +1600,16 @@ pub(crate) fn port_params_equal(a: &PortParams, b: &PortParams) -> bool {
 /// the stage stack. Only Audio / Video variants are produced today.
 /// Expand `all:`-originated tracks (kind == `MediaType::Unknown`,
 /// selector without an explicit kind constraint) into one
-/// [`TrackRuntime`] per source stream exposed by the open demuxer.
+/// [`TrackRuntime`] per source stream exposed by the opened source.
 ///
 /// The DAG builder produces a single MuxTrack per `all:` entry; it
 /// can't know the source's stream layout statically, so it leaves the
 /// kind as `Unknown` and the selector as "any". The executor's prep
 /// phase (both serial and pipelined) calls this after opening
-/// demuxers so the fan-out sees the authoritative stream list.
+/// sources so the fan-out sees the authoritative stream list.
 ///
 /// Tracks with an explicit kind (from `audio:` / `video:` /
 /// `subtitle:` lists) pass through unchanged.
-pub(crate) fn expand_all_tracks(
-    pipelines: Vec<TrackRuntime>,
-    dmx_by_uri: &HashMap<String, Box<dyn Demuxer>>,
-) -> Vec<TrackRuntime> {
-    let mut out: Vec<TrackRuntime> = Vec::with_capacity(pipelines.len());
-    for pl in pipelines {
-        match dmx_by_uri.get(&pl.source_uri) {
-            Some(dmx) => fan_out_one(pl, dmx.streams(), &mut out),
-            None => out.push(pl),
-        }
-    }
-    out
-}
-
-/// Like [`expand_all_tracks`] but keyed off a [`SourcePump`] map. Used
-/// by the new typed-source path; mirrors the legacy demuxer-only
-/// helper so the serial + pipelined runners can both call into a
-/// single fan-out routine regardless of source shape.
 pub(crate) fn expand_all_tracks_pump(
     pipelines: Vec<TrackRuntime>,
     sources_by_uri: &HashMap<String, SourcePump>,
@@ -1670,8 +1625,8 @@ pub(crate) fn expand_all_tracks_pump(
 }
 
 /// Fan one track runtime out over `streams` if it needs expansion,
-/// else pass it through unchanged. Shared by [`expand_all_tracks`] and
-/// [`expand_all_tracks_pump`].
+/// else pass it through unchanged. Factored out of
+/// [`expand_all_tracks_pump`] so the fan-out rule lives in one place.
 ///
 /// Each duplicate's selector is pinned to `(kind, per-kind ordinal)` —
 /// [`select_stream`]'s `index` counts within the pool of streams
@@ -1870,7 +1825,7 @@ pub(crate) fn ext_from_uri(uri: &str) -> Option<String> {
 /// fields — moves freely across threads.
 pub(crate) struct PreparedRun {
     pub(crate) pipelines: Vec<TrackRuntime>,
-    pub(crate) dmx_by_uri: HashMap<String, Box<dyn Demuxer>>,
+    pub(crate) sources_by_uri: HashMap<String, SourcePump>,
     pub(crate) sink: Box<dyn JobSink + Send>,
     pub(crate) out_streams: Vec<StreamInfo>,
     /// Per-track channel-depth budget threaded from the [`Executor`]
@@ -1921,7 +1876,7 @@ impl ExecutorHandle {
             .spawn(move || {
                 let result = crate::staged::run_pipelined_with_control(
                     prep.pipelines,
-                    prep.dmx_by_uri,
+                    prep.sources_by_uri,
                     prep.sink,
                     prep.out_streams,
                     crate::staged::PipelineControl {
