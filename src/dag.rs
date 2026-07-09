@@ -231,7 +231,13 @@ impl Job {
             (None, other) => ResolvedSelector::kind(other),
         };
 
-        let upstream = self.build_input(dag, ctx, &track.input, &selector)?;
+        // Per-track alias-visiting stack: the defensive cycle guard for
+        // `build_source`'s alias inlining. `Job::validate` reports cycles
+        // with a full path; this guard exists so a direct `to_dag` call
+        // on an unvalidated job returns `Err` instead of recursing until
+        // the stack overflows.
+        let mut visiting: Vec<String> = Vec::new();
+        let upstream = self.build_input(dag, ctx, &track.input, &selector, &mut visiting)?;
 
         // If a codec is named, we build Decode → (Filter / PixConvert
         // chain already in upstream if any) → Encode. If no codec is
@@ -297,11 +303,12 @@ impl Job {
         ctx: &str,
         input: &TrackInput,
         selector: &ResolvedSelector,
+        visiting: &mut Vec<String>,
     ) -> Result<NodeId> {
         match input {
-            TrackInput::Source(src) => self.build_source(dag, ctx, src, selector),
+            TrackInput::Source(src) => self.build_source(dag, ctx, src, selector, visiting),
             TrackInput::Filter(f) => {
-                let upstream = self.build_input(dag, ctx, f.input.as_ref(), selector)?;
+                let upstream = self.build_input(dag, ctx, f.input.as_ref(), selector, visiting)?;
                 // Filter consumes frames; insert a Decode if the upstream is
                 // still packet-producing.
                 let frame_upstream = if self.is_packet_producing(dag, upstream)? {
@@ -316,7 +323,7 @@ impl Job {
                 }))
             }
             TrackInput::Convert(c) => {
-                let upstream = self.build_input(dag, ctx, c.input.as_ref(), selector)?;
+                let upstream = self.build_input(dag, ctx, c.input.as_ref(), selector, visiting)?;
                 let target = parse_pixel_format(&c.convert)
                     .map_err(|e| Error::invalid(format!("job: {ctx}: convert: {e}")))?;
                 // Convert consumes frames; insert a Decode if the upstream
@@ -351,12 +358,26 @@ impl Job {
         ctx: &str,
         src: &SourceRef,
         selector: &ResolvedSelector,
+        visiting: &mut Vec<String>,
     ) -> Result<NodeId> {
         if let Some(stripped) = src.from.strip_prefix('@') {
             if stripped.is_empty() {
                 return Err(Error::invalid(format!("job: {ctx}: empty alias name")));
             }
             let alias_name = src.from.clone();
+            // Defensive cycle guard: alias inlining recurses through
+            // `build_input`, so a job whose aliases form a cycle would
+            // otherwise recurse without bound (stack overflow, not a
+            // clean `Err`). `Job::validate` reports cycles with a full
+            // path before execution; this check keeps the documented
+            // "to_dag also validates defensively" contract honest for
+            // callers that build a DAG without validating first.
+            if visiting.iter().any(|v| v == &alias_name) {
+                return Err(Error::invalid(format!(
+                    "job: {ctx}: alias cycle detected while inlining {alias_name} \
+                     (run Job::validate for the full cycle path)"
+                )));
+            }
             let alias = self.aliases.get(&alias_name).ok_or_else(|| {
                 Error::invalid(format!("job: {ctx}: undefined alias {alias_name}"))
             })?;
@@ -368,7 +389,10 @@ impl Job {
                     "job: {ctx}: alias {alias_name} does not provide a matching track"
                 ))
             })?;
-            self.build_input(dag, ctx, &track.input, selector)
+            visiting.push(alias_name);
+            let node = self.build_input(dag, ctx, &track.input, selector, visiting);
+            visiting.pop();
+            node
         } else {
             let demux = dag.push(DagNode::Demuxer {
                 source: src.from.clone(),
@@ -641,6 +665,105 @@ mod tests {
         match dag.node(enc) {
             DagNode::Filter { name, .. } => assert_eq!(name, "volume"),
             n => panic!("expected Filter under Encode, got {n:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dag_rejects_self_cycle_without_prior_validate() {
+        // Direct `to_dag` on an unvalidated cyclic job must return Err,
+        // not recurse until the stack overflows. (`Executor::run` always
+        // validates first; this pins the documented "to_dag also
+        // validates defensively" contract for direct callers.)
+        let j = Job::from_json(
+            r#"{
+                "@a": {"all": [{"from": "@a"}]},
+                "out.mkv": {"audio": [{"from": "@a"}]}
+            }"#,
+        )
+        .unwrap();
+        let e = j.to_dag().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("cycle"), "got: {msg}");
+    }
+
+    #[test]
+    fn to_dag_rejects_mutual_cycle_without_prior_validate() {
+        let j = Job::from_json(
+            r#"{
+                "@a": {"all": [{"from": "@b"}]},
+                "@b": {"all": [{"from": "@a"}]},
+                "out.mkv": {"audio": [{"from": "@a"}]}
+            }"#,
+        )
+        .unwrap();
+        let e = j.to_dag().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("cycle"), "got: {msg}");
+    }
+
+    #[test]
+    fn to_dag_rejects_cycle_through_filter_wrapper() {
+        // The cycle passes through a Filter node's upstream input —
+        // the guard must catch alias re-entry regardless of wrapper
+        // depth, not just direct `from` chains.
+        let j = Job::from_json(
+            r#"{
+                "@a": {"all": [{"filter": "volume", "params": {}, "input": {"from": "@a"}}]},
+                "out.mkv": {"audio": [{"from": "@a"}]}
+            }"#,
+        )
+        .unwrap();
+        let e = j.to_dag().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("cycle"), "got: {msg}");
+    }
+
+    #[test]
+    fn to_dag_accepts_diamond_alias_reuse() {
+        // Re-using the same alias from two DIFFERENT tracks is legal
+        // (a diamond, not a cycle) — the visiting stack is per-track
+        // and pops on the way out, so the second reference must not
+        // trip the guard.
+        let j = Job::from_json(
+            r#"{
+                "@in": {"all": [{"from": "a.mkv"}]},
+                "out.mkv": {
+                    "audio": [{"from": "@in"}],
+                    "video": [{"from": "@in"}]
+                }
+            }"#,
+        )
+        .unwrap();
+        let dag = j.to_dag().unwrap();
+        assert!(dag.roots.contains_key("out.mkv"));
+    }
+
+    #[test]
+    fn to_dag_accepts_deep_legal_alias_chain() {
+        // A linear (acyclic) chain through several aliases still
+        // resolves — the guard only rejects RE-ENTRY of an alias
+        // already on the current descent path.
+        let j = Job::from_json(
+            r#"{
+                "@l0": {"all": [{"from": "a.mkv"}]},
+                "@l1": {"all": [{"from": "@l0"}]},
+                "@l2": {"all": [{"from": "@l1"}]},
+                "out.mkv": {"audio": [{"from": "@l2"}]}
+            }"#,
+        )
+        .unwrap();
+        let dag = j.to_dag().unwrap();
+        let root = dag.roots["out.mkv"];
+        let mux = match dag.node(root) {
+            DagNode::Mux { tracks, .. } => tracks,
+            _ => panic!(),
+        };
+        match dag.node(mux[0].upstream) {
+            DagNode::Select { upstream, .. } => match dag.node(*upstream) {
+                DagNode::Demuxer { source } => assert_eq!(source, "a.mkv"),
+                n => panic!("expected Demuxer leaf, got {n:?}"),
+            },
+            n => panic!("unexpected top node {n:?}"),
         }
     }
 

@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `Job::to_dag` now returns `Err(InvalidData)` on alias cycles instead
+  of recursing without bound. The method's docs promised defensive
+  validation, but a direct `to_dag` call on an unvalidated cyclic job
+  (self-cycle, mutual cycle, or a cycle threaded through a filter
+  wrapper) overflowed the stack during alias inlining. A per-track
+  visiting stack in `build_source` rejects alias re-entry on the
+  current descent path while still allowing legal diamond re-use of
+  the same alias from different tracks.
+
 ## [0.1.11](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.10...v0.1.11) - 2026-06-09
 
 ### Other
