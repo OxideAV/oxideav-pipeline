@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `all:` track fan-out now pins each duplicate's selector to a
+  `(kind, per-kind ordinal)` pair. Pre-fix the expansion left the
+  ordinal as `index: None`, so a source with two streams of the SAME
+  media type (dual-audio, dual-subtitle, …) resolved BOTH duplicates
+  to the first matching stream — the sink received two copies of
+  stream 0 and the second stream's data silently vanished from the
+  output on both the serial and pipelined paths. The two fan-out
+  helpers (`expand_all_tracks` / `expand_all_tracks_pump`) now share
+  one implementation. Pinned by a dual-audio stub demuxer whose
+  per-stream payload fill bytes let the test attribute every delivered
+  frame to its source stream (`tests/all_tracks_fan_out_same_kind.rs`,
+  serial + pipelined).
 - `Job::to_dag` now returns `Err(InvalidData)` on alias cycles instead
   of recursing without bound. The method's docs promised defensive
   validation, but a direct `to_dag` call on an unvalidated cyclic job

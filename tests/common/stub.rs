@@ -49,6 +49,19 @@ pub const CONTAINER_FIXED: &str = "stub_audio_fixed_landing";
 pub const EXT_FIXED: &str = "stubfx";
 /// pts the fixed-landing demuxer always reports as the seek result.
 pub const FIXED_LANDED_PTS: i64 = 42;
+/// Container name for the dual-audio-stream variant (two audio streams
+/// with distinguishable payload bytes). Used to pin the `all:` fan-out
+/// contract: two source streams of the SAME media type must resolve to
+/// two distinct output tracks, not two copies of the first stream.
+pub const CONTAINER_MULTI: &str = "stub_audio_multi";
+/// Extension for the dual-audio-stream stub container.
+pub const EXT_MULTI: &str = "stubm2";
+/// Payload fill byte for the multi-stub's stream 0.
+pub const MULTI_FILL_S0: u8 = 0xAA;
+/// Payload fill byte for the multi-stub's stream 1.
+pub const MULTI_FILL_S1: u8 = 0xBB;
+/// Packets emitted per stream by the multi-stub demuxer.
+pub const MULTI_PACKETS_PER_STREAM: u32 = 5;
 
 /// Sample rate of the synthetic audio. Small so the demuxer's pts
 /// arithmetic is easy to reason about in tests, realistic enough that
@@ -92,6 +105,11 @@ pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) 
     // requested pts.
     containers.register_demuxer(CONTAINER_FIXED, open_demuxer_fixed as OpenDemuxerFn);
     containers.register_extension(EXT_FIXED, CONTAINER_FIXED);
+    // Dual-audio-stream variant: interleaves packets from two audio
+    // streams whose payload bytes differ (0xAA vs 0xBB) so a test can
+    // assert which source stream each delivered frame came from.
+    containers.register_demuxer(CONTAINER_MULTI, open_demuxer_multi as OpenDemuxerFn);
+    containers.register_extension(EXT_MULTI, CONTAINER_MULTI);
 }
 
 /// Create an empty unseekable-stub file. Same shape as [`touch`] but
@@ -160,6 +178,93 @@ fn open_demuxer_fixed(
     Ok(Box::new(FixedLandingStubDemuxer(StubDemuxer::new(
         DEFAULT_DURATION_MS,
     ))))
+}
+
+fn open_demuxer_multi(
+    _input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(MultiStreamStubDemuxer::new()))
+}
+
+/// Create an empty dual-audio-stream stub file. Same shape as [`touch`]
+/// but the extension routes through the multi-stream demuxer.
+pub fn touch_multi(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("oxideav_pipeline_stub_{name}.{EXT_MULTI}"));
+    let _ = std::fs::File::create(&p).expect("create stub multi file");
+    p
+}
+
+/// Two-audio-stream stub demuxer. Emits
+/// [`MULTI_PACKETS_PER_STREAM`] packets per stream, strictly
+/// interleaved (s0, s1, s0, s1, …). Stream 0's payload bytes are all
+/// [`MULTI_FILL_S0`]; stream 1's are all [`MULTI_FILL_S1`], so a
+/// downstream observer can attribute every frame to its source stream
+/// by content alone.
+pub struct MultiStreamStubDemuxer {
+    streams: Vec<StreamInfo>,
+    emitted: u32,
+}
+
+impl MultiStreamStubDemuxer {
+    pub fn new() -> Self {
+        let mk_stream = |index: u32| {
+            let mut params = CodecParameters::audio(CodecId::new(CODEC_ID));
+            params.sample_rate = Some(SAMPLE_RATE);
+            params.channels = Some(CHANNELS);
+            params.sample_format = Some(SampleFormat::S16);
+            StreamInfo {
+                index,
+                time_base: TimeBase::new(1, SAMPLE_RATE as i64),
+                duration: Some(i64::from(MULTI_PACKETS_PER_STREAM * SAMPLES_PER_PACKET)),
+                start_time: Some(0),
+                params,
+            }
+        };
+        Self {
+            streams: vec![mk_stream(0), mk_stream(1)],
+            emitted: 0,
+        }
+    }
+}
+
+impl Default for MultiStreamStubDemuxer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Demuxer for MultiStreamStubDemuxer {
+    fn format_name(&self) -> &str {
+        CONTAINER_MULTI
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        &self.streams
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.emitted >= 2 * MULTI_PACKETS_PER_STREAM {
+            return Err(Error::Eof);
+        }
+        let stream_index = self.emitted % 2;
+        let per_stream_ordinal = self.emitted / 2;
+        self.emitted += 1;
+        let fill = if stream_index == 0 {
+            MULTI_FILL_S0
+        } else {
+            MULTI_FILL_S1
+        };
+        let pts = i64::from(per_stream_ordinal * SAMPLES_PER_PACKET);
+        Ok(Packet {
+            stream_index,
+            time_base: TimeBase::new(1, SAMPLE_RATE as i64),
+            pts: Some(pts),
+            dts: Some(pts),
+            duration: Some(i64::from(SAMPLES_PER_PACKET)),
+            flags: PacketFlags::default(),
+            data: vec![fill; (SAMPLES_PER_PACKET as usize) * 2], // S16 mono
+        })
+    }
 }
 
 /// Wraps [`StubDemuxer`] but rejects every `seek_to` with

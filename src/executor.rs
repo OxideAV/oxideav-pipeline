@@ -1643,30 +1643,9 @@ pub(crate) fn expand_all_tracks(
 ) -> Vec<TrackRuntime> {
     let mut out: Vec<TrackRuntime> = Vec::with_capacity(pipelines.len());
     for pl in pipelines {
-        let needs_expand = pl.kind == MediaType::Unknown
-            && pl.selector.kind.is_none()
-            && pl.selector.index.is_none();
-        if !needs_expand {
-            out.push(pl);
-            continue;
-        }
-        let Some(dmx) = dmx_by_uri.get(&pl.source_uri) else {
-            out.push(pl);
-            continue;
-        };
-        let streams = dmx.streams();
-        if streams.is_empty() {
-            out.push(pl);
-            continue;
-        }
-        // One duplicate per source stream. Selector pinned to that
-        // stream's index so later `select_stream` hits deterministically.
-        for s in streams {
-            let selector = ResolvedSelector {
-                kind: Some(s.params.media_type),
-                index: None,
-            };
-            out.push(pl.duplicate_pre_instantiate(s.params.media_type, selector));
+        match dmx_by_uri.get(&pl.source_uri) {
+            Some(dmx) => fan_out_one(pl, dmx.streams(), &mut out),
+            None => out.push(pl),
         }
     }
     out
@@ -1682,31 +1661,44 @@ pub(crate) fn expand_all_tracks_pump(
 ) -> Vec<TrackRuntime> {
     let mut out: Vec<TrackRuntime> = Vec::with_capacity(pipelines.len());
     for pl in pipelines {
-        let needs_expand = pl.kind == MediaType::Unknown
-            && pl.selector.kind.is_none()
-            && pl.selector.index.is_none();
-        if !needs_expand {
-            out.push(pl);
-            continue;
-        }
-        let Some(pump) = sources_by_uri.get(&pl.source_uri) else {
-            out.push(pl);
-            continue;
-        };
-        let streams = pump.streams();
-        if streams.is_empty() {
-            out.push(pl);
-            continue;
-        }
-        for s in streams {
-            let selector = ResolvedSelector {
-                kind: Some(s.params.media_type),
-                index: None,
-            };
-            out.push(pl.duplicate_pre_instantiate(s.params.media_type, selector));
+        match sources_by_uri.get(&pl.source_uri) {
+            Some(pump) => fan_out_one(pl, pump.streams(), &mut out),
+            None => out.push(pl),
         }
     }
     out
+}
+
+/// Fan one track runtime out over `streams` if it needs expansion,
+/// else pass it through unchanged. Shared by [`expand_all_tracks`] and
+/// [`expand_all_tracks_pump`].
+///
+/// Each duplicate's selector is pinned to `(kind, per-kind ordinal)` —
+/// [`select_stream`]'s `index` counts within the pool of streams
+/// matching `kind`, so the ordinal restarts at 0 for every media type.
+/// Pinning the ordinal (rather than leaving `index: None`) is what
+/// makes two source streams of the SAME kind resolve to two distinct
+/// runtimes: with `index: None` every duplicate collapsed onto the
+/// first matching stream, so the second audio stream of a dual-audio
+/// source was silently replaced by a copy of the first.
+fn fan_out_one(pl: TrackRuntime, streams: &[StreamInfo], out: &mut Vec<TrackRuntime>) {
+    let needs_expand =
+        pl.kind == MediaType::Unknown && pl.selector.kind.is_none() && pl.selector.index.is_none();
+    if !needs_expand || streams.is_empty() {
+        out.push(pl);
+        return;
+    }
+    let mut per_kind: HashMap<MediaType, u32> = HashMap::new();
+    for s in streams {
+        let kind = s.params.media_type;
+        let ordinal = per_kind.entry(kind).or_insert(0);
+        let selector = ResolvedSelector {
+            kind: Some(kind),
+            index: Some(*ordinal),
+        };
+        *ordinal += 1;
+        out.push(pl.duplicate_pre_instantiate(kind, selector));
+    }
 }
 
 pub(crate) fn port_spec_from_params(cp: &CodecParameters, tb: TimeBase) -> PortSpec {
