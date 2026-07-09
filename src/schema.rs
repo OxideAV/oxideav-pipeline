@@ -444,6 +444,12 @@ impl Job {
             if key.is_empty() {
                 return Err(Error::invalid("job: empty top-level key"));
             }
+            if key == "@" {
+                return Err(Error::invalid(
+                    "job: `@` is not a valid key (alias names need at least \
+                     one character after the `@`)",
+                ));
+            }
             if key.starts_with('@') && !RESERVED_SINKS.contains(&key.as_str()) {
                 job.aliases.insert(key.clone(), spec);
             } else {
@@ -594,6 +600,16 @@ mod tests {
     fn rejects_non_object_top_level() {
         assert!(Job::from_json("42").is_err());
         assert!(Job::from_json("[]").is_err());
+    }
+
+    #[test]
+    fn rejects_bare_at_key() {
+        // `"@"` would create an alias whose name is empty after the
+        // sigil — unreferencable (`{"from": "@"}` errors as an empty
+        // alias name) and almost certainly a typo. Reject at parse.
+        let e = Job::from_json(r#"{"@": {"audio": [{"from": "a.wav"}]}}"#).unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("alias names"), "got: {msg}");
     }
 
     #[test]

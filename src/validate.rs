@@ -1,8 +1,8 @@
 //! Validate a parsed `Job`: reference integrity + alias-cycle detection.
 
-use oxideav_core::{Error, Result};
+use oxideav_core::{Error, MediaType, Result};
 
-use crate::schema::{is_reserved_sink, parse_pixel_format, Job, OutputSpec, TrackInput};
+use crate::schema::{is_reserved_sink, parse_pixel_format, Job, OutputSpec, TrackInput, TrackSpec};
 
 impl Job {
     /// Walk every track input to confirm:
@@ -30,16 +30,57 @@ impl Job {
     }
 
     fn check_refs_in_spec(&self, ctx_name: &str, spec: &OutputSpec) -> Result<()> {
-        let all_tracks = spec
-            .audio
-            .iter()
-            .chain(&spec.video)
-            .chain(&spec.subtitle)
-            .chain(&spec.all);
-        for track in all_tracks {
-            self.check_refs_in_input(ctx_name, &track.input)?;
+        let buckets: [(&[TrackSpec], Option<MediaType>); 4] = [
+            (&spec.audio, Some(MediaType::Audio)),
+            (&spec.video, Some(MediaType::Video)),
+            (&spec.subtitle, Some(MediaType::Subtitle)),
+            (&spec.all, None),
+        ];
+        for (tracks, bucket_kind) in buckets {
+            for track in tracks {
+                self.check_track(ctx_name, track, bucket_kind)?;
+            }
         }
         Ok(())
+    }
+
+    fn check_track(
+        &self,
+        ctx_name: &str,
+        track: &TrackSpec,
+        bucket_kind: Option<MediaType>,
+    ) -> Result<()> {
+        // An explicitly-empty codec is always a mistake: `codec`
+        // omitted means stream-copy, and a named codec must be a
+        // non-blank id. Catch it here with the track context —
+        // otherwise it survives to codec resolution and fails with
+        // an opaque "no codec registered for \"\"".
+        if let Some(c) = &track.codec {
+            if c.trim().is_empty() {
+                return Err(Error::invalid(format!(
+                    "job: {ctx_name}: empty `codec` \
+                     (omit the key for stream-copy, or name a codec id)"
+                )));
+            }
+        }
+        // A kind-specific bucket combined with a stream_selector naming
+        // a DIFFERENT kind is contradictory: the selector kind wins at
+        // DAG-build, so the selected stream's media type would not
+        // match the track label the muxer is told about. Only the
+        // `all:` bucket (bucket_kind == None) may carry an arbitrary
+        // selector kind.
+        if let (Some(bucket), Some(sel)) = (bucket_kind, &track.stream_selector) {
+            if let Some(sel_kind) = sel.kind {
+                if sel_kind != bucket {
+                    return Err(Error::invalid(format!(
+                        "job: {ctx_name}: stream_selector kind {sel_kind:?} \
+                         contradicts the {bucket:?} track list it appears in \
+                         (move the track to `all:` or drop the selector kind)"
+                    )));
+                }
+            }
+        }
+        self.check_refs_in_input(ctx_name, &track.input)
     }
 
     fn check_refs_in_input(&self, ctx: &str, input: &TrackInput) -> Result<()> {
@@ -229,5 +270,89 @@ mod tests {
     fn rejects_reserved_sink_as_source() {
         let j = Job::from_json(r#"{"out.mkv": {"audio": [{"from": "@display"}]}}"#).unwrap();
         assert!(j.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_codec_string() {
+        let j =
+            Job::from_json(r#"{"out.mkv": {"audio": [{"from": "a.wav", "codec": ""}]}}"#).unwrap();
+        let e = j.validate().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("empty `codec`"), "got: {msg}");
+        assert!(msg.contains("out.mkv"), "error must carry ctx, got: {msg}");
+    }
+
+    #[test]
+    fn rejects_whitespace_codec_string() {
+        let j = Job::from_json(r#"{"out.mkv": {"audio": [{"from": "a.wav", "codec": "  "}]}}"#)
+            .unwrap();
+        assert!(j.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_empty_codec_inside_alias() {
+        // The codec check must apply to alias bodies too, not just
+        // outputs — the validate loop chains both maps.
+        let j = Job::from_json(
+            r#"{
+                "@x": {"audio": [{"from": "a.wav", "codec": ""}]},
+                "out.mkv": {"audio": [{"from": "@x"}]}
+            }"#,
+        )
+        .unwrap();
+        assert!(j.validate().is_err());
+    }
+
+    #[test]
+    fn accepts_named_codec() {
+        let j = Job::from_json(r#"{"out.flac": {"audio": [{"from": "a.wav", "codec": "flac"}]}}"#)
+            .unwrap();
+        j.validate().unwrap();
+    }
+
+    #[test]
+    fn rejects_selector_kind_contradicting_bucket() {
+        // A `video` selector inside the `audio:` list would win at
+        // DAG-build and mux a video stream under an Audio track label.
+        let j = Job::from_json(
+            r#"{"out.mkv": {"audio": [{"from": "a.mkv", "stream_selector": {"type": "video"}}]}}"#,
+        )
+        .unwrap();
+        let e = j.validate().unwrap_err();
+        let msg = format!("{e}");
+        assert!(msg.contains("contradicts"), "got: {msg}");
+    }
+
+    #[test]
+    fn accepts_selector_kind_matching_bucket() {
+        // Redundant but consistent — `audio` selector in the audio list
+        // (useful for its `index` field) stays legal.
+        let j = Job::from_json(
+            r#"{"out.mkv": {"audio": [{"from": "a.mkv", "stream_selector": {"type": "audio", "index": 1}}]}}"#,
+        )
+        .unwrap();
+        j.validate().unwrap();
+    }
+
+    #[test]
+    fn accepts_any_selector_kind_in_all_bucket() {
+        // `all:` has no bucket kind, so an explicit selector kind is the
+        // only way to constrain it — must stay legal.
+        let j = Job::from_json(
+            r#"{"out.mkv": {"all": [{"from": "a.mkv", "stream_selector": {"type": "video"}}]}}"#,
+        )
+        .unwrap();
+        j.validate().unwrap();
+    }
+
+    #[test]
+    fn kind_free_selector_in_kind_bucket_stays_legal() {
+        // index-only selector inside a typed bucket: no contradiction
+        // (the bucket kind fills in), must pass.
+        let j = Job::from_json(
+            r#"{"out.mkv": {"video": [{"from": "a.mkv", "stream_selector": {"index": 2}}]}}"#,
+        )
+        .unwrap();
+        j.validate().unwrap();
     }
 }

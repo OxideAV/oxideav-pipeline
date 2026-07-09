@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Validation completeness: `Job::validate` now rejects an explicitly
+  empty / whitespace `codec` string with the track context (previously
+  it survived to codec resolution and failed with an opaque "no codec
+  registered" message), and rejects a `stream_selector` whose `kind`
+  contradicts the typed track list it appears in (`video` selector
+  inside `audio: [...]` — the selector kind won at DAG-build and muxed
+  a mislabeled stream). Kind-free selectors in typed buckets and
+  arbitrary selector kinds inside `all:` stay legal. `Job::from_json`
+  additionally rejects the bare `@` top-level key (an alias whose name
+  is empty after the sigil is unreferencable).
+
 ### Fixed
 
 - `all:` track fan-out now pins each duplicate's selector to a
