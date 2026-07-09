@@ -1902,8 +1902,9 @@ impl ExecutorHandle {
     }
 
     /// Issue a seek to `(stream_idx, pts)` in `time_base` units. The
-    /// demuxer thread receives the command, calls `demuxer.seek_to`,
-    /// then broadcasts exactly one barrier on every route:
+    /// source-pump thread receives the command, calls `demuxer.seek_to`
+    /// (bytes-shape sources), then broadcasts exactly one barrier on
+    /// every route:
     ///
     /// * [`crate::BarrierKind::SeekFlush`] if the demuxer reported a
     ///   successful seek. Workers reset codec / filter state, the
@@ -1911,7 +1912,9 @@ impl ExecutorHandle {
     /// * [`crate::BarrierKind::SeekRejected`] if `demuxer.seek_to`
     ///   returned an error (Unsupported, no SEEKTABLE, etc). The
     ///   pipeline keeps producing packets from where it was; the
-    ///   engine should disable seek UI for the session.
+    ///   engine should disable seek UI for the session. Packet- and
+    ///   frame-shape sources have no seek surface at all, so every
+    ///   seek against them is answered with `SeekRejected` too.
     ///
     /// Callers must therefore handle BOTH barrier kinds when matching
     /// on `generation`. The send itself only fails if the executor

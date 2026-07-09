@@ -22,6 +22,61 @@ returned by `SourceRegistry::open`:
 The shape is decided by the driver at registration time; jobs reference URIs
 identically across the three.
 
+All three shapes run on **both executor paths**. The pipelined
+(stage-per-thread) runner spawns one source-pump thread per URI shaped
+by the source kind: bytes-shape URIs get a demuxer thread, packet-shape
+URIs get the same per-stream fan-out without the container layer, and
+frame-shape URIs get a frame pump feeding the per-track frame-stage
+chains directly (no demux, no decode stage). `Executor::spawn` — the
+playback path with the live seek / progress / abort handle — therefore
+works over typed sources too; a seek dispatched against a packet- or
+frame-shape source (no seek surface on those traits) surfaces
+`BarrierKind::SeekRejected` with the dispatch generation and the stream
+keeps flowing. Serial/pipelined stats parity is pinned by
+`tests/typed_source_staged.rs`.
+
+## Graph validation
+
+`Job::validate` walks every output/alias spec and rejects, with the
+offending key in the message: empty specs, unresolved / reserved-sink
+alias references, alias cycles (with the full path), empty `from`,
+empty filter names, unknown pixel-format names, empty render3d
+source/backend fields, explicitly-empty `codec` strings, and a
+`stream_selector` whose `kind` contradicts the typed track list it
+appears in. `Job::to_dag` additionally carries its own defensive
+cycle guard, so calling it on an unvalidated cyclic job returns
+`Err(InvalidData)` instead of overflowing the stack during alias
+inlining (legal diamond re-use of one alias from several tracks still
+resolves).
+
+## `all:` fan-out over same-kind streams
+
+An `all:` track expands into one runtime per source stream once the
+source is open, each pinned to a `(kind, per-kind ordinal)` selector —
+so a dual-audio source produces two distinct output tracks rather than
+two copies of the first audio stream. Pinned by
+`tests/all_tracks_fan_out_same_kind.rs` (serial + pipelined) via a
+dual-stream stub demuxer with per-stream payload fill bytes.
+
+## Error propagation
+
+A failing node surfaces the ORIGINAL error from `Executor::run` on
+both paths — `AbortState` keeps the first error, later cascade
+symptoms are dropped, and the abort cascade wakes every blocked worker
+(no hang). Serial delivers all pre-failure frames before surfacing the
+error; the pipelined path deliberately trades in-flight frames
+(bounded by the channel depths) for prompt teardown — the same
+tradeoff `ExecutorHandle::stop` relies on. See
+`tests/error_propagation.rs`.
+
+## Benchmarks
+
+`cargo bench -p oxideav-pipeline --bench graph` — criterion
+micro-benchmarks over the graph-resolution cold path (`Job::from_json`
+/ `validate` / `to_dag` on wide, deep, and alias-chained synthetic
+jobs) plus `Dag::describe` and the `TrackInput::walk` / `leaf`
+accessors. Pure in-memory jobs; no fixtures, no codecs.
+
 ## Per-packet decoder error tolerance
 
 A decoder error on a single packet (e.g. an AAC frame with a recoverable

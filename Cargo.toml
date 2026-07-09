@@ -35,3 +35,11 @@ default = []
 # crate has zero codec/container dev-deps.
 [dev-dependencies]
 oxideav-audio-filter = "0.1"
+criterion = "0.5"
+
+# Graph-resolution micro-benchmarks (pure in-crate synthetic jobs; no
+# fixtures, no codecs). Run with:
+#     cargo bench -p oxideav-pipeline --bench graph
+[[bench]]
+name = "graph"
+harness = false

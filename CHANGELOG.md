@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Error-propagation coherence pinned by `tests/error_propagation.rs`:
+  a failing sink or a mid-stream source failure surfaces the original
+  typed error from `Executor::run` on both executor paths — no hang,
+  first-error-wins, serial delivers all pre-failure frames, pipelined
+  trades in-flight frames (bounded by channel depth) for prompt
+  teardown.
+- Criterion micro-benchmarks (`benches/graph.rs`) over the
+  graph-resolution cold path: parse / validate / to_dag on wide (64
+  tracks), deep (64 nested filters), and alias-chained (64 links)
+  synthetic jobs, plus `Dag::describe` and `TrackInput::walk` / `leaf`.
 - The staged (pipelined) runner now drives packet-shape and
   frame-shape sources natively. Bytes-shape URIs keep their demuxer
   thread; packet-shape URIs (RTMP-style) get an identical packet-pump
@@ -37,6 +47,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `TrackInput` deserialization is now key-directed (pick the variant
+  by which of `from` / `convert` / `render3d` / `filter` is present,
+  in the historical priority order) instead of `#[serde(untagged)]`.
+  The untagged derive re-tried every candidate variant at every
+  nesting level of the recursive `input` field, making parse cost
+  grow exponentially with filter-chain depth — a 64-deep chain
+  effectively never finished parsing (found by the new `deep-64`
+  bench, which ran 15+ minutes without completing). Key-directed
+  dispatch parses the same chain in microseconds; a missing
+  discriminator now reports the four expected keys instead of
+  serde's generic "did not match any variant". Wire format unchanged.
 - `all:` track fan-out now pins each duplicate's selector to a
   `(kind, per-kind ordinal)` pair. Pre-fix the expansion left the
   ordinal as `index: None`, so a source with two streams of the SAME
