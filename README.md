@@ -69,6 +69,26 @@ error; the pipelined path deliberately trades in-flight frames
 tradeoff `ExecutorHandle::stop` relies on. See
 `tests/error_propagation.rs`.
 
+## Multi-output parallelism
+
+A job with several outputs and `threads ≥ 2` runs its outputs
+**concurrently**: outputs are chunked into document-order waves whose
+width is `ExecutionContext::effective_workers(n_outputs)` — the same
+budget clamp codecs use for internal fan-out — and each wave's outputs
+run on scoped threads, each granted an even split of the job budget as
+its codec-internal `ExecutionContext`. Preparation (source opens,
+codec instantiation, sink resolution) stays sequential in document
+order, so setup errors keep their precedence and never interleave. If
+an output fails, `Executor::run` surfaces the error of the *earliest
+failing output in document order* — deterministic under any thread
+timing; healthy wave-mates still run to completion and deliver their
+full streams, and waves after the failure never start (matching the
+sequential contract that outputs after a failure don't run).
+`threads == 1` keeps the historical strictly-sequential serial loop.
+The budget itself resolves through the framework's single threading
+authority: `with_threads(n)` > the job's `threads` key >
+`ExecutionContext::auto()`. See `tests/multi_output_parallel.rs`.
+
 ## Benchmarks
 
 `cargo bench -p oxideav-pipeline --bench graph` — criterion

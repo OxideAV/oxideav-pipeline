@@ -9,8 +9,13 @@
 //!   per track, bounded mpsc channels in between, mux on the caller
 //!   thread so sinks don't need to be `Send`. See [`crate::pipeline`].
 //!
-//! Outputs within one job still run sequentially — multi-output
-//! parallelism is a deliberate follow-up.
+//! Multi-output jobs run their outputs **concurrently** on the
+//! pipelined path: outputs are chunked into document-order waves whose
+//! width is clamped through [`ExecutionContext::effective_workers`]
+//! (the same budget clamp codecs use for their internal fan-out), each
+//! wave's outputs run on scoped threads, and the per-output codec
+//! budget is the wave's even split of the job budget. `threads == 1`
+//! keeps the historical strictly-sequential serial loop.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -273,14 +278,22 @@ impl<'a> Executor<'a> {
         self
     }
 
-    /// Validate, resolve, and run the job. Processes outputs in their
-    /// document order.
+    /// Validate, resolve, and run the job.
+    ///
+    /// With `threads == 1` (or a single output on any budget) outputs
+    /// process strictly in their document order, one at a time. With
+    /// `threads ≥ 2` and several outputs, outputs run **concurrently**
+    /// in document-order waves — see [`Self::run_outputs_parallel`]
+    /// for the wave/budget model and the error-precedence contract.
     pub fn run(mut self) -> Result<ExecutorStats> {
         self.job.validate()?;
         let dag = self.job.to_dag()?;
         let threads = self.resolve_threads();
-        let mut stats = ExecutorStats::default();
         let names: Vec<String> = dag.roots.keys().cloned().collect();
+        if threads >= 2 && names.len() >= 2 {
+            return self.run_outputs_parallel(&dag, &names, threads);
+        }
+        let mut stats = ExecutorStats::default();
         for name in names {
             let out_stats = if threads >= 2 {
                 self.run_output_pipelined(&dag, &name, threads)?
@@ -288,6 +301,92 @@ impl<'a> Executor<'a> {
                 self.run_output(&dag, &name)?
             };
             stats.merge(&out_stats);
+        }
+        Ok(stats)
+    }
+
+    /// Run a multi-output job with the outputs executing concurrently.
+    ///
+    /// **Wave model.** Outputs are processed in document-order chunks
+    /// ("waves"). The wave width is
+    /// `ExecutionContext::with_threads(threads).effective_workers(n_outputs)`
+    /// — the exact clamp codecs use for internal fan-out, so a
+    /// 64-output job on a 4-thread budget runs at most 4 outputs at a
+    /// time instead of spawning 64 pipelines at once. Within a wave,
+    /// every output gets an even split of the job budget
+    /// (`threads / wave_width`, floored, min 1) as its codec-internal
+    /// [`ExecutionContext`] budget; the structural stage-per-thread
+    /// pipeline is used for every output either way. The next wave
+    /// starts only after every output of the current wave finished.
+    ///
+    /// **Preparation stays sequential.** Source opening, codec
+    /// instantiation, and sink resolution for a wave happen on the
+    /// caller thread in document order before the wave spawns, so
+    /// setup errors keep their document-order precedence and never
+    /// interleave.
+    ///
+    /// **Error precedence.** If any output of a wave fails, `run`
+    /// returns the error of the *earliest failing output in document
+    /// order* (deterministic regardless of thread timing), and later
+    /// waves never start. Unlike the sequential path, the failing
+    /// output's wave-mates run to completion before the error
+    /// surfaces — each output is an independent pipeline with its own
+    /// abort cascade, and a healthy sibling's data is delivered rather
+    /// than discarded. Outputs in waves after the failure never start,
+    /// matching the sequential contract.
+    fn run_outputs_parallel(
+        &mut self,
+        dag: &Dag,
+        names: &[String],
+        threads: usize,
+    ) -> Result<ExecutorStats> {
+        let budget = ExecutionContext::with_threads(threads);
+        let wave_width = budget.effective_workers(names.len());
+        let per_output = (threads / wave_width).max(1);
+        let mut stats = ExecutorStats::default();
+        for wave in names.chunks(wave_width) {
+            // Prepare sequentially (document order) on the caller
+            // thread; run the prepared outputs concurrently.
+            let mut preps = Vec::with_capacity(wave.len());
+            for name in wave {
+                preps.push((
+                    name.clone(),
+                    self.prepare_pipelined_run(dag, name, per_output)?,
+                ));
+            }
+            let results: Vec<Result<ExecutorStats>> = std::thread::scope(|s| {
+                let handles: Vec<_> = preps
+                    .into_iter()
+                    .map(|(name, prep)| {
+                        std::thread::Builder::new()
+                            .name(format!("pipeline-out-{name}"))
+                            .spawn_scoped(s, move || {
+                                staged::run_pipelined(
+                                    prep.pipelines,
+                                    prep.sources_by_uri,
+                                    prep.sink,
+                                    prep.out_streams,
+                                    prep.channel_caps,
+                                    prep.max_queue_bytes,
+                                )
+                            })
+                            .expect("oxideav-pipeline: failed to spawn output thread")
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|h| {
+                        h.join().unwrap_or_else(|_| {
+                            Err(Error::other("pipeline: output worker thread panicked"))
+                        })
+                    })
+                    .collect()
+            });
+            // Document-order iteration ⇒ the first error returned is
+            // the earliest failing output in document order.
+            for r in results {
+                stats.merge(&r?);
+            }
         }
         Ok(stats)
     }
@@ -322,8 +421,16 @@ impl<'a> Executor<'a> {
     }
 
     /// Resolve the effective thread budget. Priority: explicit
-    /// `with_threads(n > 0)` > `job.threads` > `available_parallelism()`
-    /// > `1`.
+    /// `with_threads(n > 0)` > `job.threads` > host autodetect.
+    ///
+    /// The autodetect goes through [`ExecutionContext::auto`] rather
+    /// than querying the host directly — `ExecutionContext` is the
+    /// single threading authority in the framework, and host-derived
+    /// budgets are the caller-side decision it encapsulates. The
+    /// executor is that caller; everything downstream (codec fan-out,
+    /// the multi-output wave width) clamps through
+    /// [`ExecutionContext::effective_workers`] against the budget
+    /// resolved here.
     fn resolve_threads(&self) -> usize {
         if let Some(n) = self.explicit_threads {
             if n > 0 {
@@ -335,9 +442,7 @@ impl<'a> Executor<'a> {
                 return n;
             }
         }
-        std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(1)
+        ExecutionContext::auto().threads
     }
 
     fn run_output(&mut self, dag: &Dag, name: &str) -> Result<ExecutorStats> {
@@ -391,6 +496,20 @@ impl<'a> Executor<'a> {
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
         }
+
+        // Drop pumps no track of THIS output uses — the DAG probe in
+        // `resolve_source_shapes` opens every source leaf in the
+        // document, but this run is per-output. Without the retain the
+        // pump loop below would drain (and stat-count) sources that
+        // belong to the job's OTHER outputs: on a multi-output job
+        // every output re-read every source, inflating `packets_read`
+        // and doing dead work proportional to the output count. The
+        // pipelined path has always dropped them in
+        // `prepare_pipelined_run`; this keeps serial/pipelined stats
+        // parity on multi-output jobs.
+        let used: std::collections::HashSet<&String> =
+            pipelines.iter().map(|pl| &pl.source_uri).collect();
+        sources_by_uri.retain(|uri, _| used.contains(uri));
 
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format. Runs after the source is

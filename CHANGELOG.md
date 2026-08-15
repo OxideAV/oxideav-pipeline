@@ -9,6 +9,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Multi-output parallelism: `Executor::run` on a job with several
+  outputs and `threads ≥ 2` now runs the outputs concurrently instead
+  of one after another (closing the long-standing "multi-output
+  parallelism is a deliberate follow-up" note in the executor module
+  doc). Outputs are chunked into document-order waves whose width is
+  clamped through `ExecutionContext::effective_workers(n_outputs)` —
+  the same clamp codecs use for internal fan-out — and each wave's
+  outputs run on scoped threads with an even split of the job budget
+  as their codec-internal `ExecutionContext`. Preparation stays
+  sequential in document order (setup-error precedence unchanged).
+  Error contract: the earliest failing output in DOCUMENT order wins
+  deterministically, healthy wave-mates still deliver their complete
+  streams, and waves after the failure never start. `threads == 1`
+  keeps the strictly-sequential serial loop; `spawn()` remains
+  single-output. Pinned by `tests/multi_output_parallel.rs`
+  (completeness + serial stats parity, a rendezvous proving real
+  overlap, wave-width ≤ budget, and three error-precedence /
+  wave-teardown contracts).
+
+### Changed
+
+- The executor's thread-budget autodetect goes through
+  `ExecutionContext::auto()` instead of querying host parallelism
+  directly — `ExecutionContext` is the framework's single threading
+  authority, and every downstream clamp (codec fan-out, the new
+  multi-output wave width) derives from the budget it resolves.
+
+### Fixed
+
+- The serial path (`threads == 1` / single-thread `run`) no longer
+  pumps sources that belong to the job's OTHER outputs. The source
+  probe opens every source leaf in the document, but `run_output`'s
+  pump loop then drained every opened source to EOF — on a
+  multi-output job every output re-read every other output's source,
+  inflating `ExecutorStats::packets_read` (2× on a two-output job) and
+  doing dead demux work quadratic in the output count. The pipelined
+  path has always dropped route-less pumps in `prepare_pipelined_run`;
+  the serial path now retains only the URIs its own tracks reference,
+  restoring serial/pipelined stats parity on multi-output jobs (pinned
+  by `tests/multi_output_parallel.rs`).
+
 - Error-propagation coherence pinned by `tests/error_propagation.rs`:
   a failing sink or a mid-stream source failure surfaces the original
   typed error from `Executor::run` on both executor paths — no hang,
