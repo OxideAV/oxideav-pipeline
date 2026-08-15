@@ -485,3 +485,106 @@ fn waves_after_a_failure_never_start() {
         assert_eq!(payloads.load(Ordering::SeqCst), 0, "{name} received data");
     }
 }
+
+// ───────────────────────── hostile / edge cases ──────────────────────
+
+#[test]
+fn outputs_sharing_one_source_uri_run_in_parallel() {
+    // Both outputs read the SAME source URI. Each output's prepare
+    // opens its own pump (independent read positions), so neither
+    // output may starve or double-read: both must deliver the full
+    // stream.
+    let src = common::stub::touch("mop_shared_src");
+    let job = Job::from_json(&format!(
+        r#"{{
+            "outa": {{"audio": [{{"from": "{0}"}}]}},
+            "outb": {{"audio": [{{"from": "{0}"}}]}}
+        }}"#,
+        json_path(&src),
+    ))
+    .expect("parse job");
+    let ctx = stub_ctx();
+    let (sink_a, _, payloads_a) = CountingSink::boxed();
+    let (sink_b, _, payloads_b) = CountingSink::boxed();
+    let stats = Executor::new(&job, &ctx)
+        .with_threads(4)
+        .with_sink_override("outa", sink_a)
+        .with_sink_override("outb", sink_b)
+        .run()
+        .expect("run");
+    assert_eq!(payloads_a.load(Ordering::SeqCst), STUB_PACKETS);
+    assert_eq!(payloads_b.load(Ordering::SeqCst), STUB_PACKETS);
+    assert_eq!(stats.packets_read as usize, 2 * STUB_PACKETS);
+}
+
+#[test]
+fn tight_budgets_propagate_to_every_wave_output() {
+    // The channel-depth and byte-ceiling knobs are per-Executor but
+    // must reach EVERY prepared output across waves. Tightest legal
+    // caps + a tiny byte ceiling on a 4-output/2-thread job: all four
+    // outputs still deliver their complete streams (the budgets bound
+    // memory, never correctness).
+    let ctx = stub_ctx();
+    let mut json = String::from("{");
+    for (i, name) in ["t0", "t1", "t2", "t3"].iter().enumerate() {
+        let src = common::stub::touch(&format!("mop_tight_{name}"));
+        if i > 0 {
+            json.push(',');
+        }
+        json.push_str(&format!(
+            r#""{name}": {{"audio": [{{"from": "{}"}}]}}"#,
+            json_path(&src)
+        ));
+    }
+    json.push('}');
+    let job = Job::from_json(&json).expect("parse job");
+    let mut exec = Executor::new(&job, &ctx)
+        .with_threads(2)
+        .with_channel_caps(oxideav_pipeline::ChannelCaps {
+            packets: 1,
+            frames: 1,
+        })
+        .with_max_queue_bytes(64);
+    let mut counters = Vec::new();
+    for name in ["t0", "t1", "t2", "t3"] {
+        let (sink, _, payloads) = CountingSink::boxed();
+        exec = exec.with_sink_override(name, sink);
+        counters.push(payloads);
+    }
+    let stats = exec.run().expect("run");
+    for (i, payloads) in counters.iter().enumerate() {
+        assert_eq!(
+            payloads.load(Ordering::SeqCst),
+            STUB_PACKETS,
+            "output t{i} incomplete under tight budgets"
+        );
+    }
+    assert_eq!(stats.packets_read as usize, 4 * STUB_PACKETS);
+}
+
+#[test]
+fn spawn_still_rejects_multi_output_jobs() {
+    // `spawn()` remains single-output (the playback path); the
+    // multi-output parallelism lives in `run()`. Pin the guidance in
+    // the error so the two contracts don't silently drift apart.
+    let src_a = common::stub::touch("mop_spawn_a");
+    let src_b = common::stub::touch("mop_spawn_b");
+    let job = Job::from_json(&format!(
+        r#"{{
+            "outa": {{"audio": [{{"from": "{}"}}]}},
+            "outb": {{"audio": [{{"from": "{}"}}]}}
+        }}"#,
+        json_path(&src_a),
+        json_path(&src_b),
+    ))
+    .expect("parse job");
+    let ctx = stub_ctx();
+    let msg = match Executor::new(&job, &ctx).spawn() {
+        Ok(_) => panic!("spawn must reject multi-output jobs"),
+        Err(e) => format!("{e}"),
+    };
+    assert!(
+        msg.contains("single output"),
+        "error should direct callers to run(), got: {msg}"
+    );
+}

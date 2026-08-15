@@ -223,3 +223,56 @@ fn mixed_seekability_answers_flush_and_rejected_same_generation() {
     );
     handle.stop().expect("stop");
 }
+
+#[test]
+fn seek_burst_delivers_one_barrier_per_source_per_generation() {
+    // Rapid-fire seeks (scrubbing): every dispatched generation must
+    // produce exactly ONE barrier per routed source — no coalescing
+    // that drops a generation on one source but not the other, no
+    // duplicates.
+    let src_a = common::stub::touch("seek_multi_burst_a");
+    let src_b = common::stub::touch("seek_multi_burst_b");
+    let (handle, rx) = spawn_two_source_job(&src_a, &src_b);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    wait_first_payload(&rx, deadline);
+
+    let tb = TimeBase::new(1, common::stub::SAMPLE_RATE as i64);
+    let targets = [80_000i64, 160_000, 240_000];
+    let mut generations = Vec::new();
+    for t in targets {
+        generations.push(handle.seek_with_generation(0, t, tb).expect("seek"));
+    }
+
+    let barriers = collect_barriers(&rx, 6, deadline);
+    assert_eq!(
+        barriers.len(),
+        6,
+        "3 generations x 2 sources, got {barriers:?}"
+    );
+    for (gen, target) in generations.iter().zip(targets) {
+        let matching: Vec<_> = barriers
+            .iter()
+            .filter(|b| match b {
+                BarrierKind::SeekFlush {
+                    generation,
+                    landed_pts,
+                    ..
+                } => {
+                    if generation == gen {
+                        assert_eq!(*landed_pts, target, "generation {gen} landed off-target");
+                        true
+                    } else {
+                        false
+                    }
+                }
+                BarrierKind::SeekRejected { generation } => generation == gen,
+            })
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "generation {gen} must appear once per source, got {barriers:?}"
+        );
+    }
+    handle.stop().expect("stop");
+}

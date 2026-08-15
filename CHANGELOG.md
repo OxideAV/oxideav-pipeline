@@ -47,6 +47,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SeekRejected` (same generation) with the stream still flowing
   after.
 
+- Hostile/edge coverage for the two contracts above: two parallel
+  outputs sharing ONE source URI (independent pumps, both deliver in
+  full), the tightest channel caps + a tiny byte ceiling propagating
+  to every output across waves, `spawn()`'s single-output rejection
+  pinned by message, and rapid multi-source seek bursts (every
+  generation produces exactly one barrier per routed source — no
+  coalescing, no duplicates).
+
 ### Changed
 
 - The executor's thread-budget autodetect goes through
