@@ -588,3 +588,148 @@ fn spawn_still_rejects_multi_output_jobs() {
         "error should direct callers to run(), got: {msg}"
     );
 }
+
+// ───────────────────── gating contract (opt-out) ─────────────────────
+
+/// Rendezvous counter for the serial-gating test (its own static so
+/// the concurrently-running overlap test can't interfere).
+static GATE_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+/// Like [`RendezvousSource`] but with a short deadline and its own
+/// counter: used to prove the ABSENCE of concurrency on `threads == 1`.
+struct GateSource {
+    params: CodecParameters,
+    rendezvoused: bool,
+}
+
+impl FrameSource for GateSource {
+    fn params(&self) -> &CodecParameters {
+        &self.params
+    }
+    fn next_frame(&mut self) -> Result<Frame> {
+        if !self.rendezvoused {
+            self.rendezvoused = true;
+            GATE_STARTED.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while GATE_STARTED.load(Ordering::SeqCst) < 2 {
+                if Instant::now() >= deadline {
+                    return Err(Error::other(
+                        "rendezvous timed out: outputs did not run concurrently",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        Err(Error::Eof)
+    }
+}
+
+#[test]
+fn threads_one_never_runs_outputs_concurrently() {
+    // `threads == 1` is the documented opt-out: outputs run strictly
+    // one at a time. With rendezvous sources that only proceed when
+    // both are pumping, a sequential run MUST time out — a passing
+    // rendezvous here would mean the opt-out silently stopped
+    // guaranteeing serial execution.
+    let mut ctx = stub_ctx();
+    ctx.sources.register_frames("mopgate", |_uri| {
+        Ok(Box::new(GateSource {
+            params: audio_params("mop_pcm"),
+            rendezvoused: false,
+        }))
+    });
+    let job = Job::from_json(&format!(
+        r#"{{
+            "outa": {{"audio": [{{"from": "mopgate://a", "codec": "{enc}"}}]}},
+            "outb": {{"audio": [{{"from": "mopgate://b", "codec": "{enc}"}}]}}
+        }}"#,
+        enc = common::stub::ENC_CODEC_ID,
+    ))
+    .expect("parse job");
+    let (sink_a, _, _) = CountingSink::boxed();
+    let (sink_b, _, _) = CountingSink::boxed();
+    let err = Executor::new(&job, &ctx)
+        .with_threads(1)
+        .with_sink_override("outa", sink_a)
+        .with_sink_override("outb", sink_b)
+        .run()
+        .expect_err("sequential outputs must not rendezvous");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("did not run concurrently"),
+        "expected the rendezvous timeout, got: {msg}"
+    );
+}
+
+/// Rendezvous counter for the job-level `threads` key test.
+static JOBTHR_STARTED: AtomicUsize = AtomicUsize::new(0);
+
+struct JobThreadsSource {
+    params: CodecParameters,
+    emitted: u64,
+    rendezvoused: bool,
+}
+
+impl FrameSource for JobThreadsSource {
+    fn params(&self) -> &CodecParameters {
+        &self.params
+    }
+    fn next_frame(&mut self) -> Result<Frame> {
+        if !self.rendezvoused {
+            self.rendezvoused = true;
+            JOBTHR_STARTED.fetch_add(1, Ordering::SeqCst);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while JOBTHR_STARTED.load(Ordering::SeqCst) < 2 {
+                if Instant::now() >= deadline {
+                    return Err(Error::other(
+                        "rendezvous timed out: outputs did not run concurrently",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        if self.emitted >= 5 {
+            return Err(Error::Eof);
+        }
+        let pts = (self.emitted * 16) as i64;
+        self.emitted += 1;
+        Ok(Frame::Audio(AudioFrame {
+            samples: 16,
+            pts: Some(pts),
+            data: vec![vec![0u8; 32]],
+        }))
+    }
+}
+
+#[test]
+fn job_level_threads_key_gates_parallelism_like_with_threads() {
+    // The job document's own `"threads"` meta key (no CLI override)
+    // must trigger multi-output parallelism through the same
+    // resolve_threads priority chain as `with_threads`.
+    let mut ctx = stub_ctx();
+    ctx.sources.register_frames("mopjobthr", |_uri| {
+        Ok(Box::new(JobThreadsSource {
+            params: audio_params("mop_pcm"),
+            emitted: 0,
+            rendezvoused: false,
+        }))
+    });
+    let job = Job::from_json(&format!(
+        r#"{{
+            "threads": 4,
+            "outa": {{"audio": [{{"from": "mopjobthr://a", "codec": "{enc}"}}]}},
+            "outb": {{"audio": [{{"from": "mopjobthr://b", "codec": "{enc}"}}]}}
+        }}"#,
+        enc = common::stub::ENC_CODEC_ID,
+    ))
+    .expect("parse job");
+    let (sink_a, _, payloads_a) = CountingSink::boxed();
+    let (sink_b, _, payloads_b) = CountingSink::boxed();
+    Executor::new(&job, &ctx)
+        .with_sink_override("outa", sink_a)
+        .with_sink_override("outb", sink_b)
+        .run()
+        .expect("job-level threads must enable the parallel path");
+    assert_eq!(payloads_a.load(Ordering::SeqCst), 5);
+    assert_eq!(payloads_b.load(Ordering::SeqCst), 5);
+}
