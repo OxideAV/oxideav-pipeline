@@ -122,6 +122,12 @@ fn audio_params(codec: &str) -> CodecParameters {
 /// Packets the default 60 s stub demuxer emits (100 ms per packet).
 const STUB_PACKETS: usize = 600;
 
+/// JSON-safe rendering of a filesystem path (escapes the Windows
+/// path separator, which is a JSON escape character).
+fn json_path(p: &std::path::Path) -> String {
+    p.display().to_string().replace('\\', "\\\\")
+}
+
 // ─────────────────── completeness + serial parity ────────────────────
 
 fn run_two_output_copy_job(threads: usize, tag: &str) -> (ExecutorStats, usize, usize) {
@@ -132,8 +138,8 @@ fn run_two_output_copy_job(threads: usize, tag: &str) -> (ExecutorStats, usize, 
             "outa": {{"audio": [{{"from": "{}"}}]}},
             "outb": {{"audio": [{{"from": "{}"}}]}}
         }}"#,
-        src_a.display(),
-        src_b.display(),
+        json_path(&src_a),
+        json_path(&src_b),
     ))
     .expect("parse job");
     let ctx = stub_ctx();
@@ -365,7 +371,7 @@ fn run_precedence_job(
         }
         json.push_str(&format!(
             r#""{name}": {{"audio": [{{"from": "{}"}}]}}"#,
-            src.display()
+            json_path(&src)
         ));
     }
     json.push('}');
@@ -444,7 +450,7 @@ fn waves_after_a_failure_never_start() {
         }
         json.push_str(&format!(
             r#""{name}": {{"audio": [{{"from": "{}"}}]}}"#,
-            src.display()
+            json_path(&src)
         ));
     }
     json.push('}');
