@@ -28,6 +28,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   overlap, wave-width ≤ budget, and three error-precedence /
   wave-teardown contracts).
 
+- Multi-source seek fan-out: a seek dispatched through
+  `ExecutorHandle` now reaches EVERY routed source of the job instead
+  of only the first (closing the "multi-URI seek is a follow-up" note
+  in the staged runner). The first routed source pump owns the
+  handle's receiver and forwards each `SeekCmd` to a dedicated channel
+  per sibling routed source before handling it locally; each source
+  answers with its own generation-stamped barrier (`SeekFlush` with
+  its landed pts, `SeekRejected` when it has no seek surface), so
+  every track observes exactly one barrier per dispatched generation.
+  A command addressing a stream a source doesn't route retargets that
+  source at its first routed stream with the pts rescaled into that
+  stream's time base (`resolve_seek_target`, unit-tested for the
+  passthrough / rescale / defensive arms), landing every source on the
+  same presentation instant. Pinned by `tests/seek_multi_source.rs`:
+  two seekable URIs both flush at the target with one generation, and
+  a seekable + unseekable mix answers one `SeekFlush` + one
+  `SeekRejected` (same generation) with the stream still flowing
+  after.
+
 ### Changed
 
 - The executor's thread-budget autodetect goes through

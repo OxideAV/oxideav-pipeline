@@ -277,6 +277,25 @@ that could silently desync with the demuxer's. The shorter
 callers that don't need correlation. See
 `tests/seek_with_generation.rs`.
 
+## Multi-source seek fan-out
+
+A job whose tracks come from several source URIs (separate audio +
+video files, say) re-anchors ALL of them on one
+`ExecutorHandle::seek`: the handle's receiver is owned by the first
+routed source pump, which forwards every `SeekCmd` to a dedicated
+channel per sibling routed source before handling it locally. Each
+source answers with its own barrier — `SeekFlush` with its landed pts
+(and the time base that pts is expressed in), or `SeekRejected` when
+it has no seek surface — all stamped with the dispatch generation, so
+every track observes exactly one barrier per generation. A command
+addressing a stream a source doesn't route still seeks that source:
+it retargets at its first routed stream with the pts rescaled into
+that stream's time base, landing every source on the same presentation
+instant. Historically only the first routed source received the seek
+and the others silently kept their old position. See
+`tests/seek_multi_source.rs` plus the `resolve_seek_target` unit
+tests.
+
 ## TrackInput typed accessors
 
 The recursive [`TrackInput`] node carries four variants — `Source`,

@@ -810,25 +810,70 @@ pub(crate) fn run_pipelined_inner(
     // bytes-shape URIs get the demuxer stage, packet-shape URIs get the
     // packet-pump stage (identical fan-out, no container layer, seeks
     // rejected), frame-shape URIs get the frame-pump stage (frames fan
-    // straight into the per-track frame chains). The seek_rx (if any)
-    // is given to the FIRST source that has routes — multi-URI seek is
-    // a follow-up (the engine only ever drives one source today, so a
-    // single seek receiver is enough to cover all of plain playback).
+    // straight into the per-track frame chains).
+    //
+    // Seek plumbing: the handle's single seek receiver is owned by the
+    // FIRST routed source pump (the "seek owner"); every OTHER routed
+    // source gets a dedicated forwarding channel, and the owner
+    // re-sends each drained [`SeekCmd`] to every sibling BEFORE
+    // handling it locally. One dispatch therefore reaches EVERY routed
+    // source, so a job whose tracks come from several URIs (separate
+    // audio + video files, say) re-anchors all of them instead of
+    // silently seeking only one and desyncing the rest. Each source
+    // answers with its own barrier — `SeekFlush` with its landed pts,
+    // or `SeekRejected` when it has no seek surface — all stamped with
+    // the command's generation, so every track observes exactly one
+    // barrier per dispatched generation. The forwarding senders never
+    // block (unbounded channel) and a sibling that already exited just
+    // drops the forwards. When the OWNER hits EOF the whole seek
+    // surface winds down with it — identical to the historical
+    // single-receiver lifetime.
+    type RoutedSource = (String, SourcePump, Vec<Route>, Vec<SyncSender<Msg<Frame>>>);
+    let mut routed: Vec<RoutedSource> = Vec::new();
     for (uri, pump) in sources_by_uri {
         let pkt_routes = routes_by_uri.remove(&uri).unwrap_or_default();
         let frame_routes = frame_routes_by_uri.remove(&uri).unwrap_or_default();
         if pkt_routes.is_empty() && frame_routes.is_empty() {
             continue;
         }
+        routed.push((uri, pump, pkt_routes, frame_routes));
+    }
+    let mut seek_inputs: Vec<Option<Receiver<SeekCmd>>> = Vec::with_capacity(routed.len());
+    let mut owner_fanout: Vec<mpsc::Sender<SeekCmd>> = Vec::new();
+    for i in 0..routed.len() {
+        if i == 0 {
+            seek_inputs.push(seek_rx.take());
+        } else if seek_inputs[0].is_some() {
+            let (tx, rx) = mpsc::channel::<SeekCmd>();
+            owner_fanout.push(tx);
+            seek_inputs.push(Some(rx));
+        } else {
+            seek_inputs.push(None);
+        }
+    }
+    for (i, (uri, pump, pkt_routes, frame_routes)) in routed.into_iter().enumerate() {
         let abort_d = abort.clone();
         let counters_d = counters.clone();
         let budget_d = budget.clone();
-        let src_seek_rx = seek_rx.take();
+        let src_seek_rx = seek_inputs[i].take();
+        let seek_fanout = if i == 0 {
+            std::mem::take(&mut owner_fanout)
+        } else {
+            Vec::new()
+        };
         match pump {
             SourcePump::Demuxer(dmx) => {
                 let name = format!("demux-{uri}");
                 handles.push(spawn_stage(abort_d, name, move |abort| {
-                    run_demuxer_stage(dmx, pkt_routes, abort, counters_d, src_seek_rx, budget_d)
+                    run_demuxer_stage(
+                        dmx,
+                        pkt_routes,
+                        abort,
+                        counters_d,
+                        src_seek_rx,
+                        seek_fanout,
+                        budget_d,
+                    )
                 }));
             }
             SourcePump::Packets(src) => {
@@ -840,6 +885,7 @@ pub(crate) fn run_pipelined_inner(
                         abort,
                         counters_d,
                         src_seek_rx,
+                        seek_fanout,
                         budget_d,
                     )
                 }));
@@ -847,7 +893,14 @@ pub(crate) fn run_pipelined_inner(
             SourcePump::Frames { source, .. } => {
                 let name = format!("frames-{uri}");
                 handles.push(spawn_stage(abort_d, name, move |abort| {
-                    run_frame_source_stage(source, frame_routes, abort, counters_d, src_seek_rx)
+                    run_frame_source_stage(
+                        source,
+                        frame_routes,
+                        abort,
+                        counters_d,
+                        src_seek_rx,
+                        seek_fanout,
+                    )
                 }));
             }
         }
@@ -1085,6 +1138,7 @@ fn run_demuxer_stage(
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
+    seek_fanout: Vec<mpsc::Sender<SeekCmd>>,
     budget: Arc<QueueBudget>,
 ) -> Result<()> {
     loop {
@@ -1124,11 +1178,26 @@ fn run_demuxer_stage(
         // match in lockstep regardless of how many seeks are queued.
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
-                let kind = match dmx.seek_to(cmd.stream_idx, cmd.pts) {
+                // Seek-owner duty: forward the command to every sibling
+                // routed source BEFORE handling it locally, so a
+                // multi-URI job re-anchors all of its sources on one
+                // dispatch. Non-owners have an empty `seek_fanout`.
+                for tx in &seek_fanout {
+                    let _ = tx.send(cmd);
+                }
+                // A command addressing a stream this source doesn't
+                // route (the primary target lives on a sibling URI)
+                // still seeks THIS source — retargeted at its first
+                // routed stream with the pts rescaled into that
+                // stream's time base — so all sources land on the same
+                // presentation instant.
+                let (dst_stream, dst_pts, dst_tb) =
+                    resolve_seek_target(&routes, dmx.streams(), &cmd);
+                let kind = match dmx.seek_to(dst_stream, dst_pts) {
                     Ok(landed_pts) => BarrierKind::SeekFlush {
                         generation: cmd.generation,
                         landed_pts,
-                        time_base: cmd.time_base,
+                        time_base: dst_tb,
                     },
                     Err(_e) => BarrierKind::SeekRejected {
                         generation: cmd.generation,
@@ -1186,12 +1255,50 @@ fn run_demuxer_stage(
 /// command's generation: the pipeline keeps producing packets from
 /// where it was and the engine learns to disable its seek UI, exactly
 /// as with a demuxer whose `seek_to` is unimplemented.
+/// Resolve which stream of THIS source a [`SeekCmd`] should move, and
+/// to what pts.
+///
+/// * The command's `stream_idx` is one of this source's routed streams
+///   → primary target: seek it with the command's pts verbatim
+///   (the historical single-source behaviour).
+/// * Otherwise the primary target lives on a sibling source of a
+///   multi-URI job, and this source is being re-anchored to the same
+///   presentation instant: retarget at the FIRST routed stream, with
+///   the pts rescaled from the command's time base into that stream's
+///   own — the returned time base is the one the eventual
+///   `SeekFlush::landed_pts` is expressed in, keeping the barrier's
+///   "landed pts with matching time_base" contract intact. When the
+///   stream's info is unavailable the pts passes through unscaled
+///   (best effort; the demuxer clamps).
+///
+/// The generic `T` is the route payload (a channel sender at the call
+/// site); only the stream index half of each route matters here.
+fn resolve_seek_target<T>(
+    routes: &[(u32, T)],
+    streams: &[StreamInfo],
+    cmd: &SeekCmd,
+) -> (u32, i64, TimeBase) {
+    if routes.iter().any(|(s, _)| *s == cmd.stream_idx) {
+        return (cmd.stream_idx, cmd.pts, cmd.time_base);
+    }
+    let dst = routes.first().map(|(s, _)| *s).unwrap_or(cmd.stream_idx);
+    match streams.iter().find(|s| s.index == dst) {
+        Some(info) => (
+            dst,
+            cmd.time_base.rescale(cmd.pts, info.time_base),
+            info.time_base,
+        ),
+        None => (dst, cmd.pts, cmd.time_base),
+    }
+}
+
 fn run_packet_source_stage(
     mut src: Box<dyn PacketSource>,
     routes: Vec<(u32, SyncSender<Msg<Packet>>)>,
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
+    seek_fanout: Vec<mpsc::Sender<SeekCmd>>,
     budget: Arc<QueueBudget>,
 ) -> Result<()> {
     loop {
@@ -1204,6 +1311,13 @@ fn run_packet_source_stage(
         }
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
+                // Seek-owner duty (see `run_demuxer_stage`): a packet
+                // source can own the receiver in a mixed-shape
+                // multi-URI job; siblings still need the forward even
+                // though this source itself rejects.
+                for tx in &seek_fanout {
+                    let _ = tx.send(cmd);
+                }
                 let kind = BarrierKind::SeekRejected {
                     generation: cmd.generation,
                 };
@@ -1259,6 +1373,7 @@ fn run_frame_source_stage(
     abort: Arc<AbortState>,
     counters: Arc<PipelineCounters>,
     seek_rx: Option<Receiver<SeekCmd>>,
+    seek_fanout: Vec<mpsc::Sender<SeekCmd>>,
 ) -> Result<()> {
     loop {
         if abort.is_aborted() {
@@ -1266,6 +1381,12 @@ fn run_frame_source_stage(
         }
         if let Some(rx) = &seek_rx {
             while let Ok(cmd) = rx.try_recv() {
+                // Seek-owner duty (see `run_demuxer_stage`): forward
+                // to siblings even though a frame source itself has no
+                // seek surface.
+                for tx in &seek_fanout {
+                    let _ = tx.send(cmd);
+                }
                 let kind = BarrierKind::SeekRejected {
                     generation: cmd.generation,
                 };
@@ -1718,6 +1839,86 @@ fn drain_and_send(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn stream_info(index: u32, tb: TimeBase) -> StreamInfo {
+        StreamInfo {
+            index,
+            time_base: tb,
+            duration: None,
+            start_time: Some(0),
+            params: oxideav_core::CodecParameters::audio(oxideav_core::CodecId::new("t")),
+        }
+    }
+
+    fn cmd(stream_idx: u32, pts: i64, tb: TimeBase) -> SeekCmd {
+        SeekCmd {
+            stream_idx,
+            pts,
+            time_base: tb,
+            generation: 7,
+        }
+    }
+
+    #[test]
+    fn seek_target_primary_stream_passes_through_verbatim() {
+        // The command addresses a routed stream → identical target,
+        // pts, and time base (the historical single-source path).
+        let routes: Vec<(u32, ())> = vec![(0, ()), (2, ())];
+        let streams = [
+            stream_info(0, TimeBase::new(1, 8_000)),
+            stream_info(2, TimeBase::new(1, 90_000)),
+        ];
+        let c = cmd(2, 12_345, TimeBase::new(1, 90_000));
+        let (s, p, tb) = resolve_seek_target(&routes, &streams, &c);
+        assert_eq!(s, 2);
+        assert_eq!(p, 12_345);
+        assert_eq!(tb, TimeBase::new(1, 90_000));
+    }
+
+    #[test]
+    fn seek_target_foreign_stream_rescales_to_first_route() {
+        // The command addresses stream 5 (a sibling source's stream);
+        // this source routes stream 1 at 90 kHz. 30 s expressed in
+        // 1/8000 ticks (240_000) must become 30 s in 1/90000 ticks
+        // (2_700_000), and the returned time base must be the one the
+        // landed pts will be expressed in.
+        let routes: Vec<(u32, ())> = vec![(1, ())];
+        let streams = [
+            stream_info(0, TimeBase::new(1, 8_000)),
+            stream_info(1, TimeBase::new(1, 90_000)),
+        ];
+        let c = cmd(5, 240_000, TimeBase::new(1, 8_000));
+        let (s, p, tb) = resolve_seek_target(&routes, &streams, &c);
+        assert_eq!(s, 1);
+        assert_eq!(p, 2_700_000);
+        assert_eq!(tb, TimeBase::new(1, 90_000));
+    }
+
+    #[test]
+    fn seek_target_foreign_stream_without_info_passes_pts_unscaled() {
+        // Routed stream has no StreamInfo (defensive arm): keep the
+        // pts and the command's time base rather than inventing one.
+        let routes: Vec<(u32, ())> = vec![(3, ())];
+        let streams = [stream_info(0, TimeBase::new(1, 8_000))];
+        let c = cmd(9, 4_242, TimeBase::new(1, 1_000));
+        let (s, p, tb) = resolve_seek_target(&routes, &streams, &c);
+        assert_eq!(s, 3);
+        assert_eq!(p, 4_242);
+        assert_eq!(tb, TimeBase::new(1, 1_000));
+    }
+
+    #[test]
+    fn seek_target_no_routes_falls_back_to_command() {
+        // Degenerate: no routes at all (the caller filters these
+        // sources out before spawning, but the helper must not panic).
+        let routes: Vec<(u32, ())> = vec![];
+        let streams: Vec<StreamInfo> = vec![];
+        let c = cmd(0, 99, TimeBase::new(1, 48_000));
+        let (s, p, tb) = resolve_seek_target(&routes, &streams, &c);
+        assert_eq!(s, 0);
+        assert_eq!(p, 99);
+        assert_eq!(tb, TimeBase::new(1, 48_000));
+    }
 
     #[test]
     fn channel_caps_default_matches_internal_constants() {
