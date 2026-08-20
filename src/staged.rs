@@ -556,6 +556,13 @@ pub(crate) struct PipelineControl {
     /// count caps. Threaded through from
     /// [`crate::Executor::with_max_queue_bytes`].
     pub max_queue_bytes: u64,
+    /// Failed-output disposal opt-in, threaded through from
+    /// [`crate::Executor::with_discard_failed_outputs`]. On any
+    /// failure path the sink receives
+    /// [`JobSink::abandon`](crate::JobSink::abandon) before the error
+    /// returns; a clean stop (abort without a recorded error) still
+    /// finalises via `finish`.
+    pub discard_on_failure: bool,
 }
 
 /// Run one output's pipeline. The caller has already instantiated all
@@ -568,6 +575,7 @@ pub(crate) fn run_pipelined(
     out_streams: Vec<StreamInfo>,
     caps: Option<ChannelCaps>,
     max_queue_bytes: u64,
+    discard_on_failure: bool,
 ) -> StageResult<ExecutorStats> {
     run_pipelined_inner(
         pipelines,
@@ -580,6 +588,7 @@ pub(crate) fn run_pipelined(
             abort: None,
             caps,
             max_queue_bytes,
+            discard_on_failure,
         },
     )
 }
@@ -604,8 +613,20 @@ pub(crate) fn run_pipelined_inner(
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
 ) -> StageResult<ExecutorStats> {
-    sink.start(&out_streams)
-        .map_err(attribute(FailureStage::Sink, None))?;
+    let discard_on_failure = control.discard_on_failure;
+    // Failed-output disposal (opt-in): on any failure path the sink
+    // gets `abandon()` (drop partial artifacts) instead of `finish()`.
+    // Bundled in a closure so every early-return site below stays a
+    // one-liner; disposal errors never mask the run error.
+    let fail_sink = |sink: &mut Box<dyn JobSink + Send>, failure: StageFailure| -> StageFailure {
+        if discard_on_failure {
+            let _ = sink.abandon();
+        }
+        failure
+    };
+    if let Err(e) = sink.start(&out_streams) {
+        return Err(fail_sink(&mut sink, attribute(FailureStage::Sink, None)(e)));
+    }
 
     // External abort takes precedence so callers (e.g. `ExecutorHandle`)
     // can pre-arm cancellation before the workers spawn.
@@ -666,12 +687,15 @@ pub(crate) fn run_pipelined_inner(
         let frame_head_rx: Receiver<Msg<Frame>> = if source_is_frames {
             if pl.copy {
                 // Structural setup error — no data has flowed yet.
-                return Err(StageFailure::new(
-                    FailureStage::Prepare,
-                    Some(track_idx as u32),
-                    Error::other(
-                        "pipeline: copy track over a frame-shape source is not \
-                         representable (frames carry no packets to copy)",
+                return Err(fail_sink(
+                    &mut sink,
+                    StageFailure::new(
+                        FailureStage::Prepare,
+                        Some(track_idx as u32),
+                        Error::other(
+                            "pipeline: copy track over a frame-shape source is not \
+                             representable (frames carry no packets to copy)",
+                        ),
                     ),
                 ));
             }
@@ -725,13 +749,21 @@ pub(crate) fn run_pipelined_inner(
             // Each FrameStage runs on its own worker thread so audio
             // filters, pixel-format converts, and future video filters
             // can overlap the encoder's back-pressure.
-            let decoder = pl.decoder.take().ok_or_else(|| {
-                StageFailure::new(
-                    FailureStage::Prepare,
-                    Some(track_idx as u32),
-                    Error::other("pipeline: non-copy track without a decoder is not supported"),
-                )
-            })?;
+            let decoder = match pl.decoder.take() {
+                Some(d) => d,
+                None => {
+                    return Err(fail_sink(
+                        &mut sink,
+                        StageFailure::new(
+                            FailureStage::Prepare,
+                            Some(track_idx as u32),
+                            Error::other(
+                                "pipeline: non-copy track without a decoder is not supported",
+                            ),
+                        ),
+                    ));
+                }
+            };
             let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
             let abort_d = abort.clone();
             let counters_d = counters.clone();
@@ -1111,10 +1143,14 @@ pub(crate) fn run_pipelined_inner(
         let _ = h.join();
     }
     if let Some(failure) = abort.take_failure() {
-        return Err(failure);
+        return Err(fail_sink(&mut sink, failure));
     }
-    sink.finish()
-        .map_err(attribute(FailureStage::SinkFinish, None))?;
+    if let Err(e) = sink.finish() {
+        return Err(fail_sink(
+            &mut sink,
+            attribute(FailureStage::SinkFinish, None)(e),
+        ));
+    }
     if let Some(tx) = &progress_tx {
         let frames = counters.frames_written.load(Ordering::SeqCst);
         // At EOF the demuxer has drained all packets and every consuming

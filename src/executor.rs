@@ -145,6 +145,27 @@ pub trait JobSink {
     fn barrier(&mut self, _kind: crate::BarrierKind) -> Result<()> {
         Ok(())
     }
+
+    /// Failed-output disposal hook. Called INSTEAD of [`Self::finish`]
+    /// when the executor was configured with
+    /// [`Executor::with_discard_failed_outputs`]`(true)` and either
+    ///
+    /// * this output's run failed after the sink was resolved, or
+    /// * the sink was resolved for a multi-output wave whose
+    ///   preparation failed before the wave started (the output never
+    ///   ran, but sink resolution may already have created artifacts —
+    ///   e.g. [`crate::FileSink`]'s output file).
+    ///
+    /// Implementations should remove partial artifacts (delete the
+    /// half-written file, drop buffered frames) rather than finalise
+    /// them. NOT called on a clean [`ExecutorHandle::stop`] — a stop
+    /// without a recorded error still finalises via `finish`.
+    ///
+    /// Default: no-op, preserving the historical behaviour for custom
+    /// sinks (partial output is simply left wherever the sink put it).
+    fn abandon(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Job runner. Constructed with a validated `Job` and a unified
@@ -168,6 +189,13 @@ pub struct Executor<'a> {
     /// ceiling, leaving only the count caps. Ignored on the serial
     /// path. Set via [`Self::with_max_queue_bytes`].
     max_queue_bytes: u64,
+    /// When `true`, a failed output's sink receives
+    /// [`JobSink::abandon`] instead of being silently dropped, so
+    /// partial artifacts (e.g. the half-written file of a
+    /// [`crate::FileSink`]) are removed. Default `false` — historical
+    /// behaviour keeps whatever landed before the failure. Set via
+    /// [`Self::with_discard_failed_outputs`].
+    discard_failed_outputs: bool,
     /// Optional factory for [`DagNode::Render3D`] nodes. When `None`,
     /// any `Render3D` node in the DAG fails source-shape resolution
     /// with an `Unsupported` error pointing at where to install the
@@ -193,6 +221,7 @@ impl<'a> Executor<'a> {
             explicit_threads: None,
             channel_caps: None,
             max_queue_bytes: 0,
+            discard_failed_outputs: false,
             render_source_factory: None,
         }
     }
@@ -262,6 +291,34 @@ impl<'a> Executor<'a> {
     /// Has no effect on the serial path — that path uses no channels.
     pub fn with_max_queue_bytes(mut self, n: u64) -> Self {
         self.max_queue_bytes = n;
+        self
+    }
+
+    /// Opt in to failed-output disposal: when an output fails, its
+    /// sink receives [`JobSink::abandon`] instead of being silently
+    /// dropped mid-stream.
+    ///
+    /// For the built-in file sink that means the partially-written
+    /// output file is DELETED — a failed transcode leaves no
+    /// half-file behind for a downstream consumer to mistake for a
+    /// finished one. Custom sinks opt in by overriding
+    /// [`JobSink::abandon`] (the default is a no-op, so enabling this
+    /// knob is always safe with observer/override sinks).
+    ///
+    /// Scope of "failed": the output's own run erred after its sink
+    /// was resolved; or, on a multi-output job, the sink was resolved
+    /// for a wave whose preparation failed before the wave started
+    /// (its file was already created but the output never ran).
+    /// Healthy wave-mates of a failing output are unaffected — they
+    /// run to completion and finalise normally — and a clean
+    /// [`ExecutorHandle::stop`] (no recorded error) still finalises
+    /// via [`JobSink::finish`] rather than abandoning.
+    ///
+    /// Default `false`: historical behaviour, partial output is kept
+    /// wherever the sink put it (useful for debugging a mid-stream
+    /// failure).
+    pub fn with_discard_failed_outputs(mut self, discard: bool) -> Self {
+        self.discard_failed_outputs = discard;
         self
     }
 
@@ -371,6 +428,18 @@ impl<'a> Executor<'a> {
                 match self.prepare_pipelined_run(dag, name, per_output) {
                     Ok(p) => preps.push((name.clone(), p)),
                     Err(e) => {
+                        // Wave-mates prepared before this failure will
+                        // never run — their sinks (and any artifacts
+                        // sink resolution created, e.g. a FileSink's
+                        // output file) are dead weight. Give them the
+                        // failed-output disposal treatment when opted
+                        // in; disposal errors never mask the prep
+                        // error.
+                        if self.discard_failed_outputs {
+                            for (_, mut p) in preps {
+                                let _ = p.sink.abandon();
+                            }
+                        }
                         return Err(RunFailure::for_output(
                             name,
                             StageFailure::new(FailureStage::Prepare, None, e),
@@ -393,6 +462,7 @@ impl<'a> Executor<'a> {
                                     prep.out_streams,
                                     prep.channel_caps,
                                     prep.max_queue_bytes,
+                                    prep.discard_on_failure,
                                 )
                             })
                             .expect("oxideav-pipeline: failed to spawn output thread")
@@ -572,102 +642,130 @@ impl<'a> Executor<'a> {
         let out_streams = build_output_streams(&mut pipelines);
 
         let mut sink = self.open_sink(name, &out_streams).map_err(&prep)?;
-        sink.start(&out_streams)
-            .map_err(attribute(FailureStage::Sink, None))?;
+        let result = pump_serial_output(
+            &mut pipelines,
+            &mut sources_by_uri,
+            sink.as_mut(),
+            &out_streams,
+        );
+        if result.is_err() && self.discard_failed_outputs {
+            // Failed-output disposal (opt-in): the sink cleans up its
+            // partial artifacts instead of leaving a half-written
+            // output behind. Disposal errors never mask the run error.
+            let _ = sink.abandon();
+        }
+        result
+    }
+}
 
-        // Main pump. Read packets / frames from every source in
-        // round-robin until all are EOF. Routes vary by source shape:
-        //   - Demuxer / Packets → next_packet()  → feed_packet()
-        //   - Frames            → next_frame()   → feed_frame()
-        let mut stats = ExecutorStats::default();
-        let mut eof: HashMap<String, bool> =
-            sources_by_uri.keys().map(|k| (k.clone(), false)).collect();
-        let uris: Vec<String> = sources_by_uri.keys().cloned().collect();
-        while eof.values().any(|e| !e) {
-            for uri in &uris {
-                if eof[uri] {
-                    continue;
-                }
-                let pump = sources_by_uri.get_mut(uri).unwrap();
-                match pump {
-                    SourcePump::Demuxer(dmx) => match dmx.next_packet() {
-                        Ok(pkt) => {
-                            stats.packets_read += 1;
-                            for (track_idx, pl) in pipelines.iter_mut().enumerate() {
-                                if pl.source_uri != *uri {
-                                    continue;
-                                }
-                                if pkt.stream_index != pl.source_stream {
-                                    continue;
-                                }
-                                pl.feed_packet(&pkt, track_idx as u32, sink.as_mut(), &mut stats)?;
+/// Serial pump for one output: round-robin every source to EOF, feeding
+/// packets / frames through the per-track runtimes into the sink, then
+/// drain + finalise. Split out of `Executor::run_output` so the caller
+/// retains sink ownership across a failure and can run the
+/// failed-output disposal hook ([`JobSink::abandon`]) on it.
+fn pump_serial_output(
+    pipelines: &mut [TrackRuntime],
+    sources_by_uri: &mut HashMap<String, SourcePump>,
+    sink: &mut dyn JobSink,
+    out_streams: &[StreamInfo],
+) -> StageResult<ExecutorStats> {
+    sink.start(out_streams)
+        .map_err(attribute(FailureStage::Sink, None))?;
+
+    // Main pump. Read packets / frames from every source in
+    // round-robin until all are EOF. Routes vary by source shape:
+    //   - Demuxer / Packets → next_packet()  → feed_packet()
+    //   - Frames            → next_frame()   → feed_frame()
+    let mut stats = ExecutorStats::default();
+    let mut eof: HashMap<String, bool> =
+        sources_by_uri.keys().map(|k| (k.clone(), false)).collect();
+    let uris: Vec<String> = sources_by_uri.keys().cloned().collect();
+    while eof.values().any(|e| !e) {
+        for uri in &uris {
+            if eof[uri] {
+                continue;
+            }
+            let pump = sources_by_uri.get_mut(uri).unwrap();
+            match pump {
+                SourcePump::Demuxer(dmx) => match dmx.next_packet() {
+                    Ok(pkt) => {
+                        stats.packets_read += 1;
+                        for (track_idx, pl) in pipelines.iter_mut().enumerate() {
+                            if pl.source_uri != *uri {
+                                continue;
+                            }
+                            if pkt.stream_index != pl.source_stream {
+                                continue;
+                            }
+                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, &mut stats)?;
+                        }
+                    }
+                    Err(Error::Eof) => {
+                        eof.insert(uri.clone(), true);
+                        continue;
+                    }
+                    Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
+                },
+                SourcePump::Packets(pkts) => match pkts.next_packet() {
+                    Ok(pkt) => {
+                        stats.packets_read += 1;
+                        for (track_idx, pl) in pipelines.iter_mut().enumerate() {
+                            if pl.source_uri != *uri {
+                                continue;
+                            }
+                            if pkt.stream_index != pl.source_stream {
+                                continue;
+                            }
+                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, &mut stats)?;
+                        }
+                    }
+                    Err(Error::Eof) => {
+                        eof.insert(uri.clone(), true);
+                        continue;
+                    }
+                    Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
+                },
+                SourcePump::Frames { source, .. } => match source.next_frame() {
+                    Ok(frame) => {
+                        // Frame sources have a single synthetic
+                        // stream — every track on this URI consumes
+                        // the same frame. We clone for each track
+                        // beyond the first so ownership works out.
+                        stats.frames_decoded += 1;
+                        let mut consumers: Vec<usize> = Vec::new();
+                        for (track_idx, pl) in pipelines.iter().enumerate() {
+                            if pl.source_uri == *uri {
+                                consumers.push(track_idx);
                             }
                         }
-                        Err(Error::Eof) => {
-                            eof.insert(uri.clone(), true);
-                            continue;
+                        for &track_idx in &consumers {
+                            pipelines[track_idx].feed_frame(
+                                frame.clone(),
+                                track_idx as u32,
+                                &mut *sink,
+                                &mut stats,
+                            )?;
                         }
-                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
-                    },
-                    SourcePump::Packets(pkts) => match pkts.next_packet() {
-                        Ok(pkt) => {
-                            stats.packets_read += 1;
-                            for (track_idx, pl) in pipelines.iter_mut().enumerate() {
-                                if pl.source_uri != *uri {
-                                    continue;
-                                }
-                                if pkt.stream_index != pl.source_stream {
-                                    continue;
-                                }
-                                pl.feed_packet(&pkt, track_idx as u32, sink.as_mut(), &mut stats)?;
-                            }
-                        }
-                        Err(Error::Eof) => {
-                            eof.insert(uri.clone(), true);
-                            continue;
-                        }
-                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
-                    },
-                    SourcePump::Frames { source, .. } => match source.next_frame() {
-                        Ok(frame) => {
-                            // Frame sources have a single synthetic
-                            // stream — every track on this URI consumes
-                            // the same frame. We clone for each track
-                            // beyond the first so ownership works out.
-                            stats.frames_decoded += 1;
-                            let mut consumers: Vec<usize> = Vec::new();
-                            for (track_idx, pl) in pipelines.iter().enumerate() {
-                                if pl.source_uri == *uri {
-                                    consumers.push(track_idx);
-                                }
-                            }
-                            for &track_idx in &consumers {
-                                pipelines[track_idx].feed_frame(
-                                    frame.clone(),
-                                    track_idx as u32,
-                                    sink.as_mut(),
-                                    &mut stats,
-                                )?;
-                            }
-                        }
-                        Err(Error::Eof) => {
-                            eof.insert(uri.clone(), true);
-                            continue;
-                        }
-                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
-                    },
-                }
+                    }
+                    Err(Error::Eof) => {
+                        eof.insert(uri.clone(), true);
+                        continue;
+                    }
+                    Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
+                },
             }
         }
-        // EOF — drain each pipeline.
-        for (track_idx, pl) in pipelines.iter_mut().enumerate() {
-            pl.drain(track_idx as u32, sink.as_mut(), &mut stats)?;
-        }
-        sink.finish()
-            .map_err(attribute(FailureStage::SinkFinish, None))?;
-        Ok(stats)
     }
+    // EOF — drain each pipeline.
+    for (track_idx, pl) in pipelines.iter_mut().enumerate() {
+        pl.drain(track_idx as u32, &mut *sink, &mut stats)?;
+    }
+    sink.finish()
+        .map_err(attribute(FailureStage::SinkFinish, None))?;
+    Ok(stats)
+}
 
+impl<'a> Executor<'a> {
     pub(crate) fn build_track_runtime(&self, dag: &Dag, track: &MuxTrack) -> Result<TrackRuntime> {
         // Walk upstream chain, accumulating stages in reverse (top-down).
         // The chain ends at a Demuxer / PacketSource / FrameSource leaf.
@@ -946,6 +1044,7 @@ impl<'a> Executor<'a> {
             prep.out_streams,
             prep.channel_caps,
             prep.max_queue_bytes,
+            prep.discard_on_failure,
         )
     }
 
@@ -1028,6 +1127,7 @@ impl<'a> Executor<'a> {
             out_streams,
             channel_caps: self.channel_caps,
             max_queue_bytes: self.max_queue_bytes,
+            discard_on_failure: self.discard_failed_outputs,
         })
     }
 
@@ -2027,6 +2127,11 @@ pub(crate) struct PreparedRun {
     /// `0` keeps the byte ceiling disabled. Threaded alongside
     /// `channel_caps`.
     pub(crate) max_queue_bytes: u64,
+    /// Failed-output disposal opt-in, threaded from
+    /// [`Executor::with_discard_failed_outputs`]: on failure the
+    /// pipelined runner calls [`JobSink::abandon`] on the sink instead
+    /// of dropping it silently.
+    pub(crate) discard_on_failure: bool,
 }
 
 /// Live handle to a background-running [`Executor`]. Returned by
@@ -2065,6 +2170,7 @@ impl ExecutorHandle {
         let finished_t = finished.clone();
         let caps = prep.channel_caps;
         let max_queue_bytes = prep.max_queue_bytes;
+        let discard_on_failure = prep.discard_on_failure;
         let output_name = prep.output_name.clone();
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
@@ -2080,6 +2186,7 @@ impl ExecutorHandle {
                         abort: Some(abort_t),
                         caps,
                         max_queue_bytes,
+                        discard_on_failure,
                     },
                 );
                 finished_t.store(true, std::sync::atomic::Ordering::SeqCst);

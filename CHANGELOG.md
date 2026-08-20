@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Failed-output disposal:
+  `Executor::with_discard_failed_outputs(true)` opts a job into
+  partial-output cleanup. A failing output's sink now receives the new
+  `JobSink::abandon` hook (default no-op) INSTEAD of being silently
+  dropped mid-write; the built-in `FileSink` implements it by closing
+  the muxer's file handle and deleting the partially-written file, so
+  a failed transcode leaves no half-file behind for a downstream
+  consumer to mistake for a finished one. Scope: the output's own run
+  failed after sink resolution, or — on a multi-output job — the sink
+  was resolved for a wave whose PREPARATION failed before the wave
+  started (its just-created zero-byte file would otherwise linger).
+  Healthy wave-mates of a failing output still run to completion and
+  finalise normally, a clean `ExecutorHandle::stop` (no recorded
+  error) still finalises via `finish` (stop is a cancel, not a
+  failure), and the default (`false`) keeps the historical
+  partial-file-stays behaviour. `FileSink::abandon` is idempotent and
+  later hooks report the abandonment instead of resurrecting the
+  file. Pinned by `tests/discard_failed_outputs.rs` (9 contracts,
+  serial + pipelined) via a new writable stub muxer whose
+  header/trailer bytes let tests distinguish a finalised file from a
+  torn-down one, plus a dying-demuxer stub for healthy-graph
+  mid-stream source faults.
+
 - Typed failure attribution: `Executor::run_reporting` and
   `ExecutorHandle::stop_reporting` return a `RunFailure` pairing the
   ORIGINAL first error with *where* it fired — the owning output key,

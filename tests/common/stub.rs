@@ -20,7 +20,9 @@ use oxideav_core::{
     Encoder, EncoderFactory, Error, Frame, Packet, Result, SampleFormat, StreamInfo, TimeBase,
 };
 use oxideav_core::{registry::CodecInfo, CodecRegistry, Decoder, DecoderFactory};
-use oxideav_core::{ContainerRegistry, Demuxer, OpenDemuxerFn, ReadSeek};
+use oxideav_core::{
+    ContainerRegistry, Demuxer, Muxer, OpenDemuxerFn, OpenMuxerFn, ReadSeek, WriteSeek,
+};
 
 /// Codec id for the stub passthrough decoder.
 pub const CODEC_ID: &str = "stub_pcm";
@@ -62,6 +64,33 @@ pub const MULTI_FILL_S0: u8 = 0xAA;
 pub const MULTI_FILL_S1: u8 = 0xBB;
 /// Packets emitted per stream by the multi-stub demuxer.
 pub const MULTI_PACKETS_PER_STREAM: u32 = 5;
+
+/// Container name for the dying variant (`next_packet` errors after
+/// [`DIE_AFTER_PACKETS`] packets). Drives failed-output disposal /
+/// error-propagation tests that need a source failing mid-stream while
+/// the rest of the graph is healthy.
+pub const CONTAINER_DIE: &str = "stub_audio_die";
+/// Extension for the dying stub container.
+pub const EXT_DIE: &str = "stubdie";
+/// Packets the dying demuxer emits before erroring.
+pub const DIE_AFTER_PACKETS: u32 = 3;
+/// Message carried by the dying demuxer's mid-stream error.
+pub const DIE_ERR: &str = "stub demuxer deliberately died mid-stream";
+
+/// Container name for the writable stub muxer (`.stubout` files).
+/// Byte format: [`MUX_HEADER`], then one [`MUX_PACKET_TAG`] + payload
+/// per packet, then [`MUX_TRAILER`] from `write_trailer`. A finalised
+/// file therefore starts with the header and ends with the trailer; a
+/// file missing the trailer was never finalised.
+pub const CONTAINER_OUT: &str = "stub_audio_out";
+/// Extension that routes an output path to the stub muxer.
+pub const EXT_OUT: &str = "stubout";
+/// Bytes the stub muxer writes as the container header.
+pub const MUX_HEADER: &[u8] = b"SHDR";
+/// Bytes prefixed to each packet payload.
+pub const MUX_PACKET_TAG: &[u8] = b"PKT:";
+/// Bytes the stub muxer writes as the container trailer.
+pub const MUX_TRAILER: &[u8] = b"STRL";
 
 /// Sample rate of the synthetic audio. Small so the demuxer's pts
 /// arithmetic is easy to reason about in tests, realistic enough that
@@ -110,6 +139,13 @@ pub fn register(codecs: &mut CodecRegistry, containers: &mut ContainerRegistry) 
     // assert which source stream each delivered frame came from.
     containers.register_demuxer(CONTAINER_MULTI, open_demuxer_multi as OpenDemuxerFn);
     containers.register_extension(EXT_MULTI, CONTAINER_MULTI);
+    // Dying variant: healthy packets, then a mid-stream error.
+    containers.register_demuxer(CONTAINER_DIE, open_demuxer_die as OpenDemuxerFn);
+    containers.register_extension(EXT_DIE, CONTAINER_DIE);
+    // Writable stub muxer so a Job can target a real file output
+    // (`out.stubout`) through the built-in FileSink.
+    containers.register_muxer(CONTAINER_OUT, open_muxer_out as OpenMuxerFn);
+    containers.register_extension(EXT_OUT, CONTAINER_OUT);
 }
 
 /// Create an empty unseekable-stub file. Same shape as [`touch`] but
@@ -185,6 +221,87 @@ fn open_demuxer_multi(
     _codecs: &dyn CodecResolver,
 ) -> Result<Box<dyn Demuxer>> {
     Ok(Box::new(MultiStreamStubDemuxer::new()))
+}
+
+fn open_demuxer_die(
+    _input: Box<dyn ReadSeek>,
+    _codecs: &dyn CodecResolver,
+) -> Result<Box<dyn Demuxer>> {
+    Ok(Box::new(DyingStubDemuxer {
+        inner: StubDemuxer::new(DEFAULT_DURATION_MS),
+        emitted: 0,
+    }))
+}
+
+fn open_muxer_out(output: Box<dyn WriteSeek>, _streams: &[StreamInfo]) -> Result<Box<dyn Muxer>> {
+    Ok(Box::new(StubMuxer { out: output }))
+}
+
+/// Create an empty dying-stub file. Same shape as [`touch`] but the
+/// extension routes through the dying demuxer (`next_packet` errors
+/// after [`DIE_AFTER_PACKETS`] packets).
+pub fn touch_die(name: &str) -> std::path::PathBuf {
+    let mut p = std::env::temp_dir();
+    p.push(format!("oxideav_pipeline_stub_{name}.{EXT_DIE}"));
+    let _ = std::fs::File::create(&p).expect("create stub die file");
+    p
+}
+
+/// Wraps [`StubDemuxer`] but `next_packet` returns
+/// `Error::other(`[`DIE_ERR`]`)` once [`DIE_AFTER_PACKETS`] packets
+/// have been emitted — a source failing mid-stream while the rest of
+/// the graph is healthy.
+pub struct DyingStubDemuxer {
+    inner: StubDemuxer,
+    emitted: u32,
+}
+
+impl Demuxer for DyingStubDemuxer {
+    fn format_name(&self) -> &str {
+        CONTAINER_DIE
+    }
+    fn streams(&self) -> &[StreamInfo] {
+        self.inner.streams()
+    }
+    fn next_packet(&mut self) -> Result<Packet> {
+        if self.emitted >= DIE_AFTER_PACKETS {
+            return Err(Error::other(DIE_ERR));
+        }
+        let pkt = self.inner.next_packet()?;
+        self.emitted += 1;
+        Ok(pkt)
+    }
+}
+
+/// Minimal writable muxer backing `.stubout` file outputs. Emits
+/// [`MUX_HEADER`] / per-packet [`MUX_PACKET_TAG`] + payload /
+/// [`MUX_TRAILER`] so a test can distinguish a finalised file (ends
+/// with the trailer) from one that was torn down mid-write.
+pub struct StubMuxer {
+    out: Box<dyn WriteSeek>,
+}
+
+impl Muxer for StubMuxer {
+    fn format_name(&self) -> &str {
+        CONTAINER_OUT
+    }
+    fn write_header(&mut self) -> Result<()> {
+        use std::io::Write;
+        self.out.write_all(MUX_HEADER)?;
+        Ok(())
+    }
+    fn write_packet(&mut self, packet: &Packet) -> Result<()> {
+        use std::io::Write;
+        self.out.write_all(MUX_PACKET_TAG)?;
+        self.out.write_all(&packet.data)?;
+        Ok(())
+    }
+    fn write_trailer(&mut self) -> Result<()> {
+        use std::io::Write;
+        self.out.write_all(MUX_TRAILER)?;
+        self.out.flush()?;
+        Ok(())
+    }
 }
 
 /// Create an empty dual-audio-stream stub file. Same shape as [`touch`]

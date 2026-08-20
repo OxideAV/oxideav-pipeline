@@ -47,9 +47,15 @@ impl JobSink for NullSink {
 /// File-backed sink. The executor is responsible for opening the muxer
 /// (since it knows the output stream parameters); this struct takes that
 /// muxer + the output path for diagnostics.
+///
+/// The muxer lives in an `Option` so [`FileSink::abandon`] can drop it
+/// (closing its file handle) before unlinking the partial output — on
+/// platforms where an open handle blocks deletion the drop must come
+/// first. Every other hook errors with a descriptive message if it is
+/// called after `abandon`.
 pub struct FileSink {
     pub path: PathBuf,
-    muxer: Box<dyn Muxer>,
+    muxer: Option<Box<dyn Muxer>>,
     header_written: bool,
 }
 
@@ -57,26 +63,32 @@ impl FileSink {
     pub fn new(path: PathBuf, muxer: Box<dyn Muxer>) -> Self {
         Self {
             path,
-            muxer,
+            muxer: Some(muxer),
             header_written: false,
         }
+    }
+
+    fn muxer_mut(&mut self) -> Result<&mut Box<dyn Muxer>> {
+        self.muxer
+            .as_mut()
+            .ok_or_else(|| Error::other("FileSink: output was abandoned"))
     }
 }
 
 impl JobSink for FileSink {
     fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
         if !self.header_written {
-            self.muxer.write_header()?;
+            self.muxer_mut()?.write_header()?;
             self.header_written = true;
         }
         Ok(())
     }
     fn write_packet(&mut self, _kind: MediaType, pkt: &Packet) -> Result<()> {
         if !self.header_written {
-            self.muxer.write_header()?;
+            self.muxer_mut()?.write_header()?;
             self.header_written = true;
         }
-        self.muxer.write_packet(pkt)
+        self.muxer_mut()?.write_packet(pkt)
     }
     fn write_frame(&mut self, _kind: MediaType, _frm: &Frame) -> Result<()> {
         Err(Error::other(
@@ -85,10 +97,21 @@ impl JobSink for FileSink {
     }
     fn finish(&mut self) -> Result<()> {
         if !self.header_written {
-            self.muxer.write_header()?;
+            self.muxer_mut()?.write_header()?;
             self.header_written = true;
         }
-        self.muxer.write_trailer()
+        self.muxer_mut()?.write_trailer()
+    }
+    /// Failed-output disposal: drop the muxer (closing the underlying
+    /// file handle) and unlink the partially-written file. Idempotent —
+    /// a second call (or an already-missing file) reports `Ok`.
+    fn abandon(&mut self) -> Result<()> {
+        self.muxer = None;
+        match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
     }
 }
 
