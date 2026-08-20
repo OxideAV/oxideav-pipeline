@@ -52,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serial and pipelined executors attribute the same failure site to
   the same stage; `SinkFinish` is split from `Sink` because every
   mid-stream byte already landed when finalisation fails. Pinned by
-  `tests/failure_attribution.rs`: 16 contracts covering job-level
+  `tests/failure_attribution.rs`: 18 contracts covering job-level
   validation, unknown-codec prepare, mid-stream source / filter /
   encoder-send / encoder-flush faults, sink start / write / finish
   faults (each on both executor paths where both exist), multi-output

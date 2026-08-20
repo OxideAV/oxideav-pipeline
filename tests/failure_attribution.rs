@@ -718,3 +718,88 @@ fn partial_stats_attached_to_failures() {
     assert_eq!(f.stats.frames_written, 0);
     assert_eq!(f.stats.packets_encoded, 0);
 }
+
+/// Track attribution beyond the trivial index 0: a two-track output
+/// whose SECOND track carries the failing encoder attributes
+/// `Encode` with `track: Some(1)` on both paths (track 0 is a healthy
+/// copy route and keeps flowing until teardown).
+#[test]
+fn second_track_failure_attributes_track_one() {
+    for threads in [1usize, 2] {
+        let src = common::stub::touch(&format!("attr_track1_{threads}"));
+        let job_json = format!(
+            r#"{{"@out": {{"audio": [
+                {{"from": "{0}"}},
+                {{"from": "{0}", "codec": "{FAIL_ENC_ID}"}}
+            ]}}}}"#,
+            json_path(&src)
+        );
+        let (sink, _) = FaultySink::boxed(SinkFault::None);
+        let f = run_expect_failure(&job_json, "@out", sink, threads);
+        assert_failure(
+            &f,
+            Some("@out"),
+            FailureStage::Encode,
+            Some(1),
+            ENC_SEND_ERR,
+        );
+    }
+}
+
+/// The mux loop's `sink.barrier` record site: a sink that errors on
+/// the seek barrier attributes `Sink` with the barrier's track index,
+/// through the spawn-path reporting surface.
+#[test]
+fn barrier_failure_attributes_to_sink_stage() {
+    struct BarrierFaultSink;
+    impl JobSink for BarrierFaultSink {
+        fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+            Ok(())
+        }
+        fn write_packet(&mut self, _kind: MediaType, _pkt: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn write_frame(&mut self, _kind: MediaType, _frm: &Frame) -> Result<()> {
+            Ok(())
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn barrier(&mut self, _kind: oxideav_pipeline::BarrierKind) -> Result<()> {
+            Err(Error::other("barrier sink deliberately failed"))
+        }
+    }
+    let src = common::stub::touch("attr_barrier_fault");
+    let job_json = format!(
+        r#"{{"@display": {{"audio": [{{"from": "{}"}}]}}}}"#,
+        json_path(&src)
+    );
+    let ctx = attr_ctx();
+    let job = Job::from_json(&job_json).expect("parse job");
+    let handle = Executor::new(&job, &ctx)
+        .with_threads(2)
+        .with_sink_override("@display", Box::new(BarrierFaultSink))
+        .spawn()
+        .expect("spawn");
+    handle
+        .seek(0, 8_000, oxideav_core::TimeBase::new(1, 8_000))
+        .expect("dispatch seek");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !handle.has_finished() {
+        assert!(
+            Instant::now() < deadline,
+            "executor did not observe the barrier failure in time"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let f = handle
+        .stop_reporting()
+        .expect_err("barrier failure must surface");
+    assert_failure(
+        &f,
+        Some("@display"),
+        FailureStage::Sink,
+        Some(0),
+        "barrier sink deliberately failed",
+    );
+}
