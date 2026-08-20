@@ -43,9 +43,10 @@ use oxideav_core::{
 };
 
 use crate::executor::{
-    flush_frame_stage_emit, run_frame_stage_emit, ExecutorStats, FrameStage, JobSink, SourcePump,
-    TrackRuntime,
+    flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, ExecutorStats,
+    FrameStage, JobSink, SourcePump, TrackRuntime,
 };
+use crate::failure::{attribute, FailureStage, StageFailure, StageResult};
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
 /// stage when it receives a [`SeekCmd`] from the
@@ -487,9 +488,10 @@ pub(crate) struct AbortState {
     /// Set by any worker that errors out (or by the mux thread at EOF).
     /// Workers poll it between iterations and bail cleanly.
     pub(crate) abort: AtomicBool,
-    /// First `Err(_)` seen. Later errors are dropped so the caller
-    /// gets the root cause rather than a cascading symptom.
-    first_err: Mutex<Option<Error>>,
+    /// First `Err(_)` seen, with its stage/track attribution. Later
+    /// errors are dropped so the caller gets the root cause rather
+    /// than a cascading symptom.
+    first_err: Mutex<Option<StageFailure>>,
 }
 
 impl AbortState {
@@ -508,15 +510,15 @@ impl AbortState {
         self.abort.store(true, Ordering::SeqCst);
     }
 
-    fn record_error(&self, e: Error) {
+    fn record_failure(&self, f: StageFailure) {
         let mut slot = self.first_err.lock().unwrap();
         if slot.is_none() {
-            *slot = Some(e);
+            *slot = Some(f);
         }
         self.abort.store(true, Ordering::SeqCst);
     }
 
-    fn take_error(&self) -> Option<Error> {
+    fn take_failure(&self) -> Option<StageFailure> {
         self.first_err.lock().unwrap().take()
     }
 }
@@ -566,7 +568,7 @@ pub(crate) fn run_pipelined(
     out_streams: Vec<StreamInfo>,
     caps: Option<ChannelCaps>,
     max_queue_bytes: u64,
-) -> Result<ExecutorStats> {
+) -> StageResult<ExecutorStats> {
     run_pipelined_inner(
         pipelines,
         sources_by_uri,
@@ -591,7 +593,7 @@ pub(crate) fn run_pipelined_with_control(
     sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
-) -> Result<ExecutorStats> {
+) -> StageResult<ExecutorStats> {
     run_pipelined_inner(pipelines, sources_by_uri, sink, out_streams, control)
 }
 
@@ -601,8 +603,9 @@ pub(crate) fn run_pipelined_inner(
     mut sink: Box<dyn JobSink + Send>,
     out_streams: Vec<StreamInfo>,
     control: PipelineControl,
-) -> Result<ExecutorStats> {
-    sink.start(&out_streams)?;
+) -> StageResult<ExecutorStats> {
+    sink.start(&out_streams)
+        .map_err(attribute(FailureStage::Sink, None))?;
 
     // External abort takes precedence so callers (e.g. `ExecutorHandle`)
     // can pre-arm cancellation before the workers spawn.
@@ -662,9 +665,14 @@ pub(crate) fn run_pipelined_inner(
         // from the frame-pump thread.
         let frame_head_rx: Receiver<Msg<Frame>> = if source_is_frames {
             if pl.copy {
-                return Err(Error::other(
-                    "pipeline: copy track over a frame-shape source is not \
-                     representable (frames carry no packets to copy)",
+                // Structural setup error — no data has flowed yet.
+                return Err(StageFailure::new(
+                    FailureStage::Prepare,
+                    Some(track_idx as u32),
+                    Error::other(
+                        "pipeline: copy track over a frame-shape source is not \
+                         representable (frames carry no packets to copy)",
+                    ),
                 ));
             }
             debug_assert!(
@@ -692,17 +700,24 @@ pub(crate) fn run_pipelined_inner(
                 let counters_c = counters.clone();
                 let budget_c = budget.clone();
                 let name = format!("copy-{track_idx}");
-                handles.push(spawn_stage(abort_c, name, move |abort| {
-                    run_copy_stage(
-                        pkt_rx,
-                        out_tx,
-                        track_idx as u32,
-                        kind,
-                        abort,
-                        counters_c,
-                        budget_c,
-                    )
-                }));
+                let stage_track = Some(track_idx as u32);
+                handles.push(spawn_stage(
+                    abort_c,
+                    name,
+                    FailureStage::Copy,
+                    stage_track,
+                    move |abort| {
+                        run_copy_stage(
+                            pkt_rx,
+                            out_tx,
+                            track_idx as u32,
+                            kind,
+                            abort,
+                            counters_c,
+                            budget_c,
+                        )
+                    },
+                ));
                 continue;
             }
 
@@ -711,16 +726,26 @@ pub(crate) fn run_pipelined_inner(
             // filters, pixel-format converts, and future video filters
             // can overlap the encoder's back-pressure.
             let decoder = pl.decoder.take().ok_or_else(|| {
-                Error::other("pipeline: non-copy track without a decoder is not supported")
+                StageFailure::new(
+                    FailureStage::Prepare,
+                    Some(track_idx as u32),
+                    Error::other("pipeline: non-copy track without a decoder is not supported"),
+                )
             })?;
             let (frame0_tx, frame0_rx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
             let abort_d = abort.clone();
             let counters_d = counters.clone();
             let budget_d = budget.clone();
             let name = format!("decode-{track_idx}");
-            handles.push(spawn_stage(abort_d, name, move |abort| {
-                run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
-            }));
+            handles.push(spawn_stage(
+                abort_d,
+                name,
+                FailureStage::Decode,
+                Some(track_idx as u32),
+                move |abort| {
+                    run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
+                },
+            ));
             frame0_rx
         };
         let frame_stages = std::mem::take(&mut pl.frame_stages);
@@ -739,6 +764,7 @@ pub(crate) fn run_pipelined_inner(
         let mut upstream: Receiver<Msg<Frame>> = frame_head_rx;
         for (fidx, stage) in frame_stages.into_iter().enumerate() {
             let (ftx, frx) = mpsc::sync_channel::<Msg<Frame>>(frame_cap);
+            let stage_kind = frame_stage_failure_kind(&stage);
             let label = match &stage {
                 FrameStage::Filter(_) => "filter",
                 FrameStage::PixConvert { .. } => "convert",
@@ -761,16 +787,22 @@ pub(crate) fn run_pipelined_inner(
                 (None, 0)
             };
 
-            handles.push(spawn_stage(abort_f, name, move |abort| {
-                run_frame_stage_worker(
-                    stage,
-                    upstream,
-                    ftx,
-                    stage_extras_tx,
-                    stage_extras_base,
-                    abort,
-                )
-            }));
+            handles.push(spawn_stage(
+                abort_f,
+                name,
+                stage_kind,
+                Some(track_idx as u32),
+                move |abort| {
+                    run_frame_stage_worker(
+                        stage,
+                        upstream,
+                        ftx,
+                        stage_extras_tx,
+                        stage_extras_base,
+                        abort,
+                    )
+                },
+            ));
             upstream = frx;
         }
 
@@ -779,25 +811,38 @@ pub(crate) fn run_pipelined_inner(
             let counters_e = counters.clone();
             let out_tx = out_tx.clone();
             let name = format!("encode-{track_idx}");
-            handles.push(spawn_stage(abort_e, name, move |abort| {
-                run_encode_stage(
-                    enc,
-                    upstream,
-                    out_tx,
-                    track_idx as u32,
-                    kind,
-                    abort,
-                    counters_e,
-                )
-            }));
+            handles.push(spawn_stage(
+                abort_e,
+                name,
+                FailureStage::Encode,
+                Some(track_idx as u32),
+                move |abort| {
+                    run_encode_stage(
+                        enc,
+                        upstream,
+                        out_tx,
+                        track_idx as u32,
+                        kind,
+                        abort,
+                        counters_e,
+                    )
+                },
+            ));
         } else {
-            // No encoder — raw frames flow into the mux (player scenario).
+            // No encoder — raw frames flow into the mux (player
+            // scenario). The fanout only forwards; it has no failure
+            // mode of its own, so any (future) error is closest to the
+            // sink side.
             let abort_r = abort.clone();
             let out_tx = out_tx.clone();
             let name = format!("frame-fanout-{track_idx}");
-            handles.push(spawn_stage(abort_r, name, move |abort| {
-                run_frame_fanout(upstream, out_tx, track_idx as u32, kind, abort)
-            }));
+            handles.push(spawn_stage(
+                abort_r,
+                name,
+                FailureStage::Sink,
+                Some(track_idx as u32),
+                move |abort| run_frame_fanout(upstream, out_tx, track_idx as u32, kind, abort),
+            ));
         }
     }
 
@@ -864,44 +909,62 @@ pub(crate) fn run_pipelined_inner(
         match pump {
             SourcePump::Demuxer(dmx) => {
                 let name = format!("demux-{uri}");
-                handles.push(spawn_stage(abort_d, name, move |abort| {
-                    run_demuxer_stage(
-                        dmx,
-                        pkt_routes,
-                        abort,
-                        counters_d,
-                        src_seek_rx,
-                        seek_fanout,
-                        budget_d,
-                    )
-                }));
+                handles.push(spawn_stage(
+                    abort_d,
+                    name,
+                    FailureStage::Source,
+                    None,
+                    move |abort| {
+                        run_demuxer_stage(
+                            dmx,
+                            pkt_routes,
+                            abort,
+                            counters_d,
+                            src_seek_rx,
+                            seek_fanout,
+                            budget_d,
+                        )
+                    },
+                ));
             }
             SourcePump::Packets(src) => {
                 let name = format!("packets-{uri}");
-                handles.push(spawn_stage(abort_d, name, move |abort| {
-                    run_packet_source_stage(
-                        src,
-                        pkt_routes,
-                        abort,
-                        counters_d,
-                        src_seek_rx,
-                        seek_fanout,
-                        budget_d,
-                    )
-                }));
+                handles.push(spawn_stage(
+                    abort_d,
+                    name,
+                    FailureStage::Source,
+                    None,
+                    move |abort| {
+                        run_packet_source_stage(
+                            src,
+                            pkt_routes,
+                            abort,
+                            counters_d,
+                            src_seek_rx,
+                            seek_fanout,
+                            budget_d,
+                        )
+                    },
+                ));
             }
             SourcePump::Frames { source, .. } => {
                 let name = format!("frames-{uri}");
-                handles.push(spawn_stage(abort_d, name, move |abort| {
-                    run_frame_source_stage(
-                        source,
-                        frame_routes,
-                        abort,
-                        counters_d,
-                        src_seek_rx,
-                        seek_fanout,
-                    )
-                }));
+                handles.push(spawn_stage(
+                    abort_d,
+                    name,
+                    FailureStage::Source,
+                    None,
+                    move |abort| {
+                        run_frame_source_stage(
+                            source,
+                            frame_routes,
+                            abort,
+                            counters_d,
+                            src_seek_rx,
+                            seek_fanout,
+                        )
+                    },
+                ));
             }
         }
     }
@@ -953,13 +1016,21 @@ pub(crate) fn run_pipelined_inner(
                         OutputPayload::Packet(mut p) => {
                             p.stream_index = item.track_index;
                             if let Err(e) = sink.write_packet(item.kind, &p) {
-                                abort.record_error(e);
+                                abort.record_failure(StageFailure::new(
+                                    FailureStage::Sink,
+                                    Some(item.track_index),
+                                    e,
+                                ));
                                 break;
                             }
                         }
                         OutputPayload::Frame(f) => {
                             if let Err(e) = sink.write_frame(item.kind, &f) {
-                                abort.record_error(e);
+                                abort.record_failure(StageFailure::new(
+                                    FailureStage::Sink,
+                                    Some(item.track_index),
+                                    e,
+                                ));
                                 break;
                             }
                             counters.frames_written.fetch_add(1, Ordering::SeqCst);
@@ -987,7 +1058,11 @@ pub(crate) fn run_pipelined_inner(
                 Ok(Msg::Barrier(kind)) => {
                     made_progress = true;
                     if let Err(e) = sink.barrier(kind) {
-                        abort.record_error(e);
+                        abort.record_failure(StageFailure::new(
+                            FailureStage::Sink,
+                            Some(i as u32),
+                            e,
+                        ));
                         break;
                     }
                 }
@@ -1035,10 +1110,11 @@ pub(crate) fn run_pipelined_inner(
     for h in handles {
         let _ = h.join();
     }
-    if let Some(err) = abort.take_error() {
-        return Err(err);
+    if let Some(failure) = abort.take_failure() {
+        return Err(failure);
     }
-    sink.finish()?;
+    sink.finish()
+        .map_err(attribute(FailureStage::SinkFinish, None))?;
     if let Some(tx) = &progress_tx {
         let frames = counters.frames_written.load(Ordering::SeqCst);
         // At EOF the demuxer has drained all packets and every consuming
@@ -1097,9 +1173,16 @@ pub(crate) fn run_pipelined_inner(
 }
 
 /// Spawn a worker thread that runs `work` under `abort`. If `work`
-/// returns `Err`, record it on `abort` (first-wins) and flip the abort
-/// flag so peers can bail.
-fn spawn_stage<F>(abort: Arc<AbortState>, name: String, work: F) -> JoinHandle<()>
+/// returns `Err`, record it on `abort` (first-wins) with the given
+/// `(stage, track)` attribution and flip the abort flag so peers can
+/// bail.
+fn spawn_stage<F>(
+    abort: Arc<AbortState>,
+    name: String,
+    stage: FailureStage,
+    track: Option<u32>,
+    work: F,
+) -> JoinHandle<()>
 where
     F: FnOnce(Arc<AbortState>) -> Result<()> + Send + 'static,
 {
@@ -1107,7 +1190,7 @@ where
         .name(format!("oxideav-job:{name}"))
         .spawn(move || {
             if let Err(e) = work(abort.clone()) {
-                abort.record_error(e);
+                abort.record_failure(StageFailure::new(stage, track, e));
             }
         })
         .expect("pipeline: thread spawn")

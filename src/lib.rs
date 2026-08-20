@@ -14,6 +14,7 @@
 pub mod bench;
 pub mod dag;
 pub mod executor;
+pub mod failure;
 pub mod schema;
 pub mod selection;
 pub mod sinks;
@@ -22,6 +23,7 @@ pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink, RenderSourceFactory};
+pub use failure::{FailureStage, RunFailure};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
 pub use schema::{
     parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, Render3DNode, SourceRef,

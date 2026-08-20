@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Typed failure attribution: `Executor::run_reporting` and
+  `ExecutorHandle::stop_reporting` return a `RunFailure` pairing the
+  ORIGINAL first error with *where* it fired — the owning output key,
+  a `FailureStage` (`Prepare` / `Source` / `Copy` / `Decode` /
+  `Filter` / `Convert` / `Encode` / `Sink` / `SinkFinish`), and the
+  track index when the failing stage belongs to one. Engines can now
+  render "encoder failed on track 0 of out.mp4" (or branch
+  programmatically on the failing stage) without parsing log lines.
+  The historical `run()` / `stop()` surfaces are unchanged wrappers:
+  `From<RunFailure> for Error` recovers the stored original error
+  unwrapped — never a re-stringified copy — so error-kind matching
+  behaves identically on both surfaces, and the first-error-wins
+  contract pinned by `tests/error_propagation.rs` is untouched. The
+  serial and pipelined executors attribute the same failure site to
+  the same stage; `SinkFinish` is split from `Sink` because every
+  mid-stream byte already landed when finalisation fails. Pinned by
+  `tests/failure_attribution.rs`: 13 contracts covering job-level
+  validation, unknown-codec prepare, mid-stream source / filter /
+  encoder-send / encoder-flush faults, sink start / write / finish
+  faults (each on both executor paths where both exist), multi-output
+  earliest-in-document-order naming, run/run_reporting root-cause
+  parity, and spawn-path attribution via `stop_reporting`.
+
 - Multi-output parallelism: `Executor::run` on a job with several
   outputs and `threads ≥ 2` now runs the outputs concurrently instead
   of one after another (closing the long-standing "multi-output

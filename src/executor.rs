@@ -29,6 +29,7 @@ use oxideav_core::{
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
 use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
+use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
 use crate::selection::{make_decoder, make_encoder};
 use crate::sinks::{open_file_write, FileSink, NullSink};
@@ -285,9 +286,26 @@ impl<'a> Executor<'a> {
     /// `threads ≥ 2` and several outputs, outputs run **concurrently**
     /// in document-order waves — see [`Self::run_outputs_parallel`]
     /// for the wave/budget model and the error-precedence contract.
-    pub fn run(mut self) -> Result<ExecutorStats> {
-        self.job.validate()?;
-        let dag = self.job.to_dag()?;
+    ///
+    /// On failure the ORIGINAL first error is returned unchanged
+    /// (first-error-wins, pinned by `tests/error_propagation.rs`). Use
+    /// [`Self::run_reporting`] to additionally learn *where* the error
+    /// fired — both surfaces observe the exact same root cause.
+    pub fn run(self) -> Result<ExecutorStats> {
+        self.run_reporting().map_err(Error::from)
+    }
+
+    /// Like [`Self::run`], but a failure returns a [`RunFailure`]
+    /// carrying the attribution alongside the original error: the
+    /// owning output key, the [`FailureStage`], and the track index
+    /// when the failing stage belongs to one.
+    ///
+    /// `RunFailure::error` holds the exact error [`Self::run`] would
+    /// have returned (never a re-stringified copy), so error-kind
+    /// matching behaves identically on both surfaces.
+    pub fn run_reporting(mut self) -> std::result::Result<ExecutorStats, RunFailure> {
+        self.job.validate().map_err(RunFailure::job_level)?;
+        let dag = self.job.to_dag().map_err(RunFailure::job_level)?;
         let threads = self.resolve_threads();
         let names: Vec<String> = dag.roots.keys().cloned().collect();
         if threads >= 2 && names.len() >= 2 {
@@ -296,10 +314,11 @@ impl<'a> Executor<'a> {
         let mut stats = ExecutorStats::default();
         for name in names {
             let out_stats = if threads >= 2 {
-                self.run_output_pipelined(&dag, &name, threads)?
+                self.run_output_pipelined(&dag, &name, threads)
             } else {
-                self.run_output(&dag, &name)?
-            };
+                self.run_output(&dag, &name)
+            }
+            .map_err(|f| RunFailure::for_output(&name, f))?;
             stats.merge(&out_stats);
         }
         Ok(stats)
@@ -339,7 +358,7 @@ impl<'a> Executor<'a> {
         dag: &Dag,
         names: &[String],
         threads: usize,
-    ) -> Result<ExecutorStats> {
+    ) -> std::result::Result<ExecutorStats, RunFailure> {
         let budget = ExecutionContext::with_threads(threads);
         let wave_width = budget.effective_workers(names.len());
         let per_output = (threads / wave_width).max(1);
@@ -347,14 +366,20 @@ impl<'a> Executor<'a> {
         for wave in names.chunks(wave_width) {
             // Prepare sequentially (document order) on the caller
             // thread; run the prepared outputs concurrently.
-            let mut preps = Vec::with_capacity(wave.len());
+            let mut preps: Vec<(String, PreparedRun)> = Vec::with_capacity(wave.len());
             for name in wave {
-                preps.push((
-                    name.clone(),
-                    self.prepare_pipelined_run(dag, name, per_output)?,
-                ));
+                match self.prepare_pipelined_run(dag, name, per_output) {
+                    Ok(p) => preps.push((name.clone(), p)),
+                    Err(e) => {
+                        return Err(RunFailure::for_output(
+                            name,
+                            StageFailure::new(FailureStage::Prepare, None, e),
+                        ));
+                    }
+                }
             }
-            let results: Vec<Result<ExecutorStats>> = std::thread::scope(|s| {
+            let wave_names: Vec<String> = preps.iter().map(|(n, _)| n.clone()).collect();
+            let results: Vec<StageResult<ExecutorStats>> = std::thread::scope(|s| {
                 let handles: Vec<_> = preps
                     .into_iter()
                     .map(|(name, prep)| {
@@ -377,15 +402,25 @@ impl<'a> Executor<'a> {
                     .into_iter()
                     .map(|h| {
                         h.join().unwrap_or_else(|_| {
-                            Err(Error::other("pipeline: output worker thread panicked"))
+                            // The output thread runs the mux loop +
+                            // sink; a panic that escapes the per-stage
+                            // catch surfaces there, so attribute it to
+                            // the sink side rather than inventing a
+                            // separate variant for a case that should
+                            // never happen.
+                            Err(StageFailure::new(
+                                FailureStage::Sink,
+                                None,
+                                Error::other("pipeline: output worker thread panicked"),
+                            ))
                         })
                     })
                     .collect()
             });
             // Document-order iteration ⇒ the first error returned is
             // the earliest failing output in document order.
-            for r in results {
-                stats.merge(&r?);
+            for (name, r) in wave_names.iter().zip(results) {
+                stats.merge(&r.map_err(|f| RunFailure::for_output(name, f))?);
             }
         }
         Ok(stats)
@@ -445,21 +480,25 @@ impl<'a> Executor<'a> {
         ExecutionContext::auto().threads
     }
 
-    fn run_output(&mut self, dag: &Dag, name: &str) -> Result<ExecutorStats> {
+    fn run_output(&mut self, dag: &Dag, name: &str) -> StageResult<ExecutorStats> {
+        // Everything up to (and including) sink resolution is
+        // preparation — no stream data has flowed — so its errors
+        // attribute to `FailureStage::Prepare`.
+        let prep = attribute(FailureStage::Prepare, None);
         let mut dag = dag.clone();
         // Probe every Demuxer-shape leaf and rewrite to the typed
         // variant (PacketSource / FrameSource) when the registry hands
         // back a non-bytes opener. Returns the opened sources keyed by
         // URI so we don't re-open below.
-        let mut sources_by_uri = self.resolve_source_shapes(&mut dag)?;
+        let mut sources_by_uri = self.resolve_source_shapes(&mut dag).map_err(&prep)?;
         let dag = &dag;
         let root_id = dag.roots[name];
         let tracks: Vec<MuxTrack> = match dag.node(root_id) {
             DagNode::Mux { tracks, .. } => tracks.clone(),
             other => {
-                return Err(Error::invalid(format!(
+                return Err(prep(Error::invalid(format!(
                     "job: output {name}: expected Mux root, got {other:?}"
-                )));
+                ))));
             }
         };
 
@@ -467,7 +506,7 @@ impl<'a> Executor<'a> {
         // stack of stages (select/decode/filter/encode) to apply.
         let mut pipelines: Vec<TrackRuntime> = Vec::new();
         for t in &tracks {
-            pipelines.push(self.build_track_runtime(dag, t)?);
+            pipelines.push(self.build_track_runtime(dag, t).map_err(&prep)?);
         }
 
         // Expand `all:` tracks (kind == Unknown, selector == any) into
@@ -480,19 +519,19 @@ impl<'a> Executor<'a> {
         // always returns the synthetic index 0.
         for pl in &mut pipelines {
             let pump = sources_by_uri.get(&pl.source_uri).ok_or_else(|| {
-                Error::invalid(format!(
+                prep(Error::invalid(format!(
                     "job: track references source {:?} but no source was opened for that URI \
                      (known URIs: {:?}) — this is an internal pipeline-resolver bug",
                     pl.source_uri,
                     sources_by_uri.keys().collect::<Vec<_>>(),
-                ))
+                )))
             })?;
-            pl.source_stream = select_stream(pump.streams(), &pl.selector)?;
+            pl.source_stream = select_stream(pump.streams(), &pl.selector).map_err(&prep)?;
             let info = pump
                 .streams()
                 .iter()
                 .find(|s| s.index == pl.source_stream)
-                .ok_or_else(|| Error::invalid("selected stream not in source"))?;
+                .ok_or_else(|| prep(Error::invalid("selected stream not in source")))?;
             pl.input_params = info.params.clone();
             pl.input_time_base = info.time_base;
         }
@@ -523,7 +562,8 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)?;
+            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)
+                .map_err(&prep)?;
         }
 
         // Build the per-track output stream infos + open (or replace) the sink.
@@ -531,8 +571,9 @@ impl<'a> Executor<'a> {
         // sees all of them in `start()` before any frame flows.
         let out_streams = build_output_streams(&mut pipelines);
 
-        let mut sink = self.open_sink(name, &out_streams)?;
-        sink.start(&out_streams)?;
+        let mut sink = self.open_sink(name, &out_streams).map_err(&prep)?;
+        sink.start(&out_streams)
+            .map_err(attribute(FailureStage::Sink, None))?;
 
         // Main pump. Read packets / frames from every source in
         // round-robin until all are EOF. Routes vary by source shape:
@@ -566,7 +607,7 @@ impl<'a> Executor<'a> {
                             eof.insert(uri.clone(), true);
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
                     },
                     SourcePump::Packets(pkts) => match pkts.next_packet() {
                         Ok(pkt) => {
@@ -585,7 +626,7 @@ impl<'a> Executor<'a> {
                             eof.insert(uri.clone(), true);
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
                     },
                     SourcePump::Frames { source, .. } => match source.next_frame() {
                         Ok(frame) => {
@@ -613,7 +654,7 @@ impl<'a> Executor<'a> {
                             eof.insert(uri.clone(), true);
                             continue;
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(attribute(FailureStage::Source, None)(e)),
                     },
                 }
             }
@@ -622,7 +663,8 @@ impl<'a> Executor<'a> {
         for (track_idx, pl) in pipelines.iter_mut().enumerate() {
             pl.drain(track_idx as u32, sink.as_mut(), &mut stats)?;
         }
-        sink.finish()?;
+        sink.finish()
+            .map_err(attribute(FailureStage::SinkFinish, None))?;
         Ok(stats)
     }
 
@@ -893,8 +935,10 @@ impl<'a> Executor<'a> {
         dag: &Dag,
         name: &str,
         threads: usize,
-    ) -> Result<ExecutorStats> {
-        let prep = self.prepare_pipelined_run(dag, name, threads)?;
+    ) -> StageResult<ExecutorStats> {
+        let prep = self
+            .prepare_pipelined_run(dag, name, threads)
+            .map_err(attribute(FailureStage::Prepare, None))?;
         staged::run_pipelined(
             prep.pipelines,
             prep.sources_by_uri,
@@ -977,6 +1021,7 @@ impl<'a> Executor<'a> {
             pipelines.iter().map(|pl| &pl.source_uri).collect();
         sources_by_uri.retain(|uri, _| used.contains(uri));
         Ok(PreparedRun {
+            output_name: name.to_string(),
             pipelines,
             sources_by_uri,
             sink,
@@ -1387,7 +1432,7 @@ impl TrackRuntime {
         track_index: u32,
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
-    ) -> Result<()> {
+    ) -> StageResult<()> {
         self.pump_frame(frame, track_index, sink, stats)
     }
 
@@ -1397,12 +1442,13 @@ impl TrackRuntime {
         track_index: u32,
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
-    ) -> Result<()> {
+    ) -> StageResult<()> {
         if self.copy {
             // Pure copy: retag stream index + forward.
             let mut out = pkt.clone();
             out.stream_index = track_index;
-            sink.write_packet(self.kind, &out)?;
+            sink.write_packet(self.kind, &out)
+                .map_err(attribute(FailureStage::Sink, Some(track_index)))?;
             stats.packets_copied += 1;
             return Ok(());
         }
@@ -1466,16 +1512,19 @@ impl TrackRuntime {
         track_index: u32,
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
-    ) -> Result<()> {
+    ) -> StageResult<()> {
+        let sinkf = attribute(FailureStage::Sink, Some(track_index));
+        let encf = attribute(FailureStage::Encode, Some(track_index));
         let mut frames: Vec<Frame> = vec![frame];
         for stage in &mut self.frame_stages {
+            let stagef = attribute(frame_stage_failure_kind(stage), Some(track_index));
             let mut next = Vec::new();
             for f in frames {
-                let produced = run_frame_stage_emit(stage, f)?;
+                let produced = run_frame_stage_emit(stage, f).map_err(&stagef)?;
                 // Extras (multi-port filter emissions) go straight to the
                 // sink as auto-attached streams.
                 for (kind, frm) in produced.extras {
-                    sink.write_frame(kind, &frm)?;
+                    sink.write_frame(kind, &frm).map_err(&sinkf)?;
                     stats.frames_written += 1;
                 }
                 next.extend(produced.primary);
@@ -1485,23 +1534,23 @@ impl TrackRuntime {
 
         if let Some(enc) = &mut self.encoder {
             for frame in frames {
-                enc.send_frame(&frame)?;
+                enc.send_frame(&frame).map_err(&encf)?;
                 loop {
                     match enc.receive_packet() {
                         Ok(mut p) => {
                             p.stream_index = track_index;
-                            sink.write_packet(self.kind, &p)?;
+                            sink.write_packet(self.kind, &p).map_err(&sinkf)?;
                             stats.packets_encoded += 1;
                         }
                         Err(Error::NeedMore) | Err(Error::Eof) => break,
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(encf(e)),
                     }
                 }
             }
         } else {
             // Raw frame to sink (player sink consumes this).
             for f in frames {
-                sink.write_frame(self.kind, &f)?;
+                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
         }
@@ -1513,7 +1562,9 @@ impl TrackRuntime {
         track_index: u32,
         sink: &mut dyn JobSink,
         stats: &mut ExecutorStats,
-    ) -> Result<()> {
+    ) -> StageResult<()> {
+        let sinkf = attribute(FailureStage::Sink, Some(track_index));
+        let encf = attribute(FailureStage::Encode, Some(track_index));
         if self.copy {
             return Ok(());
         }
@@ -1551,21 +1602,30 @@ impl TrackRuntime {
         // stages downstream.
         let mut tail: Vec<Frame> = Vec::new();
         for i in 0..self.frame_stages.len() {
-            let flushed = flush_frame_stage_emit(&mut self.frame_stages[i])?;
+            let stagef = attribute(
+                frame_stage_failure_kind(&self.frame_stages[i]),
+                Some(track_index),
+            );
+            let flushed = flush_frame_stage_emit(&mut self.frame_stages[i]).map_err(&stagef)?;
             // Extras from a flushing filter go straight to the sink.
             for (kind, frm) in flushed.extras {
-                sink.write_frame(kind, &frm)?;
+                sink.write_frame(kind, &frm).map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
             let mut primary = flushed.primary;
             // Push the flushed frames through the remaining downstream
             // stages so a later pixel-format convert still sees them.
             for j in (i + 1)..self.frame_stages.len() {
+                let stagef = attribute(
+                    frame_stage_failure_kind(&self.frame_stages[j]),
+                    Some(track_index),
+                );
                 let mut next: Vec<Frame> = Vec::new();
                 for f in primary.drain(..) {
-                    let produced = run_frame_stage_emit(&mut self.frame_stages[j], f)?;
+                    let produced =
+                        run_frame_stage_emit(&mut self.frame_stages[j], f).map_err(&stagef)?;
                     for (kind, frm) in produced.extras {
-                        sink.write_frame(kind, &frm)?;
+                        sink.write_frame(kind, &frm).map_err(&sinkf)?;
                         stats.frames_written += 1;
                     }
                     next.extend(produced.primary);
@@ -1576,38 +1636,46 @@ impl TrackRuntime {
         }
         if let Some(enc) = &mut self.encoder {
             for frame in tail {
-                enc.send_frame(&frame)?;
+                enc.send_frame(&frame).map_err(&encf)?;
                 loop {
                     match enc.receive_packet() {
                         Ok(mut p) => {
                             p.stream_index = track_index;
-                            sink.write_packet(self.kind, &p)?;
+                            sink.write_packet(self.kind, &p).map_err(&sinkf)?;
                             stats.packets_encoded += 1;
                         }
                         Err(Error::NeedMore) | Err(Error::Eof) => break,
-                        Err(e) => return Err(e),
+                        Err(e) => return Err(encf(e)),
                     }
                 }
             }
-            enc.flush()?;
+            enc.flush().map_err(&encf)?;
             loop {
                 match enc.receive_packet() {
                     Ok(mut p) => {
                         p.stream_index = track_index;
-                        sink.write_packet(self.kind, &p)?;
+                        sink.write_packet(self.kind, &p).map_err(&sinkf)?;
                         stats.packets_encoded += 1;
                     }
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
-                    Err(e) => return Err(e),
+                    Err(e) => return Err(encf(e)),
                 }
             }
         } else {
             for f in tail {
-                sink.write_frame(self.kind, &f)?;
+                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
                 stats.frames_written += 1;
             }
         }
         Ok(())
+    }
+}
+
+/// Map a [`FrameStage`] variant to its [`FailureStage`] attribution.
+pub(crate) fn frame_stage_failure_kind(stage: &FrameStage) -> FailureStage {
+    match stage {
+        FrameStage::Filter(_) => FailureStage::Filter,
+        FrameStage::PixConvert { .. } => FailureStage::Convert,
     }
 }
 
@@ -1943,6 +2011,10 @@ pub(crate) fn ext_from_uri(uri: &str) -> Option<String> {
 /// background thread ([`Executor::spawn`]). Holds no `'a`-borrowed
 /// fields — moves freely across threads.
 pub(crate) struct PreparedRun {
+    /// The output key this run belongs to (`"out.mp4"`, `"@display"`,
+    /// …) — carried so failure attribution on the background-thread
+    /// path ([`ExecutorHandle::stop_reporting`]) can name the output.
+    pub(crate) output_name: String,
     pub(crate) pipelines: Vec<TrackRuntime>,
     pub(crate) sources_by_uri: HashMap<String, SourcePump>,
     pub(crate) sink: Box<dyn JobSink + Send>,
@@ -1975,8 +2047,11 @@ pub struct ExecutorHandle {
     /// callers can correlate dispatches with their barriers.
     next_generation: std::sync::Arc<std::sync::atomic::AtomicU32>,
     progress_rx: std::sync::mpsc::Receiver<crate::staged::Progress>,
-    join: Option<std::thread::JoinHandle<Result<ExecutorStats>>>,
+    join: Option<std::thread::JoinHandle<StageResult<ExecutorStats>>>,
     finished: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Output key of the (single) spawned output, for
+    /// [`Self::stop_reporting`]'s failure attribution.
+    output_name: String,
 }
 
 impl ExecutorHandle {
@@ -1990,6 +2065,7 @@ impl ExecutorHandle {
         let finished_t = finished.clone();
         let caps = prep.channel_caps;
         let max_queue_bytes = prep.max_queue_bytes;
+        let output_name = prep.output_name.clone();
         let join = std::thread::Builder::new()
             .name("oxideav-pipeline-exec".into())
             .spawn(move || {
@@ -2017,6 +2093,7 @@ impl ExecutorHandle {
             progress_rx,
             join: Some(join),
             finished,
+            output_name,
         }
     }
 
@@ -2120,14 +2197,41 @@ impl ExecutorHandle {
 
     /// Set the abort flag, join the worker thread, and return its
     /// final stats (or the first error it observed).
-    pub fn stop(mut self) -> Result<ExecutorStats> {
+    ///
+    /// A clean stop (no worker error recorded) still finalises the
+    /// sink — the trailer is written and `Ok(stats)` returns. Use
+    /// [`Self::stop_reporting`] to learn *where* a failure fired; both
+    /// surfaces observe the same original error.
+    pub fn stop(self) -> Result<ExecutorStats> {
+        self.stop_reporting().map_err(Error::from)
+    }
+
+    /// Like [`Self::stop`], but a failure returns a [`RunFailure`]
+    /// carrying the attribution (output key, [`FailureStage`], track)
+    /// alongside the original error — the background-thread analogue
+    /// of [`Executor::run_reporting`].
+    pub fn stop_reporting(mut self) -> std::result::Result<ExecutorStats, RunFailure> {
         self.abort.request_abort();
+        let name = std::mem::take(&mut self.output_name);
         match self.join.take() {
-            Some(h) => h
-                .join()
-                .map_err(|_| Error::other("ExecutorHandle: worker thread panicked"))?,
-            None => Err(Error::other(
-                "ExecutorHandle: stop() called twice or after drop",
+            Some(h) => match h.join() {
+                Ok(r) => r.map_err(|f| RunFailure::for_output(&name, f)),
+                Err(_) => Err(RunFailure::for_output(
+                    &name,
+                    StageFailure::new(
+                        FailureStage::Sink,
+                        None,
+                        Error::other("ExecutorHandle: worker thread panicked"),
+                    ),
+                )),
+            },
+            None => Err(RunFailure::for_output(
+                &name,
+                StageFailure::new(
+                    FailureStage::Prepare,
+                    None,
+                    Error::other("ExecutorHandle: stop() called twice or after drop"),
+                ),
             )),
         }
     }
