@@ -1142,14 +1142,17 @@ pub(crate) fn run_pipelined_inner(
     for h in handles {
         let _ = h.join();
     }
-    if let Some(failure) = abort.take_failure() {
+    if let Some(mut failure) = abort.take_failure() {
+        // Attach the partial counters: workers have joined, so the
+        // snapshot reflects everything that actually reached the sink
+        // before teardown (`RunFailure::stats`).
+        failure.stats = counters.snapshot();
         return Err(fail_sink(&mut sink, failure));
     }
     if let Err(e) = sink.finish() {
-        return Err(fail_sink(
-            &mut sink,
-            attribute(FailureStage::SinkFinish, None)(e),
-        ));
+        let mut failure = attribute(FailureStage::SinkFinish, None)(e);
+        failure.stats = counters.snapshot();
+        return Err(fail_sink(&mut sink, failure));
     }
     if let Some(tx) = &progress_tx {
         let frames = counters.frames_written.load(Ordering::SeqCst);

@@ -75,9 +75,10 @@ tradeoff `ExecutorHandle::stop` relies on. See
 return a `RunFailure` pairing that original error with *where* it
 fired: the owning output key, a `FailureStage`
 (`prepare` / `source` / `copy` / `decode` / `filter` / `convert` /
-`encode` / `sink` / `sink-finish`), and the track index when the
-failing stage belongs to one — "encoder failed on track 0 of out.mp4"
-as data, not log-line archaeology. Both executor paths attribute the
+`encode` / `sink` / `sink-finish`), the track index when the failing
+stage belongs to one, and the failing output's partial
+`ExecutorStats` snapshot — "encoder failed on track 0 of out.mp4
+after writing 132 frames" as data, not log-line archaeology. Both executor paths attribute the
 same failure site to the same stage; `SinkFinish` is split from
 `Sink` because the whole stream already landed when finalisation
 fails (some engines treat that as salvageable). `run()` / `stop()`

@@ -36,8 +36,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `ExecutorHandle::stop_reporting` return a `RunFailure` pairing the
   ORIGINAL first error with *where* it fired — the owning output key,
   a `FailureStage` (`Prepare` / `Source` / `Copy` / `Decode` /
-  `Filter` / `Convert` / `Encode` / `Sink` / `SinkFinish`), and the
-  track index when the failing stage belongs to one. Engines can now
+  `Filter` / `Convert` / `Encode` / `Sink` / `SinkFinish`), the
+  track index when the failing stage belongs to one, and the failing
+  output's partial `ExecutorStats` snapshot ("failed after writing N
+  frames" as data — all-zero for preparation failures, taken after
+  worker teardown joins on the pipelined path so it reflects
+  everything that actually reached the sink). Engines can now
   render "encoder failed on track 0 of out.mp4" (or branch
   programmatically on the failing stage) without parsing log lines.
   The historical `run()` / `stop()` surfaces are unchanged wrappers:
@@ -48,7 +52,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serial and pipelined executors attribute the same failure site to
   the same stage; `SinkFinish` is split from `Sink` because every
   mid-stream byte already landed when finalisation fails. Pinned by
-  `tests/failure_attribution.rs`: 14 contracts covering job-level
+  `tests/failure_attribution.rs`: 16 contracts covering job-level
   validation, unknown-codec prepare, mid-stream source / filter /
   encoder-send / encoder-flush faults, sink start / write / finish
   faults (each on both executor paths where both exist), multi-output

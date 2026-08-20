@@ -106,6 +106,17 @@ pub struct RunFailure {
     /// one. Source pumps, sink resolution, and job-level failures carry
     /// `None`.
     pub track: Option<u32>,
+    /// Counters of the FAILING output at the moment the failure
+    /// surfaced — "how far did it get" as data (a CLI can print
+    /// "failed after writing N frames" without scraping logs).
+    ///
+    /// Semantics: the failing output's OWN partial counters, not a
+    /// job-wide total — sibling outputs' work (completed or in
+    /// flight) is not included. Preparation-stage failures report
+    /// all-zero counters (no stream data flowed). On the pipelined
+    /// path the snapshot is taken after the worker teardown joins, so
+    /// it reflects everything that actually reached the sink.
+    pub stats: crate::executor::ExecutorStats,
     /// The original first error, unwrapped.
     pub error: Error,
 }
@@ -118,6 +129,7 @@ impl RunFailure {
             output: None,
             stage: FailureStage::Prepare,
             track: None,
+            stats: Default::default(),
             error,
         }
     }
@@ -128,6 +140,7 @@ impl RunFailure {
             output: Some(output.to_string()),
             stage: failure.stage,
             track: failure.track,
+            stats: failure.stats,
             error: failure.error,
         }
     }
@@ -170,6 +183,10 @@ impl From<RunFailure> for Error {
 pub(crate) struct StageFailure {
     pub(crate) stage: FailureStage,
     pub(crate) track: Option<u32>,
+    /// Partial counters of the failing output, filled in by the
+    /// boundary layer that owns the counters (the serial pump / the
+    /// pipelined runner) — deep call sites construct with zeros.
+    pub(crate) stats: crate::executor::ExecutorStats,
     pub(crate) error: Error,
 }
 
@@ -178,6 +195,7 @@ impl StageFailure {
         Self {
             stage,
             track,
+            stats: Default::default(),
             error,
         }
     }
@@ -225,6 +243,7 @@ mod tests {
             output: Some("out.mp4".into()),
             stage: FailureStage::Encode,
             track: Some(1),
+            stats: Default::default(),
             error: Error::other("boom"),
         };
         assert_eq!(
@@ -241,6 +260,7 @@ mod tests {
             output: Some("x".into()),
             stage: FailureStage::Sink,
             track: None,
+            stats: Default::default(),
             error: Error::resource_exhausted("cap"),
         };
         let e: Error = f.into();
@@ -254,6 +274,7 @@ mod tests {
             output: None,
             stage: FailureStage::Prepare,
             track: None,
+            stats: Default::default(),
             error: Error::unsupported("nope"),
         };
         let src = std::error::Error::source(&f).expect("source");

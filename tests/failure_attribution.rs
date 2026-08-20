@@ -659,3 +659,62 @@ fn error_kind_survives_attribution() {
         assert!(recovered.is_resource_exhausted());
     }
 }
+
+/// `RunFailure::stats` carries the failing output's partial counters:
+/// a mid-stream sink failure reports exactly the frames delivered
+/// before the error (deterministic on both paths — the serial pump
+/// stops at the failing write, the pipelined mux loop records the
+/// error on the first failing write); an EOF-flush encoder failure
+/// reports the full healthy stream; a preparation failure reports
+/// all-zero counters.
+#[test]
+fn partial_stats_attached_to_failures() {
+    // Mid-stream sink failure: 3 healthy frames landed, the 4th write
+    // failed — the snapshot must say 3.
+    for threads in [1usize, 2] {
+        let src = common::stub::touch(&format!("attr_stats_sink_{threads}"));
+        let job_json = format!(
+            r#"{{"@display": {{"audio": [{{"from": "{}"}}]}}}}"#,
+            json_path(&src)
+        );
+        let (sink, _) = FaultySink::boxed(SinkFault::WriteAfter(3));
+        let f = run_expect_failure(&job_json, "@display", sink, threads);
+        assert_eq!(
+            f.stats.frames_written, 3,
+            "threads={threads}: partial frames_written"
+        );
+        assert!(
+            f.stats.packets_read > 0,
+            "threads={threads}: packets_read must reflect pre-failure demux work"
+        );
+    }
+
+    // EOF-flush encoder failure: the whole stream encoded before the
+    // flush erred.
+    for threads in [1usize, 2] {
+        let src = common::stub::touch(&format!("attr_stats_flush_{threads}"));
+        let job_json = format!(
+            r#"{{"@out": {{"audio": [{{"from": "{}", "codec": "{FAIL_FLUSH_ENC_ID}"}}]}}}}"#,
+            json_path(&src)
+        );
+        let (sink, _) = FaultySink::boxed(SinkFault::None);
+        let f = run_expect_failure(&job_json, "@out", sink, threads);
+        assert!(
+            f.stats.packets_encoded > 0,
+            "threads={threads}: flush-time failure must report the encoded stream"
+        );
+    }
+
+    // Preparation failure: nothing flowed, counters all zero.
+    let src = common::stub::touch("attr_stats_prep");
+    let job_json = format!(
+        r#"{{"@display": {{"audio": [{{"from": "{}", "codec": "attr_no_such_codec"}}]}}}}"#,
+        json_path(&src)
+    );
+    let (sink, _) = FaultySink::boxed(SinkFault::None);
+    let f = run_expect_failure(&job_json, "@display", sink, 1);
+    assert_eq!(f.stage, FailureStage::Prepare);
+    assert_eq!(f.stats.packets_read, 0);
+    assert_eq!(f.stats.frames_written, 0);
+    assert_eq!(f.stats.packets_encoded, 0);
+}

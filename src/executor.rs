@@ -317,6 +317,23 @@ impl<'a> Executor<'a> {
     /// Default `false`: historical behaviour, partial output is kept
     /// wherever the sink put it (useful for debugging a mid-stream
     /// failure).
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use oxideav_core::RuntimeContext;
+    /// use oxideav_pipeline::{Executor, Job};
+    ///
+    /// let ctx = RuntimeContext::new();
+    /// let job = Job::from_json(r#"{"out.wav": {"audio": [{"from": "in.wav"}]}}"#)?;
+    /// // A failed run deletes the partially-written out.wav instead of
+    /// // leaving a truncated file that looks like a finished output.
+    /// let stats = Executor::new(&job, &ctx)
+    ///     .with_discard_failed_outputs(true)
+    ///     .run()?;
+    /// # let _ = stats;
+    /// # Ok::<(), oxideav_core::Error>(())
+    /// ```
     pub fn with_discard_failed_outputs(mut self, discard: bool) -> Self {
         self.discard_failed_outputs = discard;
         self
@@ -354,12 +371,38 @@ impl<'a> Executor<'a> {
 
     /// Like [`Self::run`], but a failure returns a [`RunFailure`]
     /// carrying the attribution alongside the original error: the
-    /// owning output key, the [`FailureStage`], and the track index
-    /// when the failing stage belongs to one.
+    /// owning output key, the [`FailureStage`], the track index when
+    /// the failing stage belongs to one, and the failing output's
+    /// partial [`ExecutorStats`] ("how far did it get").
     ///
     /// `RunFailure::error` holds the exact error [`Self::run`] would
     /// have returned (never a re-stringified copy), so error-kind
     /// matching behaves identically on both surfaces.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// use oxideav_core::RuntimeContext;
+    /// use oxideav_pipeline::{Executor, FailureStage, Job};
+    ///
+    /// let ctx = RuntimeContext::new();
+    /// let job = Job::from_json(r#"{"out.wav": {"audio": [{"from": "in.wav"}]}}"#)?;
+    /// match Executor::new(&job, &ctx).run_reporting() {
+    ///     Ok(stats) => println!("done: {} packets", stats.packets_read),
+    ///     Err(f) if f.stage == FailureStage::Prepare => {
+    ///         eprintln!("setup failed before any data flowed: {f}");
+    ///     }
+    ///     Err(f) => {
+    ///         eprintln!(
+    ///             "{} failed mid-stream after {} frames: {}",
+    ///             f.output.as_deref().unwrap_or("job"),
+    ///             f.stats.frames_written,
+    ///             f.error,
+    ///         );
+    ///     }
+    /// }
+    /// # Ok::<(), oxideav_core::Error>(())
+    /// ```
     pub fn run_reporting(mut self) -> std::result::Result<ExecutorStats, RunFailure> {
         self.job.validate().map_err(RunFailure::job_level)?;
         let dag = self.job.to_dag().map_err(RunFailure::job_level)?;
@@ -671,12 +714,30 @@ fn pump_serial_output(
 ) -> StageResult<ExecutorStats> {
     sink.start(out_streams)
         .map_err(attribute(FailureStage::Sink, None))?;
+    let mut stats = ExecutorStats::default();
+    // On failure, attach the partial counters to the attribution so
+    // callers see "how far it got" (`RunFailure::stats`).
+    match pump_serial_streams(pipelines, sources_by_uri, sink, &mut stats) {
+        Ok(()) => Ok(stats),
+        Err(mut failure) => {
+            failure.stats = stats;
+            Err(failure)
+        }
+    }
+}
 
+/// The serial pump proper, accumulating into `stats` owned by the
+/// caller so a mid-stream failure still reports the partial counters.
+fn pump_serial_streams(
+    pipelines: &mut [TrackRuntime],
+    sources_by_uri: &mut HashMap<String, SourcePump>,
+    sink: &mut dyn JobSink,
+    stats: &mut ExecutorStats,
+) -> StageResult<()> {
     // Main pump. Read packets / frames from every source in
     // round-robin until all are EOF. Routes vary by source shape:
     //   - Demuxer / Packets → next_packet()  → feed_packet()
     //   - Frames            → next_frame()   → feed_frame()
-    let mut stats = ExecutorStats::default();
     let mut eof: HashMap<String, bool> =
         sources_by_uri.keys().map(|k| (k.clone(), false)).collect();
     let uris: Vec<String> = sources_by_uri.keys().cloned().collect();
@@ -697,7 +758,7 @@ fn pump_serial_output(
                             if pkt.stream_index != pl.source_stream {
                                 continue;
                             }
-                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, &mut stats)?;
+                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, stats)?;
                         }
                     }
                     Err(Error::Eof) => {
@@ -716,7 +777,7 @@ fn pump_serial_output(
                             if pkt.stream_index != pl.source_stream {
                                 continue;
                             }
-                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, &mut stats)?;
+                            pl.feed_packet(&pkt, track_idx as u32, &mut *sink, stats)?;
                         }
                     }
                     Err(Error::Eof) => {
@@ -743,7 +804,7 @@ fn pump_serial_output(
                                 frame.clone(),
                                 track_idx as u32,
                                 &mut *sink,
-                                &mut stats,
+                                stats,
                             )?;
                         }
                     }
@@ -758,11 +819,11 @@ fn pump_serial_output(
     }
     // EOF — drain each pipeline.
     for (track_idx, pl) in pipelines.iter_mut().enumerate() {
-        pl.drain(track_idx as u32, &mut *sink, &mut stats)?;
+        pl.drain(track_idx as u32, &mut *sink, stats)?;
     }
     sink.finish()
         .map_err(attribute(FailureStage::SinkFinish, None))?;
-    Ok(stats)
+    Ok(())
 }
 
 impl<'a> Executor<'a> {
