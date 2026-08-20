@@ -69,6 +69,43 @@ error; the pipelined path deliberately trades in-flight frames
 tradeoff `ExecutorHandle::stop` relies on. See
 `tests/error_propagation.rs`.
 
+## Failure attribution
+
+`Executor::run_reporting` (and `ExecutorHandle::stop_reporting`)
+return a `RunFailure` pairing that original error with *where* it
+fired: the owning output key, a `FailureStage`
+(`prepare` / `source` / `copy` / `decode` / `filter` / `convert` /
+`encode` / `sink` / `sink-finish`), and the track index when the
+failing stage belongs to one — "encoder failed on track 0 of out.mp4"
+as data, not log-line archaeology. Both executor paths attribute the
+same failure site to the same stage; `SinkFinish` is split from
+`Sink` because the whole stream already landed when finalisation
+fails (some engines treat that as salvageable). `run()` / `stop()`
+stay thin wrappers: `From<RunFailure> for Error` recovers the stored
+original error unwrapped, so error-KIND matching
+(`ResourceExhausted`, …) behaves identically on both surfaces and the
+first-error-wins contract is untouched. Job-level failures that
+precede any per-output work (validation, DAG build) carry
+`output: None`. See `tests/failure_attribution.rs`.
+
+## Failed-output disposal
+
+`Executor::with_discard_failed_outputs(true)` opts a job into
+partial-output cleanup: a failing output's sink receives the
+`JobSink::abandon` hook (default no-op) instead of being dropped
+mid-write, and the built-in `FileSink` implements it by closing the
+muxer's file handle and deleting the partially-written file — a
+failed transcode leaves no half-file behind for a downstream consumer
+to mistake for a finished output. The hook also fires for sinks
+resolved in a multi-output wave whose preparation failed before the
+wave started (their just-created zero-byte files would otherwise
+linger). Healthy wave-mates of a failing output still finalise
+normally, and a clean `ExecutorHandle::stop` (no recorded error)
+still finalises via `finish` — stop is a cancel, not a failure. The
+default (`false`) keeps the historical partial-file-stays behaviour,
+which is the debugging-friendly choice. See
+`tests/discard_failed_outputs.rs`.
+
 ## Multi-output parallelism
 
 A job with several outputs and `threads ≥ 2` runs its outputs

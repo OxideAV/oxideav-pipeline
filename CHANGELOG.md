@@ -26,8 +26,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failure), and the default (`false`) keeps the historical
   partial-file-stays behaviour. `FileSink::abandon` is idempotent and
   later hooks report the abandonment instead of resurrecting the
-  file. Pinned by `tests/discard_failed_outputs.rs` (9 contracts,
-  serial + pipelined) via a new writable stub muxer whose
+  file. Pinned by `tests/discard_failed_outputs.rs` (12 contracts,
+  serial + pipelined + spawn) via a new writable stub muxer whose
   header/trailer bytes let tests distinguish a finalised file from a
   torn-down one, plus a dying-demuxer stub for healthy-graph
   mid-stream source faults.
@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   serial and pipelined executors attribute the same failure site to
   the same stage; `SinkFinish` is split from `Sink` because every
   mid-stream byte already landed when finalisation fails. Pinned by
-  `tests/failure_attribution.rs`: 13 contracts covering job-level
+  `tests/failure_attribution.rs`: 14 contracts covering job-level
   validation, unknown-codec prepare, mid-stream source / filter /
   encoder-send / encoder-flush faults, sink start / write / finish
   faults (each on both executor paths where both exist), multi-output

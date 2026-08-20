@@ -171,7 +171,13 @@ fn multi_output_disposes_only_the_failing_output() {
         .with_discard_failed_outputs(true)
         .run_reporting()
         .expect_err("the dying output must fail the run");
-    assert_eq!(f.output.as_deref(), Some(json_path(&out_die).as_str()));
+    // The job key is the JSON-decoded path — compare against the
+    // raw display form, not the JSON-escaped one (they differ on
+    // platforms whose path separator is a JSON escape character).
+    assert_eq!(
+        f.output.as_deref(),
+        Some(out_die.display().to_string().as_str())
+    );
     assert_eq!(f.stage, FailureStage::Source);
     // The healthy wave-mate ran to completion and finalised normally.
     assert_finalised(&out_ok);
@@ -208,7 +214,11 @@ fn wave_prep_failure_disposes_prepared_wave_mates() {
         .with_discard_failed_outputs(true)
         .run_reporting()
         .expect_err("unknown codec must fail preparation");
-    assert_eq!(f.output.as_deref(), Some(json_path(&out_b).as_str()));
+    // JSON-decoded key == raw display form (see note above).
+    assert_eq!(
+        f.output.as_deref(),
+        Some(out_b.display().to_string().as_str())
+    );
     assert_eq!(f.stage, FailureStage::Prepare);
     assert!(
         !out_a.exists(),
@@ -243,20 +253,29 @@ fn wave_prep_failure_disposes_prepared_wave_mates() {
 
 // ───────────────────────── custom sinks ─────────────────────────
 
-/// Observer sink counting `abandon` / `finish` invocations.
+/// Observer sink counting `abandon` / `finish` invocations, with an
+/// optional failing `start`.
 struct HookSink {
     abandons: Arc<AtomicUsize>,
     finishes: Arc<AtomicUsize>,
+    fail_start: bool,
 }
 
 impl HookSink {
     fn boxed() -> (Box<dyn JobSink + Send>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        Self::boxed_with(false)
+    }
+
+    fn boxed_with(
+        fail_start: bool,
+    ) -> (Box<dyn JobSink + Send>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
         let abandons = Arc::new(AtomicUsize::new(0));
         let finishes = Arc::new(AtomicUsize::new(0));
         (
             Box::new(Self {
                 abandons: abandons.clone(),
                 finishes: finishes.clone(),
+                fail_start,
             }),
             abandons,
             finishes,
@@ -266,6 +285,9 @@ impl HookSink {
 
 impl JobSink for HookSink {
     fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+        if self.fail_start {
+            return Err(oxideav_core::Error::other("hook sink start failed"));
+        }
         Ok(())
     }
     fn write_packet(&mut self, _kind: MediaType, _pkt: &Packet) -> Result<()> {
@@ -341,6 +363,107 @@ fn custom_sink_abandon_hook_silent_by_default_and_on_success() {
         .expect("clean run");
     assert_eq!(abandons.load(Ordering::SeqCst), 0);
     assert_eq!(finishes.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn abandon_fires_even_when_the_sink_fails_at_start() {
+    // A `start`-time failure means the output produced nothing at all,
+    // but the sink may still have created artifacts at resolution time
+    // — the disposal hook fires here too, on both paths.
+    for threads in [1usize, 2] {
+        let src = common::stub::touch(&format!("disposal_startfail_{threads}"));
+        let job_json = format!(
+            r#"{{"@display": {{"audio": [{{"from": "{}"}}]}}}}"#,
+            json_path(&src)
+        );
+        let ctx = stub_ctx();
+        let job = Job::from_json(&job_json).expect("parse job");
+        let (sink, abandons, finishes) = HookSink::boxed_with(true);
+        Executor::new(&job, &ctx)
+            .with_threads(threads)
+            .with_discard_failed_outputs(true)
+            .with_sink_override("@display", sink)
+            .run()
+            .expect_err("failing start must fail the run");
+        assert_eq!(abandons.load(Ordering::SeqCst), 1, "threads={threads}");
+        assert_eq!(finishes.load(Ordering::SeqCst), 0, "threads={threads}");
+    }
+}
+
+#[test]
+fn serial_multi_output_disposes_the_failing_output_only() {
+    // threads == 1 runs outputs strictly sequentially: the first
+    // output fails mid-stream (file disposed); the second is never
+    // prepared, so its file is never created in the first place.
+    let src_die = common::stub::touch_die("disposal_serial_die");
+    let src_ok = common::stub::touch("disposal_serial_ok");
+    let out_die = out_path("disposal_serial_die");
+    let out_ok = out_path("disposal_serial_ok");
+    let job_json = format!(
+        r#"{{
+            "{}": {{"audio": [{{"from": "{}"}}]}},
+            "{}": {{"audio": [{{"from": "{}"}}]}}
+        }}"#,
+        json_path(&out_die),
+        json_path(&src_die),
+        json_path(&out_ok),
+        json_path(&src_ok),
+    );
+    let ctx = stub_ctx();
+    let job = Job::from_json(&job_json).expect("parse job");
+    let f = Executor::new(&job, &ctx)
+        .with_threads(1)
+        .with_discard_failed_outputs(true)
+        .run_reporting()
+        .expect_err("dying first output must fail the run");
+    // The job key is the JSON-decoded path — compare against the
+    // raw display form, not the JSON-escaped one (they differ on
+    // platforms whose path separator is a JSON escape character).
+    assert_eq!(
+        f.output.as_deref(),
+        Some(out_die.display().to_string().as_str())
+    );
+    assert!(!out_die.exists(), "failing output's file must be removed");
+    assert!(
+        !out_ok.exists(),
+        "outputs after a serial failure never run and never create files"
+    );
+}
+
+#[test]
+fn spawn_path_disposes_the_file_on_failure() {
+    // The disposal opt-in must survive the trip through
+    // Executor::spawn / PipelineControl onto the background thread.
+    let src = common::stub::touch_die("disposal_spawn_die");
+    let out = out_path("disposal_spawn_die");
+    let job_json = format!(
+        r#"{{"{}": {{"audio": [{{"from": "{}"}}]}}}}"#,
+        json_path(&out),
+        json_path(&src)
+    );
+    let ctx = stub_ctx();
+    let job = Job::from_json(&job_json).expect("parse job");
+    let handle = Executor::new(&job, &ctx)
+        .with_threads(2)
+        .with_discard_failed_outputs(true)
+        .spawn()
+        .expect("spawn");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while !handle.has_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "executor did not observe the source failure in time"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    let f = handle
+        .stop_reporting()
+        .expect_err("must surface the source failure");
+    assert_eq!(f.stage, FailureStage::Source);
+    assert!(
+        !out.exists(),
+        "spawn-path failure must dispose the partial file"
+    );
 }
 
 // ───────────────────────── stop() semantics ─────────────────────────

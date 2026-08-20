@@ -620,3 +620,42 @@ fn stop_reporting_attributes_spawn_path_failures() {
         SINK_WRITE_ERR,
     );
 }
+
+/// Error KIND (not just the message) survives attribution: a
+/// `ResourceExhausted` from a sink (the DoS-cap contract) is still
+/// matchable on `RunFailure::error` and on the recovered plain error.
+#[test]
+fn error_kind_survives_attribution() {
+    struct ExhaustedSink;
+    impl JobSink for ExhaustedSink {
+        fn start(&mut self, _streams: &[StreamInfo]) -> Result<()> {
+            Ok(())
+        }
+        fn write_packet(&mut self, _kind: MediaType, _pkt: &Packet) -> Result<()> {
+            Err(Error::resource_exhausted("sink budget"))
+        }
+        fn write_frame(&mut self, _kind: MediaType, _frm: &Frame) -> Result<()> {
+            Err(Error::resource_exhausted("sink budget"))
+        }
+        fn finish(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+    for threads in [1usize, 2] {
+        let src = common::stub::touch(&format!("attr_kind_{threads}"));
+        let job_json = format!(
+            r#"{{"@display": {{"audio": [{{"from": "{}"}}]}}}}"#,
+            json_path(&src)
+        );
+        let ctx = attr_ctx();
+        let job = Job::from_json(&job_json).expect("parse job");
+        let f = Executor::new(&job, &ctx)
+            .with_threads(threads)
+            .with_sink_override("@display", Box::new(ExhaustedSink))
+            .run_reporting()
+            .expect_err("must fail");
+        assert!(f.error.is_resource_exhausted(), "kind lost: {f}");
+        let recovered: Error = f.into();
+        assert!(recovered.is_resource_exhausted());
+    }
+}
