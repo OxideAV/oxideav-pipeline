@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.12](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.11...v0.1.12) - 2026-08-20
+
+### Other
+
+- track-1 encode attribution + mux-loop barrier-failure record site
+- attach the failing output's partial ExecutorStats to RunFailure
+- hostile/edge disposal + attribution coverage; README failure sections
+- failed-output disposal — opt-in JobSink::abandon + FileSink cleanup
+- typed failure attribution — run_reporting/stop_reporting surface RunFailure
+- pin the parallel-output gating contract on both knobs
+- hostile/edge coverage for parallel outputs + multi-source seek
+- fan every seek out to all routed sources
+- escape Windows path separators in embedded job JSON
+- run multi-output jobs concurrently in budget-clamped waves
+- name the convert pixel-format strings on their own terms
+- criterion graph-resolution suite + README refresh for r400 capabilities
+- error-propagation coherence — failing sink/source surfaces the original error, no hang
+- key-directed TrackInput deserialization — exponential nested-chain parse fixed
+- native packet- and frame-source pumps — spawn() works on typed sources
+- empty-codec + contradictory selector-kind + bare-@ key rejection
+- pin per-kind stream ordinals in all: fan-out — dual same-kind streams no longer collapse
+- defensive alias-cycle guard in to_dag — Err instead of stack overflow
+- add CI / crates.io / docs.rs / MIT-license badges
+- refresh to current status, drop per-round changelog cruft
+
 ### Added
 
 - Failed-output disposal:
