@@ -19,6 +19,7 @@ pub mod schema;
 pub mod selection;
 pub mod sinks;
 pub mod staged;
+pub mod stream_fit;
 pub mod validate;
 
 pub use dag::{Dag, DagNode, NodeId};
@@ -34,6 +35,7 @@ pub use selection::{
 };
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
+pub use stream_fit::{select_streams, OutputKind, StreamSelection};
 
 use oxideav_core::{
     CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
