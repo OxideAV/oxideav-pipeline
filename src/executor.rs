@@ -33,7 +33,7 @@ use crate::dag::{
 };
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
-use crate::selection::{make_decoder, make_encoder};
+use crate::selection::{make_decoder_with, make_encoder_with, CodecPreferences};
 use crate::sinks::{open_file_write, FileSink, NullSink};
 use crate::staged;
 
@@ -208,6 +208,11 @@ pub struct Executor<'a> {
     /// closure to bridge `(source_uri, backend_name, opts_json)` to a
     /// concrete `Box<dyn FrameSource>`.
     render_source_factory: Option<RenderSourceFactory>,
+    /// Codec-implementation preferences every decoder / encoder the
+    /// job builds is resolved under (`--no-hwaccel`, prefer / exclude
+    /// lists). Default: [`CodecPreferences::default`]. Set via
+    /// [`Self::with_codec_preferences`].
+    prefs: CodecPreferences,
 }
 
 impl<'a> Executor<'a> {
@@ -225,7 +230,19 @@ impl<'a> Executor<'a> {
             max_queue_bytes: 0,
             discard_failed_outputs: false,
             render_source_factory: None,
+            prefs: CodecPreferences::default(),
         }
+    }
+
+    /// Resolve every decoder and encoder the job builds under `prefs`
+    /// (the same walk as [`crate::make_decoder_with`] /
+    /// [`crate::make_encoder_with`]): e.g. `no_hardware` keeps
+    /// hardware backends out of selection, `prefer` / `exclude` bias
+    /// or drop named implementations. The default preferences pick by
+    /// registered priority alone.
+    pub fn with_codec_preferences(mut self, prefs: CodecPreferences) -> Self {
+        self.prefs = prefs;
+        self
     }
 
     /// Replace the sink for a named output. Typically used to bind a
@@ -677,7 +694,7 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)
+            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters)
                 .map_err(&prep)?;
         }
 
@@ -1171,7 +1188,7 @@ impl<'a> Executor<'a> {
         }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &ctx, &self.ctx.filters)?;
+            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters)?;
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
@@ -1406,6 +1423,7 @@ impl TrackRuntime {
     pub(crate) fn instantiate(
         &mut self,
         codecs: &CodecRegistry,
+        prefs: &CodecPreferences,
         ctx: &ExecutionContext,
         filters: &FilterRegistry,
     ) -> Result<()> {
@@ -1421,7 +1439,7 @@ impl TrackRuntime {
             match stage {
                 StageSpec::Decode => {
                     if self.decoder.is_none() {
-                        let mut d = make_decoder(codecs, &self.input_params)?;
+                        let mut d = make_decoder_with(codecs, &self.input_params, prefs)?;
                         d.set_execution_context(ctx);
                         self.decoder = Some(d);
                     }
@@ -1521,6 +1539,16 @@ impl TrackRuntime {
                         enc_params.bit_rate = None;
                         enc_params.extradata = Vec::new();
                     }
+                    // `running` starts from the demuxer's stream
+                    // parameters, whose `options` bag carries container
+                    // metadata (MP4 `elst_*` / `vmhd_*` / `btrt_*`, …).
+                    // None of it configures the encoder, and strict
+                    // option parsers (`oxideav_core::parse_options`)
+                    // reject the foreign keys outright — `convert in.mp4
+                    // out.png` failed with "unknown option
+                    // 'elst_entry_count'". Encoder options come from the
+                    // job only.
+                    enc_params.options = Default::default();
                     enc_params.codec_id = CodecId::new(codec.as_str());
                     // Map a handful of common params directly onto
                     // CodecParameters. Everything else is ignored by the
@@ -1541,7 +1569,7 @@ impl TrackRuntime {
                     if let Some(h) = params.get("height").and_then(|b| b.as_u64()) {
                         enc_params.height = Some(h as u32);
                     }
-                    let mut encoder = make_encoder(codecs, &enc_params)?;
+                    let mut encoder = make_encoder_with(codecs, &enc_params, prefs)?;
                     encoder.set_execution_context(ctx);
                     let out_params = encoder.output_params().clone();
                     running = out_params.clone();
