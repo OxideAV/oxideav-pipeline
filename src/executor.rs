@@ -28,10 +28,9 @@ use oxideav_core::{
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
-use crate::dag::{
-    codec_accepted_pixel_formats, codec_encoder_caps, Dag, DagNode, MuxTrack, ResolvedSelector,
-};
+use crate::dag::{codec_encoder_caps, Dag, DagNode, MuxTrack, ResolvedSelector};
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
+use crate::pix_negotiate::{encoder_input_format, MuxProbe};
 use crate::schema::{is_reserved_sink, Job};
 use crate::selection::{make_decoder_with, make_encoder_with, CodecPreferences};
 use crate::sinks::{open_file_write, FileSink, NullSink};
@@ -685,8 +684,13 @@ impl<'a> Executor<'a> {
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format. Runs after the source is
         // open and before codec instantiation.
+        let container = self.output_container(name);
+        let mux = container.as_deref().map(|c| MuxProbe {
+            containers: &self.ctx.containers,
+            container: c,
+        });
         for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux);
         }
 
         // Instantiate decoders / filters / encoders for each track. The
@@ -694,7 +698,7 @@ impl<'a> Executor<'a> {
         // path passes its own thread budget below.
         let ctx = ExecutionContext::serial();
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters)
+            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters, mux)
                 .map_err(&prep)?;
         }
 
@@ -1183,12 +1187,17 @@ impl<'a> Executor<'a> {
         }
         // Auto-insert pixel-format conversion stages now that we know
         // the source stream's pixel format.
+        let container = self.output_container(name);
+        let mux = container.as_deref().map(|c| MuxProbe {
+            containers: &self.ctx.containers,
+            container: c,
+        });
         for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(&self.ctx.codecs);
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux);
         }
         let ctx = ExecutionContext::with_threads(threads);
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters)?;
+            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters, mux)?;
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;
@@ -1209,6 +1218,22 @@ impl<'a> Executor<'a> {
             max_queue_bytes: self.max_queue_bytes,
             discard_on_failure: self.discard_failed_outputs,
         })
+    }
+
+    /// The container `open_sink` will open a muxer for when output
+    /// `name` is a plain file (no sink override, not an `@` sink): the
+    /// one registered for its extension. Pixel-format negotiation
+    /// probes it so the encoder is fed a layout the muxer can store.
+    fn output_container(&self, name: &str) -> Option<String> {
+        if name.starts_with('@') || self.sink_overrides.contains_key(name) {
+            return None;
+        }
+        let path = PathBuf::from(name);
+        let ext = path.extension().and_then(|e| e.to_str())?;
+        self.ctx
+            .containers
+            .container_for_extension(ext)
+            .map(str::to_owned)
     }
 
     pub(crate) fn open_sink(
@@ -1426,6 +1451,7 @@ impl TrackRuntime {
         prefs: &CodecPreferences,
         ctx: &ExecutionContext,
         filters: &FilterRegistry,
+        mux: Option<MuxProbe<'_>>,
     ) -> Result<()> {
         // Track running frame format through the stage stack so the encoder
         // can be constructed with a realistic parameter set.
@@ -1517,18 +1543,23 @@ impl TrackRuntime {
                     // shape (the audio counterpart of the pixel-format
                     // auto-insert). Explicit `sample_rate` / `channels`
                     // params override the negotiated targets.
-                    // Video: convert into the encoder's accepted layouts
-                    // when the source layout only became known here
-                    // (from the decoder) — the spec-level auto-insert
-                    // already handled sources whose container declared
-                    // it, leaving `running` accepted.
+                    // Video: convert into a layout both the encoder and
+                    // the output's muxer take (see `pix_negotiate`) when
+                    // the source layout only became known here (from
+                    // the decoder) — the spec-level auto-insert already
+                    // handled sources whose container declared it,
+                    // leaving `running` accepted.
                     if running.media_type == MediaType::Video {
-                        if let (Some(cur), Some(accepted)) = (
-                            running.pixel_format,
-                            codec_accepted_pixel_formats(codecs, codec),
-                        ) {
-                            if !accepted.contains(&cur) {
-                                let target = accepted[0];
+                        if let Some(cur) = running.pixel_format {
+                            let target = encoder_input_format(
+                                codecs,
+                                codec,
+                                &running,
+                                self.input_time_base,
+                                mux,
+                            )
+                            .unwrap_or(cur);
+                            if target != cur {
                                 self.frame_stages.push(FrameStage::PixConvert {
                                     src_info: oxideav_pixfmt::FrameInfo::new(
                                         cur,
@@ -1615,9 +1646,11 @@ impl TrackRuntime {
     }
 
     /// Rewrite `self.stages` to insert `StageSpec::Convert` in front of
-    /// any `Encode` whose codec declares a non-empty
-    /// `accepted_pixel_formats` set that does not include the currently
-    /// running pixel format.
+    /// any `Encode` that cannot take the currently running pixel format:
+    /// its codec declares a non-empty `accepted_pixel_formats` set
+    /// without it, or the output's muxer (`mux`) refuses the stream the
+    /// encoder would publish for it. The target is negotiated by
+    /// [`encoder_input_format`].
     ///
     /// Must be called after `input_params` has been populated from the
     /// demuxer and before `instantiate`. Audio tracks (where
@@ -1628,7 +1661,11 @@ impl TrackRuntime {
     /// (they do today — only audio filters exist — but this assumption
     /// will have to be revisited when video filters land and can
     /// change the pixel format).
-    pub(crate) fn apply_pixel_format_auto_insert(&mut self, codecs: &CodecRegistry) {
+    pub(crate) fn apply_pixel_format_auto_insert(
+        &mut self,
+        codecs: &CodecRegistry,
+        mux: Option<MuxProbe<'_>>,
+    ) {
         let src_fmt = match self.input_params.pixel_format {
             Some(f) => f,
             None => return,
@@ -1650,12 +1687,14 @@ impl TrackRuntime {
                 }
                 StageSpec::Encode { codec, .. } => {
                     if let Some(cur_fmt) = running {
-                        if let Some(accepted) = codec_accepted_pixel_formats(codecs, codec) {
-                            if !accepted.contains(&cur_fmt) {
-                                let target = accepted[0];
-                                rewritten.push(StageSpec::Convert { target });
-                                running = Some(target);
-                            }
+                        let mut shape = self.input_params.clone();
+                        shape.pixel_format = Some(cur_fmt);
+                        let target =
+                            encoder_input_format(codecs, codec, &shape, self.input_time_base, mux)
+                                .unwrap_or(cur_fmt);
+                        if target != cur_fmt {
+                            rewritten.push(StageSpec::Convert { target });
+                            running = Some(target);
                         }
                     }
                     rewritten.push(stage);

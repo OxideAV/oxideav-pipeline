@@ -15,6 +15,7 @@ pub mod bench;
 pub mod dag;
 pub mod executor;
 pub mod failure;
+mod pix_negotiate;
 pub mod schema;
 pub mod selection;
 pub mod sinks;
@@ -425,6 +426,10 @@ pub fn transcode_simple(
 /// Same as [`transcode_simple`] but threads `prefs` through to
 /// `make_decoder_with` / `make_encoder_with`. Use this from CLIs that
 /// expose a `--no-hwaccel` style flag or any codec-priority bias.
+///
+/// Video frames are converted into a pixel layout the encoder declares
+/// it accepts. Audio frames reach the encoder in the decoder's shape;
+/// [`transcode_simple_in`] also adapts audio (and probes the muxer).
 pub fn transcode_simple_with(
     demuxer: &mut dyn Demuxer,
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
@@ -432,6 +437,138 @@ pub fn transcode_simple_with(
     prefs: &CodecPreferences,
     plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
 ) -> Result<TranscodeStats> {
+    transcode_routes(
+        demuxer,
+        muxer_open,
+        Adapt {
+            codecs,
+            filters: None,
+            mux: None,
+        },
+        prefs,
+        plan_for,
+    )
+}
+
+/// [`transcode_simple_with`] with the whole runtime context, so every
+/// re-encoded stream is adapted to its encoder the way a job run
+/// through the [`Executor`] is:
+///
+/// * video gets a pixel-format conversion into a layout both the
+///   encoder and — when `container` names the muxer `muxer_open`
+///   opens — that muxer take (an RGB FFV1 source written to Y4M is
+///   converted to planar YUV);
+/// * audio gets the downmix / resample / sample-format conversion
+///   filters (from `ctx.filters`) the encoder's declared capabilities
+///   call for (a decoder's interleaved `s16` into Vorbis' float
+///   planar input).
+pub fn transcode_simple_in(
+    demuxer: &mut dyn Demuxer,
+    muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
+    ctx: &oxideav_core::RuntimeContext,
+    container: Option<&str>,
+    prefs: &CodecPreferences,
+    plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
+) -> Result<TranscodeStats> {
+    transcode_routes(
+        demuxer,
+        muxer_open,
+        Adapt {
+            codecs: &ctx.codecs,
+            filters: Some(&ctx.filters),
+            mux: container.map(|c| pix_negotiate::MuxProbe {
+                containers: &ctx.containers,
+                container: c,
+            }),
+        },
+        prefs,
+        plan_for,
+    )
+}
+
+/// What a re-encode route may use to shape decoded frames for its
+/// encoder.
+struct Adapt<'a> {
+    codecs: &'a CodecRegistry,
+    filters: Option<&'a FilterRegistry>,
+    mux: Option<pix_negotiate::MuxProbe<'a>>,
+}
+
+impl Adapt<'_> {
+    /// The frame stages that turn `decoder`'s output for `in_stream`
+    /// into what the `output_codec` encoder takes, plus the stream
+    /// shape after them (the encoder's input parameters).
+    fn stages(
+        &self,
+        decoder: &dyn Decoder,
+        in_stream: &StreamInfo,
+        output_codec: &str,
+    ) -> Result<(Vec<executor::FrameStage>, CodecParameters)> {
+        use executor::{port_params_to_codec_params, port_spec_from_params, FrameStage};
+        let mut running = in_stream.params.clone();
+        let mut stages = Vec::new();
+        match running.media_type {
+            MediaType::Video => {
+                // A container that declared no pixel layout leaves the
+                // decoder as the only authority on it.
+                if running.pixel_format.is_none() {
+                    running.pixel_format = decoder.output_pixel_format();
+                }
+                if let Some(cur) = running.pixel_format {
+                    let target = pix_negotiate::encoder_input_format(
+                        self.codecs,
+                        output_codec,
+                        &running,
+                        in_stream.time_base,
+                        self.mux,
+                    )
+                    .unwrap_or(cur);
+                    if target != cur {
+                        stages.push(FrameStage::PixConvert {
+                            src_info: oxideav_pixfmt::FrameInfo::new(
+                                cur,
+                                running.width.unwrap_or(0),
+                                running.height.unwrap_or(0),
+                            ),
+                            target,
+                        });
+                        running.pixel_format = Some(target);
+                    }
+                }
+            }
+            MediaType::Audio => {
+                let caps = dag::codec_encoder_caps(self.codecs, output_codec);
+                if let (Some(filters), Some(caps)) = (self.filters, caps) {
+                    let want =
+                        executor::AudioTarget::negotiate(&caps, &running, &serde_json::Value::Null);
+                    for (name, fparams) in want.filters(&running) {
+                        let in_port = port_spec_from_params(&running, in_stream.time_base);
+                        let filter =
+                            filters.make(name, &fparams, std::slice::from_ref(&in_port))?;
+                        let out_port = filter.output_ports().first().cloned().ok_or_else(|| {
+                            Error::invalid(format!("filter '{name}' declares zero output ports"))
+                        })?;
+                        running = port_params_to_codec_params(&out_port.params, &running);
+                        stages.push(FrameStage::Filter(executor::RuntimeFilter {
+                            inner: filter,
+                        }));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok((stages, running))
+    }
+}
+
+fn transcode_routes(
+    demuxer: &mut dyn Demuxer,
+    muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
+    adapt: Adapt<'_>,
+    prefs: &CodecPreferences,
+    plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
+) -> Result<TranscodeStats> {
+    let codecs = adapt.codecs;
     let in_streams = demuxer.streams().to_vec();
     if in_streams.is_empty() {
         return Err(Error::invalid("no streams in input"));
@@ -459,7 +596,14 @@ pub fn transcode_simple_with(
             }
             StreamPlan::Reencode { output_codec } => {
                 let decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
-                let enc_params = build_encoder_params(&output_codec, in_stream)?;
+                let (stages, shaped) = adapt.stages(&*decoder, in_stream, &output_codec)?;
+                let enc_params = build_encoder_params(
+                    &output_codec,
+                    &StreamInfo {
+                        params: shaped,
+                        ..in_stream.clone()
+                    },
+                )?;
                 let encoder = selection::make_encoder_with(codecs, &enc_params, prefs)?;
                 let out_params = encoder.output_params().clone();
                 let out_index = out_streams.len() as u32;
@@ -481,6 +625,7 @@ pub fn transcode_simple_with(
                 routes.push(TranscodeRoute::Reencode {
                     out_index,
                     decoder,
+                    stages,
                     encoder,
                 });
             }
@@ -517,8 +662,8 @@ pub fn transcode_simple_with(
                     if let TranscodeRoute::Reencode {
                         out_index,
                         decoder,
+                        stages,
                         encoder,
-                        ..
                     } = route
                     {
                         decoder.flush()?;
@@ -526,7 +671,9 @@ pub fn transcode_simple_with(
                             match decoder.receive_frame() {
                                 Ok(frame) => {
                                     stats.frames_decoded += 1;
-                                    encoder.send_frame(&frame)?;
+                                    for f in run_stages(stages, frame)? {
+                                        encoder.send_frame(&f)?;
+                                    }
                                     drain_encoder(
                                         &mut **encoder,
                                         *out_index,
@@ -537,6 +684,9 @@ pub fn transcode_simple_with(
                                 Err(Error::NeedMore) | Err(Error::Eof) => break,
                                 Err(e) => return Err(e),
                             }
+                        }
+                        for f in flush_stages(stages)? {
+                            encoder.send_frame(&f)?;
                         }
                         encoder.flush()?;
                         drain_encoder(&mut **encoder, *out_index, &mut *muxer, &mut stats)?;
@@ -550,6 +700,33 @@ pub fn transcode_simple_with(
 
     muxer.write_trailer()?;
     Ok(stats)
+}
+
+/// Push `frame` through every stage in order; returns what reaches
+/// the end of the chain.
+fn run_stages(stages: &mut [executor::FrameStage], frame: Frame) -> Result<Vec<Frame>> {
+    let mut frames = vec![frame];
+    for stage in stages.iter_mut() {
+        let mut next = Vec::new();
+        for f in frames {
+            next.extend(executor::run_frame_stage_emit(stage, f)?.primary);
+        }
+        frames = next;
+    }
+    Ok(frames)
+}
+
+/// Flush every stage in order, carrying each stage's tail through the
+/// stages after it.
+fn flush_stages(stages: &mut [executor::FrameStage]) -> Result<Vec<Frame>> {
+    let mut out = Vec::new();
+    for i in 0..stages.len() {
+        let tail = executor::flush_frame_stage_emit(&mut stages[i])?.primary;
+        for f in tail {
+            out.extend(run_stages(&mut stages[i + 1..], f)?);
+        }
+    }
+    Ok(out)
 }
 
 /// Build encoder params for an input stream + requested output codec id.
@@ -589,6 +766,8 @@ enum TranscodeRoute {
     Reencode {
         out_index: u32,
         decoder: Box<dyn Decoder>,
+        /// Format adaptation between decoder and encoder.
+        stages: Vec<executor::FrameStage>,
         encoder: Box<dyn Encoder>,
     },
 }
@@ -611,6 +790,7 @@ fn process_packet(
         TranscodeRoute::Reencode {
             out_index,
             decoder,
+            stages,
             encoder,
         } => {
             decoder.send_packet(pkt)?;
@@ -618,7 +798,9 @@ fn process_packet(
                 match decoder.receive_frame() {
                     Ok(frame) => {
                         stats.frames_decoded += 1;
-                        encoder.send_frame(&frame)?;
+                        for f in run_stages(stages, frame)? {
+                            encoder.send_frame(&f)?;
+                        }
                         drain_encoder(&mut **encoder, *out_index, muxer, stats)?;
                     }
                     Err(Error::NeedMore) | Err(Error::Eof) => break,
