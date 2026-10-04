@@ -446,6 +446,21 @@ pub(crate) fn codec_accepted_pixel_formats(
     None
 }
 
+/// Capabilities of the implementation the registry would pick to
+/// *encode* `codec` (the first encode-capable implementation in
+/// preference order). `None` when nothing registered can encode it.
+pub(crate) fn codec_encoder_caps(
+    codecs: &oxideav_core::CodecRegistry,
+    codec: &str,
+) -> Option<oxideav_core::CodecCapabilities> {
+    let id = oxideav_core::CodecId::new(codec);
+    codecs
+        .implementations(&id)
+        .iter()
+        .find(|imp| imp.make_encoder.is_some())
+        .map(|imp| imp.caps.clone())
+}
+
 /// Pick the single best track from an alias that matches the caller's
 /// selector. Prefers kind-specific buckets; falls back to `all`.
 fn pick_alias_track<'a>(

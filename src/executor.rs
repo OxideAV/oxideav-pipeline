@@ -28,7 +28,9 @@ use oxideav_core::{
 };
 use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
 
-use crate::dag::{codec_accepted_pixel_formats, Dag, DagNode, MuxTrack, ResolvedSelector};
+use crate::dag::{
+    codec_accepted_pixel_formats, codec_encoder_caps, Dag, DagNode, MuxTrack, ResolvedSelector,
+};
 use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
 use crate::schema::{is_reserved_sink, Job};
 use crate::selection::{make_decoder, make_encoder};
@@ -1485,7 +1487,40 @@ impl TrackRuntime {
                     running.pixel_format = Some(*target);
                 }
                 StageSpec::Encode { codec, params } => {
+                    // Audio-shape negotiation: downmix / resample /
+                    // sample-format conversion in front of an encoder
+                    // whose declared input set excludes the running
+                    // shape (the audio counterpart of the pixel-format
+                    // auto-insert). Explicit `sample_rate` / `channels`
+                    // params override the negotiated targets.
+                    if running.media_type == MediaType::Audio {
+                        if let Some(caps) = codec_encoder_caps(codecs, codec) {
+                            let want = AudioTarget::negotiate(&caps, &running, params);
+                            for (name, fparams) in want.filters(&running) {
+                                let in_port = port_spec_from_params(&running, self.input_time_base);
+                                let filter =
+                                    filters.make(name, &fparams, std::slice::from_ref(&in_port))?;
+                                let out_port =
+                                    filter.output_ports().first().cloned().ok_or_else(|| {
+                                        Error::invalid(format!(
+                                            "filter '{name}' declares zero output ports"
+                                        ))
+                                    })?;
+                                running = port_params_to_codec_params(&out_port.params, &running);
+                                self.extra_output_port_counts.push(0);
+                                self.frame_stages
+                                    .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
+                            }
+                        }
+                    }
                     let mut enc_params = running.clone();
+                    if enc_params.codec_id.as_str() != codec.as_str() {
+                        // A different codec: the source's bit rate (a
+                        // PCM stream's 1411 kb/s, say) and its codec
+                        // private data mean nothing to the encoder.
+                        enc_params.bit_rate = None;
+                        enc_params.extradata = Vec::new();
+                    }
                     enc_params.codec_id = CodecId::new(codec.as_str());
                     // Map a handful of common params directly onto
                     // CodecParameters. Everything else is ignored by the
@@ -2004,6 +2039,111 @@ fn fan_out_one(pl: TrackRuntime, streams: &[StreamInfo], out: &mut Vec<TrackRunt
     }
 }
 
+/// Encoder-input audio shape negotiated by [`AudioTarget::negotiate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AudioTarget {
+    pub(crate) sample_rate: Option<u32>,
+    pub(crate) channels: Option<u16>,
+    pub(crate) format: Option<SampleFormat>,
+}
+
+impl AudioTarget {
+    /// Resolve the shape an encoder with `caps` should be fed, given the
+    /// `running` stream shape and the track's encoder `params` (an
+    /// explicit `sample_rate` / `channels` there wins). `None` fields
+    /// mean "keep the running value" (or "unknown — leave alone").
+    pub(crate) fn negotiate(
+        caps: &oxideav_core::CodecCapabilities,
+        running: &CodecParameters,
+        params: &serde_json::Value,
+    ) -> Self {
+        let explicit_rate = params
+            .get("sample_rate")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
+        let explicit_ch = params
+            .get("channels")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u16);
+        let sample_rate = explicit_rate
+            .or_else(|| running.sample_rate.map(|r| caps.pick_sample_rate(r)))
+            .filter(|&r| r > 0);
+        let channels = explicit_ch.or_else(|| {
+            running.channels.map(|c| match caps.max_channels {
+                Some(max) if c > max && max > 0 => max,
+                _ => c,
+            })
+        });
+        let format = running.sample_format.map(|f| {
+            if caps.accepted_sample_formats.is_empty() || caps.accepted_sample_formats.contains(&f)
+            {
+                f
+            } else {
+                caps.accepted_sample_formats[0]
+            }
+        });
+        Self {
+            sample_rate,
+            channels,
+            format,
+        }
+    }
+
+    /// The filter stages (registry name + params) that turn `running`
+    /// into this target: downmix, then resample (both in the source
+    /// format, so a float stream keeps its precision through them),
+    /// then sample-format conversion.
+    pub(crate) fn filters(
+        &self,
+        running: &CodecParameters,
+    ) -> Vec<(&'static str, serde_json::Value)> {
+        let mut out = Vec::new();
+        if let (Some(want), Some(have)) = (self.channels, running.channels) {
+            if want != have {
+                let to = match want {
+                    1 => "mono".to_string(),
+                    2 => "stereo".to_string(),
+                    n => format!("discrete{n}"),
+                };
+                out.push(("downmix", serde_json::json!({ "to": to })));
+            }
+        }
+        if let (Some(want), Some(have)) = (self.sample_rate, running.sample_rate) {
+            if want != have {
+                out.push(("resample", serde_json::json!({ "rate": want })));
+            }
+        }
+        if let (Some(want), Some(have)) = (self.format, running.sample_format) {
+            if want != have {
+                if let Some(name) = sample_format_name(want) {
+                    out.push(("sample_format", serde_json::json!({ "format": name })));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Filter-parameter name of a sample format (the `sample_format`
+/// filter's `format` vocabulary).
+fn sample_format_name(fmt: SampleFormat) -> Option<&'static str> {
+    Some(match fmt {
+        SampleFormat::U8 => "u8",
+        SampleFormat::S8 => "s8",
+        SampleFormat::S16 => "s16",
+        SampleFormat::S24 => "s24",
+        SampleFormat::S32 => "s32",
+        SampleFormat::F32 => "f32",
+        SampleFormat::F64 => "f64",
+        SampleFormat::U8P => "u8p",
+        SampleFormat::S16P => "s16p",
+        SampleFormat::S32P => "s32p",
+        SampleFormat::F32P => "f32p",
+        SampleFormat::F64P => "f64p",
+        _ => return None,
+    })
+}
+
 pub(crate) fn port_spec_from_params(cp: &CodecParameters, tb: TimeBase) -> PortSpec {
     match cp.media_type {
         MediaType::Audio => PortSpec::audio(
@@ -2447,6 +2587,61 @@ impl ExecutorStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn audio_cp(rate: u32, ch: u16, fmt: SampleFormat) -> CodecParameters {
+        let mut cp = CodecParameters::audio(CodecId::new("pcm_s16le"));
+        cp.sample_rate = Some(rate);
+        cp.channels = Some(ch);
+        cp.sample_format = Some(fmt);
+        cp
+    }
+
+    #[test]
+    fn audio_target_resamples_and_converts_for_constrained_encoder() {
+        let caps = oxideav_core::CodecCapabilities::audio("opus")
+            .with_sample_rates(vec![8_000, 12_000, 16_000, 24_000, 48_000])
+            .with_sample_formats(vec![SampleFormat::S16])
+            .with_max_channels(2);
+        let running = audio_cp(44_100, 6, SampleFormat::F32);
+        let t = AudioTarget::negotiate(&caps, &running, &serde_json::json!({}));
+        assert_eq!(t.sample_rate, Some(48_000));
+        assert_eq!(t.channels, Some(2));
+        assert_eq!(t.format, Some(SampleFormat::S16));
+        let names: Vec<&str> = t.filters(&running).iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["downmix", "resample", "sample_format"]);
+    }
+
+    #[test]
+    fn audio_target_is_noop_when_shape_is_accepted() {
+        let caps = oxideav_core::CodecCapabilities::audio("opus")
+            .with_sample_rates(vec![16_000, 48_000])
+            .with_sample_formats(vec![SampleFormat::S16]);
+        let running = audio_cp(16_000, 1, SampleFormat::S16);
+        let t = AudioTarget::negotiate(&caps, &running, &serde_json::json!({}));
+        assert!(t.filters(&running).is_empty());
+        // Unconstrained encoders never get a stage either.
+        let any = oxideav_core::CodecCapabilities::audio("flac");
+        let t = AudioTarget::negotiate(
+            &any,
+            &audio_cp(44_100, 2, SampleFormat::F32),
+            &serde_json::json!({}),
+        );
+        assert!(t
+            .filters(&audio_cp(44_100, 2, SampleFormat::F32))
+            .is_empty());
+    }
+
+    #[test]
+    fn audio_target_honours_explicit_sample_rate() {
+        let caps = oxideav_core::CodecCapabilities::audio("mp3")
+            .with_sample_rates(vec![22_050, 44_100, 48_000]);
+        let running = audio_cp(44_100, 2, SampleFormat::S16);
+        let t = AudioTarget::negotiate(&caps, &running, &serde_json::json!({"sample_rate": 22050}));
+        let f = t.filters(&running);
+        assert_eq!(f.len(), 1);
+        assert_eq!(f[0].0, "resample");
+        assert_eq!(f[0].1["rate"], 22_050);
+    }
 
     #[test]
     fn ext_from_uri_basic() {
