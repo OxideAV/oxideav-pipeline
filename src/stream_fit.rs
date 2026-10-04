@@ -85,9 +85,10 @@ pub fn select_streams(
         let (accepts_kind, accepts_all) = match (output, single_kind) {
             (OutputKind::SingleCodec(_), Some(k)) => (k == Some(kind), false),
             (OutputKind::Container(name), _) => {
-                let one = muxer_accepts_kind(containers, name, of_kind[0]);
-                let all =
-                    one && (of_kind.len() == 1 || muxer_accepts_all(containers, name, &of_kind));
+                let one = muxer_accepts_kind(containers, codecs, name, of_kind[0]);
+                let all = one
+                    && (of_kind.len() == 1
+                        || muxer_accepts_all(containers, codecs, name, &of_kind));
                 (one, all)
             }
             _ => (false, false),
@@ -164,7 +165,15 @@ fn encoder_media_type(codecs: &CodecRegistry, codec: &str) -> Option<MediaType> 
 const VIDEO_PROBES: &[&str] = &["rawvideo", "h264", "vp9", "av1", "ffv1", "mjpeg", "png"];
 const AUDIO_PROBES: &[&str] = &["pcm_s16le", "flac", "opus", "vorbis", "aac", "mp3"];
 
-fn representative(kind: MediaType, codec: &str, like: &StreamInfo) -> StreamInfo {
+/// A stream of `codec` shaped like `like`. When `codec` has an
+/// encoder, its output parameters are used (muxers often need the
+/// configuration record an encoder publishes, e.g. FLAC's STREAMINFO).
+fn representative(
+    codecs: &CodecRegistry,
+    kind: MediaType,
+    codec: &str,
+    like: &StreamInfo,
+) -> StreamInfo {
     let mut params = match kind {
         MediaType::Audio => {
             let mut p = CodecParameters::audio(CodecId::new(codec));
@@ -183,6 +192,14 @@ fn representative(kind: MediaType, codec: &str, like: &StreamInfo) -> StreamInfo
         }
     };
     params.media_type = kind;
+    // Software encoders only: a probe must not open hardware sessions.
+    let software = crate::CodecPreferences {
+        no_hardware: true,
+        ..Default::default()
+    };
+    if let Ok(enc) = crate::make_encoder_with(codecs, &params, &software) {
+        params = enc.output_params().clone();
+    }
     StreamInfo {
         index: 0,
         params,
@@ -206,7 +223,12 @@ fn renumbered(streams: impl IntoIterator<Item = StreamInfo>) -> Vec<StreamInfo> 
         .collect()
 }
 
-fn muxer_accepts_kind(containers: &ContainerRegistry, name: &str, s: &StreamInfo) -> bool {
+fn muxer_accepts_kind(
+    containers: &ContainerRegistry,
+    codecs: &CodecRegistry,
+    name: &str,
+    s: &StreamInfo,
+) -> bool {
     let kind = s.params.media_type;
     if opens(containers, name, &renumbered([s.clone()])) {
         return true;
@@ -218,10 +240,15 @@ fn muxer_accepts_kind(containers: &ContainerRegistry, name: &str, s: &StreamInfo
     };
     probes
         .iter()
-        .any(|c| opens(containers, name, &[representative(kind, c, s)]))
+        .any(|c| opens(containers, name, &[representative(codecs, kind, c, s)]))
 }
 
-fn muxer_accepts_all(containers: &ContainerRegistry, name: &str, of_kind: &[&StreamInfo]) -> bool {
+fn muxer_accepts_all(
+    containers: &ContainerRegistry,
+    codecs: &CodecRegistry,
+    name: &str,
+    of_kind: &[&StreamInfo],
+) -> bool {
     if opens(
         containers,
         name,
@@ -239,7 +266,7 @@ fn muxer_accepts_all(containers: &ContainerRegistry, name: &str, of_kind: &[&Str
         opens(
             containers,
             name,
-            &renumbered(of_kind.iter().map(|s| representative(kind, c, s))),
+            &renumbered(of_kind.iter().map(|s| representative(codecs, kind, c, s))),
         )
     })
 }
