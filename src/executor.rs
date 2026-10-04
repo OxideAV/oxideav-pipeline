@@ -2132,14 +2132,18 @@ impl AudioTarget {
                 _ => c,
             })
         });
-        let format = running.sample_format.map(|f| {
-            if caps.accepted_sample_formats.is_empty() || caps.accepted_sample_formats.contains(&f)
+        // An undeclared source format still gets converted when the
+        // encoder constrains its input: the `sample_format` filter
+        // reconciles the frames' real layout.
+        let format = match running.sample_format {
+            Some(f)
+                if caps.accepted_sample_formats.is_empty()
+                    || caps.accepted_sample_formats.contains(&f) =>
             {
-                f
-            } else {
-                caps.accepted_sample_formats[0]
+                Some(f)
             }
-        });
+            _ => caps.accepted_sample_formats.first().copied(),
+        };
         Self {
             sample_rate,
             channels,
@@ -2150,12 +2154,23 @@ impl AudioTarget {
     /// The filter stages (registry name + params) that turn `running`
     /// into this target: downmix, then resample (both in the source
     /// format, so a float stream keeps its precision through them),
-    /// then sample-format conversion.
+    /// then sample-format conversion. When the source format is not
+    /// declared, the (self-reconciling) format conversion runs first so
+    /// the downmix / resample stages see a known layout.
     pub(crate) fn filters(
         &self,
         running: &CodecParameters,
     ) -> Vec<(&'static str, serde_json::Value)> {
         let mut out = Vec::new();
+        let format_stage = |fmt: SampleFormat| {
+            sample_format_name(fmt)
+                .map(|name| ("sample_format", serde_json::json!({ "format": name })))
+        };
+        if running.sample_format.is_none() {
+            if let Some(stage) = self.format.and_then(format_stage) {
+                out.push(stage);
+            }
+        }
         if let (Some(want), Some(have)) = (self.channels, running.channels) {
             if want != have {
                 let to = match want {
@@ -2173,8 +2188,8 @@ impl AudioTarget {
         }
         if let (Some(want), Some(have)) = (self.format, running.sample_format) {
             if want != have {
-                if let Some(name) = sample_format_name(want) {
-                    out.push(("sample_format", serde_json::json!({ "format": name })));
+                if let Some(stage) = format_stage(want) {
+                    out.push(stage);
                 }
             }
         }
@@ -2687,6 +2702,19 @@ mod tests {
         assert!(t
             .filters(&audio_cp(44_100, 2, SampleFormat::F32))
             .is_empty());
+    }
+
+    #[test]
+    fn audio_target_converts_an_undeclared_format_first() {
+        let caps = oxideav_core::CodecCapabilities::audio("pcm")
+            .with_sample_rates(vec![48_000])
+            .with_sample_formats(vec![SampleFormat::S16]);
+        let mut running = audio_cp(44_100, 2, SampleFormat::S16);
+        running.sample_format = None;
+        let t = AudioTarget::negotiate(&caps, &running, &serde_json::json!({}));
+        assert_eq!(t.format, Some(SampleFormat::S16));
+        let names: Vec<&str> = t.filters(&running).iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec!["sample_format", "resample"]);
     }
 
     #[test]
