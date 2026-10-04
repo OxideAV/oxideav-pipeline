@@ -1443,6 +1443,12 @@ impl TrackRuntime {
                         d.set_execution_context(ctx);
                         self.decoder = Some(d);
                     }
+                    // A container that declared no pixel layout leaves
+                    // the decoder as the only authority on it.
+                    if running.media_type == MediaType::Video && running.pixel_format.is_none() {
+                        running.pixel_format =
+                            self.decoder.as_ref().and_then(|d| d.output_pixel_format());
+                    }
                 }
                 StageSpec::Filter { name, params } => {
                     let in_port = port_spec_from_params(&running, self.input_time_base);
@@ -1511,6 +1517,30 @@ impl TrackRuntime {
                     // shape (the audio counterpart of the pixel-format
                     // auto-insert). Explicit `sample_rate` / `channels`
                     // params override the negotiated targets.
+                    // Video: convert into the encoder's accepted layouts
+                    // when the source layout only became known here
+                    // (from the decoder) — the spec-level auto-insert
+                    // already handled sources whose container declared
+                    // it, leaving `running` accepted.
+                    if running.media_type == MediaType::Video {
+                        if let (Some(cur), Some(accepted)) = (
+                            running.pixel_format,
+                            codec_accepted_pixel_formats(codecs, codec),
+                        ) {
+                            if !accepted.contains(&cur) {
+                                let target = accepted[0];
+                                self.frame_stages.push(FrameStage::PixConvert {
+                                    src_info: oxideav_pixfmt::FrameInfo::new(
+                                        cur,
+                                        running.width.unwrap_or(0),
+                                        running.height.unwrap_or(0),
+                                    ),
+                                    target,
+                                });
+                                running.pixel_format = Some(target);
+                            }
+                        }
+                    }
                     if running.media_type == MediaType::Audio {
                         if let Some(caps) = codec_encoder_caps(codecs, codec) {
                             let want = AudioTarget::negotiate(&caps, &running, params);
