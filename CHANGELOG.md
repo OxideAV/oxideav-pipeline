@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.13](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.12...v0.1.13) - 2026-10-04
+
+### Other
+
+- probe with the representative encoder's output parameters
+- pick the input streams an output container can hold
+- convert an undeclared audio format for format-constrained encoders
+- take the pixel layout from the decoder when the container has none
+- honour CodecPreferences; build encoders without the demuxer's option bag
+- negotiate the audio shape in front of encoders; drop inherited bit rate
+
 ## [0.1.12](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.11...v0.1.12) - 2026-08-20
 
 ### Other
