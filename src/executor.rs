@@ -120,7 +120,7 @@ fn synth_stream_info(params: &CodecParameters) -> StreamInfo {
 ///
 /// The trait itself does NOT require `Send` — the synchronous
 /// [`Executor::run`] keeps the sink on the caller thread, and some
-/// real-world sinks hold non-`Send` resources (e.g. a libloading
+/// real-world sinks hold non-`Send` resources (e.g. a dlsym-loaded
 /// audio device). Sinks that want to participate in
 /// [`Executor::spawn`] should additionally be `Send`; the spawn path
 /// requires `Box<dyn JobSink + Send>` directly.
