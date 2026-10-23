@@ -28,15 +28,15 @@ pub use executor::{Executor, ExecutorHandle, JobSink, RenderSourceFactory};
 pub use failure::{FailureStage, RunFailure};
 pub use oxideav_core::{FilterFactory, FilterRegistry};
 pub use schema::{
-    parse_pixel_format, ConvertNode, FilterNode, Job, OutputSpec, Render3DNode, SourceRef,
-    StreamSelector, TrackInput, TrackSpec,
+    ConvertNode, FilterNode, Job, OutputSpec, Render3DNode, SourceRef, StreamSelector, TrackInput,
+    TrackSpec, parse_pixel_format,
 };
 pub use selection::{
-    make_decoder, make_decoder_with, make_encoder, make_encoder_with, CodecPreferences,
+    CodecPreferences, make_decoder, make_decoder_with, make_encoder, make_encoder_with,
 };
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
-pub use stream_fit::{select_streams, OutputKind, StreamSelection};
+pub use stream_fit::{OutputKind, StreamSelection, select_streams};
 
 use oxideav_core::{
     CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
@@ -504,7 +504,7 @@ impl Adapt<'_> {
         in_stream: &StreamInfo,
         output_codec: &str,
     ) -> Result<(Vec<executor::FrameStage>, CodecParameters)> {
-        use executor::{port_params_to_codec_params, port_spec_from_params, FrameStage};
+        use executor::{FrameStage, port_params_to_codec_params, port_spec_from_params};
         let mut running = in_stream.params.clone();
         let mut stages = Vec::new();
         match running.media_type {

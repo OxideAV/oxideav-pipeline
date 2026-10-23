@@ -980,8 +980,8 @@ mod device_iteration_tests {
     //! factory's "driver missing" error still surfaces.
     use super::*;
     use oxideav_core::{
-        engine::{EngineProbeFn, HwDeviceInfo},
         CodecCapabilities, CodecId, CodecInfo, CodecRegistry,
+        engine::{EngineProbeFn, HwDeviceInfo},
     };
     use oxideav_core::{Decoder, Result as CoreResult};
 

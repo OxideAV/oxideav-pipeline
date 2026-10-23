@@ -26,9 +26,9 @@ use std::sync::{Arc, Mutex};
 
 use oxideav_core::registry::CodecInfo;
 use oxideav_core::{
-    packet::PacketFlags, AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters,
-    CodecResolver, Decoder, DecoderFactory, Demuxer, Error, Frame, MediaType, OpenDemuxerFn,
-    Packet, ReadSeek, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,
+    AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters, CodecResolver, Decoder,
+    DecoderFactory, Demuxer, Error, Frame, MediaType, OpenDemuxerFn, Packet, ReadSeek, Result,
+    RuntimeContext, SampleFormat, StreamInfo, TimeBase, packet::PacketFlags,
 };
 use oxideav_pipeline::{Executor, Job, JobSink};
 
@@ -170,7 +170,7 @@ impl Decoder for FlakyDecoder {
                 // `pending`, so a *next* `send_packet` will land on a
                 // clean slate — same recovery shape as oxideav-aac's
                 // decoder uses for transient bit-stream glitches.
-                if self.packets_seen % 5 == 0 {
+                if self.packets_seen.is_multiple_of(5) {
                     return Err(Error::invalid("simulated bit-stream glitch"));
                 }
                 let samples = (p.data.len() / 2) as u32;

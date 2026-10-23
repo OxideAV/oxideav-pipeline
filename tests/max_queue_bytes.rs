@@ -131,8 +131,7 @@ fn run_with_budget(max_queue_bytes: u64, caps: Option<ChannelCaps>, name: &str) 
     assert!(saw_start, "sink.start was never called");
     assert!(saw_finish, "sink.finish was never called");
 
-    let n = *payloads.lock().unwrap();
-    n
+    *payloads.lock().unwrap()
 }
 
 #[test]
@@ -179,8 +178,8 @@ fn zero_budget_matches_unconfigured() {
             .with_sink_override("@out", sink)
             .with_threads(2);
         let _ = exec.run().expect("executor run");
-        let n = *payloads.lock().unwrap();
-        n
+
+        *payloads.lock().unwrap()
     };
     assert_eq!(
         count_zero, count_default,

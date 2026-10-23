@@ -2,7 +2,7 @@
 
 use oxideav_core::{Error, MediaType, Result};
 
-use crate::schema::{is_reserved_sink, parse_pixel_format, Job, OutputSpec, TrackInput, TrackSpec};
+use crate::schema::{Job, OutputSpec, TrackInput, TrackSpec, is_reserved_sink, parse_pixel_format};
 
 impl Job {
     /// Walk every track input to confirm:
@@ -55,13 +55,13 @@ impl Job {
         // non-blank id. Catch it here with the track context —
         // otherwise it survives to codec resolution and fails with
         // an opaque "no codec registered for \"\"".
-        if let Some(c) = &track.codec {
-            if c.trim().is_empty() {
-                return Err(Error::invalid(format!(
-                    "job: {ctx_name}: empty `codec` \
+        if let Some(c) = &track.codec
+            && c.trim().is_empty()
+        {
+            return Err(Error::invalid(format!(
+                "job: {ctx_name}: empty `codec` \
                      (omit the key for stream-copy, or name a codec id)"
-                )));
-            }
+            )));
         }
         // A kind-specific bucket combined with a stream_selector naming
         // a DIFFERENT kind is contradictory: the selector kind wins at
@@ -69,16 +69,15 @@ impl Job {
         // match the track label the muxer is told about. Only the
         // `all:` bucket (bucket_kind == None) may carry an arbitrary
         // selector kind.
-        if let (Some(bucket), Some(sel)) = (bucket_kind, &track.stream_selector) {
-            if let Some(sel_kind) = sel.kind {
-                if sel_kind != bucket {
-                    return Err(Error::invalid(format!(
-                        "job: {ctx_name}: stream_selector kind {sel_kind:?} \
+        if let (Some(bucket), Some(sel)) = (bucket_kind, &track.stream_selector)
+            && let Some(sel_kind) = sel.kind
+            && sel_kind != bucket
+        {
+            return Err(Error::invalid(format!(
+                "job: {ctx_name}: stream_selector kind {sel_kind:?} \
                          contradicts the {bucket:?} track list it appears in \
                          (move the track to `all:` or drop the selector kind)"
-                    )));
-                }
-            }
+            )));
         }
         self.check_refs_in_input(ctx_name, &track.input)
     }

@@ -43,10 +43,10 @@ use oxideav_core::{
 };
 
 use crate::executor::{
-    flush_frame_stage_emit, frame_stage_failure_kind, run_frame_stage_emit, ExecutorStats,
-    FrameStage, JobSink, SourcePump, TrackRuntime,
+    ExecutorStats, FrameStage, JobSink, SourcePump, TrackRuntime, flush_frame_stage_emit,
+    frame_stage_failure_kind, run_frame_stage_emit,
 };
-use crate::failure::{attribute, FailureStage, StageFailure, StageResult};
+use crate::failure::{FailureStage, StageFailure, StageResult, attribute};
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
 /// stage when it receives a [`SeekCmd`] from the

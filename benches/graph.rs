@@ -21,7 +21,7 @@
 //!   referenced by one output (alias-inlining + cycle-guard heavy;
 //!   `validate`'s DFS and `to_dag`'s visiting stack both traverse it).
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use oxideav_pipeline::Job;
 
 /// One output, `n` audio tracks, each from its own source URI.

@@ -13,8 +13,8 @@ use indexmap::IndexMap;
 use oxideav_core::{Error, MediaType, PixelFormat, Result};
 
 use crate::schema::{
-    is_playback_sink, is_reserved_sink, parse_pixel_format, Job, OutputSpec, SourceRef,
-    StreamSelector, TrackInput, TrackSpec,
+    Job, OutputSpec, SourceRef, StreamSelector, TrackInput, TrackSpec, is_playback_sink,
+    is_reserved_sink, parse_pixel_format,
 };
 
 /// Opaque index into `Dag::nodes`.

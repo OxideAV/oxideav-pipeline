@@ -249,7 +249,7 @@ fn seek_burst_delivers_one_barrier_per_source_per_generation() {
         6,
         "3 generations x 2 sources, got {barriers:?}"
     );
-    for (gen, target) in generations.iter().zip(targets) {
+    for (r#gen, target) in generations.iter().zip(targets) {
         let matching: Vec<_> = barriers
             .iter()
             .filter(|b| match b {
@@ -258,14 +258,14 @@ fn seek_burst_delivers_one_barrier_per_source_per_generation() {
                     landed_pts,
                     ..
                 } => {
-                    if generation == gen {
+                    if generation == r#gen {
                         assert_eq!(*landed_pts, target, "generation {gen} landed off-target");
                         true
                     } else {
                         false
                     }
                 }
-                BarrierKind::SeekRejected { generation } => generation == gen,
+                BarrierKind::SeekRejected { generation } => generation == r#gen,
             })
             .collect();
         assert_eq!(

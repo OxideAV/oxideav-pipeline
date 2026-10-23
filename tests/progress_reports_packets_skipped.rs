@@ -36,9 +36,9 @@ use std::time::{Duration, Instant};
 
 use oxideav_core::registry::CodecInfo;
 use oxideav_core::{
-    packet::PacketFlags, AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters,
-    CodecResolver, Decoder, DecoderFactory, Demuxer, Error, Frame, MediaType, OpenDemuxerFn,
-    Packet, ReadSeek, Result, RuntimeContext, SampleFormat, StreamInfo, TimeBase,
+    AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters, CodecResolver, Decoder,
+    DecoderFactory, Demuxer, Error, Frame, MediaType, OpenDemuxerFn, Packet, ReadSeek, Result,
+    RuntimeContext, SampleFormat, StreamInfo, TimeBase, packet::PacketFlags,
 };
 use oxideav_pipeline::staged::Progress;
 use oxideav_pipeline::{Executor, Job, JobSink};
@@ -175,7 +175,7 @@ impl Decoder for FlakyDecoder {
     fn receive_frame(&mut self) -> Result<Frame> {
         match self.pending.take() {
             Some(p) => {
-                if self.error_every > 0 && self.packets_seen % self.error_every == 0 {
+                if self.error_every > 0 && self.packets_seen.is_multiple_of(self.error_every) {
                     return Err(Error::invalid("simulated bit-stream glitch"));
                 }
                 let samples = (p.data.len() / 2) as u32;

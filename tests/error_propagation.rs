@@ -48,10 +48,10 @@ impl FrameSource for FlakyFrameSource {
         &self.params
     }
     fn next_frame(&mut self) -> Result<Frame> {
-        if let Some(n) = self.fail_after {
-            if self.emitted >= n {
-                return Err(Error::other(SOURCE_ERR));
-            }
+        if let Some(n) = self.fail_after
+            && self.emitted >= n
+        {
+            return Err(Error::other(SOURCE_ERR));
         }
         let pts = (self.emitted * 16) as i64;
         self.emitted += 1;

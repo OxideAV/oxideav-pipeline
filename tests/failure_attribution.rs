@@ -20,14 +20,14 @@
 
 mod common;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use oxideav_core::{
-    registry::CodecInfo, AudioFrame, CodecCapabilities, CodecId, CodecParameters, Encoder,
-    EncoderFactory, Error, FilterContext, Frame, FrameSource, MediaType, Packet, PortSpec, Result,
-    RuntimeContext, SampleFormat, StreamFilter, StreamInfo,
+    AudioFrame, CodecCapabilities, CodecId, CodecParameters, Encoder, EncoderFactory, Error,
+    FilterContext, Frame, FrameSource, MediaType, Packet, PortSpec, Result, RuntimeContext,
+    SampleFormat, StreamFilter, StreamInfo, registry::CodecInfo,
 };
 use oxideav_pipeline::{Executor, FailureStage, Job, JobSink, RunFailure};
 
@@ -89,10 +89,10 @@ impl Encoder for FailingEncoder {
     }
     fn send_frame(&mut self, frame: &Frame) -> Result<()> {
         self.sent += 1;
-        if let Some(n) = self.fail_send_after {
-            if self.sent > n {
-                return Err(Error::invalid(ENC_SEND_ERR));
-            }
+        if let Some(n) = self.fail_send_after
+            && self.sent > n
+        {
+            return Err(Error::invalid(ENC_SEND_ERR));
         }
         let Frame::Audio(a) = frame else {
             return Err(Error::invalid("attribution encoder: audio only"));
@@ -173,10 +173,10 @@ impl FaultySink {
     }
     fn write(&mut self) -> Result<()> {
         let n = self.written.fetch_add(1, Ordering::SeqCst) as u64 + 1;
-        if let SinkFault::WriteAfter(ok) = self.fault {
-            if n > ok {
-                return Err(Error::other(SINK_WRITE_ERR));
-            }
+        if let SinkFault::WriteAfter(ok) = self.fault
+            && n > ok
+        {
+            return Err(Error::other(SINK_WRITE_ERR));
         }
         Ok(())
     }

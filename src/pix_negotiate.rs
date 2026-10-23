@@ -37,7 +37,7 @@ use oxideav_core::{
 use oxideav_pixfmt::FormatInfo;
 
 use crate::dag::codec_accepted_pixel_formats;
-use crate::selection::{make_encoder_with, CodecPreferences};
+use crate::selection::{CodecPreferences, make_encoder_with};
 
 /// The container a track is muxed into, for acceptance probing.
 #[derive(Clone, Copy)]
@@ -225,7 +225,7 @@ fn ranked_targets(src: PixelFormat) -> Vec<PixelFormat> {
     let mut v: Vec<(u32, u32, usize, PixelFormat)> = ALL
         .iter()
         .enumerate()
-        .filter(|(_, &f)| f != src && oxideav_pixfmt::supports(src, f))
+        .filter(|&(_, &f)| f != src && oxideav_pixfmt::supports(src, f))
         .map(|(i, &f)| (loss(s, shape(f)), f.bits_per_pixel_approx(), i, f))
         .collect();
     v.sort_unstable_by_key(|&(l, bpp, i, _)| (l, bpp, i));

@@ -135,8 +135,7 @@ fn run_with_caps(caps: Option<ChannelCaps>, name: &str) -> u64 {
     assert!(saw_start, "sink.start was never called");
     assert!(saw_finish, "sink.finish was never called");
 
-    let n = *payloads.lock().unwrap();
-    n
+    *payloads.lock().unwrap()
 }
 
 #[test]

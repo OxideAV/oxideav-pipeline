@@ -192,11 +192,11 @@ fn queue_bytes_returns_to_zero_at_eof() {
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut eof_progress: Option<oxideav_pipeline::staged::Progress> = None;
     while Instant::now() < deadline {
-        if let Some(p) = handle.try_progress() {
-            if p.eof {
-                eof_progress = Some(p);
-                break;
-            }
+        if let Some(p) = handle.try_progress()
+            && p.eof
+        {
+            eof_progress = Some(p);
+            break;
         }
         if handle.has_finished() {
             // Drain any trailing emissions and stop polling.

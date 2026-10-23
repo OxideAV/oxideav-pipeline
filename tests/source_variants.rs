@@ -19,12 +19,12 @@ use std::io::Cursor;
 use std::sync::{Arc, Mutex};
 
 use oxideav_core::{
-    packet::PacketFlags, AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters,
-    CodecResolver, ContainerRegistry, Decoder, DecoderFactory, Demuxer, Error, Frame, FrameSource,
-    MediaType, OpenDemuxerFn, Packet, PacketSource, ReadSeek, Result, RuntimeContext, SampleFormat,
-    SourceRegistry, StreamInfo, TimeBase,
+    AudioFrame, BytesSource, CodecCapabilities, CodecId, CodecParameters, CodecResolver,
+    ContainerRegistry, Decoder, DecoderFactory, Demuxer, Error, Frame, FrameSource, MediaType,
+    OpenDemuxerFn, Packet, PacketSource, ReadSeek, Result, RuntimeContext, SampleFormat,
+    SourceRegistry, StreamInfo, TimeBase, packet::PacketFlags,
 };
-use oxideav_core::{registry::CodecInfo, CodecRegistry};
+use oxideav_core::{CodecRegistry, registry::CodecInfo};
 use oxideav_pipeline::{Executor, Job, JobSink};
 
 // ───────────────────────── observer sink ─────────────────────────

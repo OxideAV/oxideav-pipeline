@@ -26,8 +26,8 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::stub::{DIE_ERR, EXT_OUT, MUX_HEADER, MUX_TRAILER};
 use oxideav_core::{Frame, MediaType, Packet, Result, RuntimeContext, StreamInfo};

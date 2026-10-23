@@ -26,14 +26,14 @@ use oxideav_core::{
     PixelFormat, PortParams, PortSpec, Rational, ReadSeek, Result, RuntimeContext, SampleFormat,
     SourceOutput, StreamFilter, StreamInfo, TimeBase,
 };
-use oxideav_pixfmt::{convert as pixfmt_convert, ConvertOptions};
+use oxideav_pixfmt::{ConvertOptions, convert as pixfmt_convert};
 
-use crate::dag::{codec_encoder_caps, Dag, DagNode, MuxTrack, ResolvedSelector};
-use crate::failure::{attribute, FailureStage, RunFailure, StageFailure, StageResult};
-use crate::pix_negotiate::{encoder_input_format, MuxProbe};
-use crate::schema::{is_reserved_sink, Job};
-use crate::selection::{make_decoder_with, make_encoder_with, CodecPreferences};
-use crate::sinks::{open_file_write, FileSink, NullSink};
+use crate::dag::{Dag, DagNode, MuxTrack, ResolvedSelector, codec_encoder_caps};
+use crate::failure::{FailureStage, RunFailure, StageFailure, StageResult, attribute};
+use crate::pix_negotiate::{MuxProbe, encoder_input_format};
+use crate::schema::{Job, is_reserved_sink};
+use crate::selection::{CodecPreferences, make_decoder_with, make_encoder_with};
+use crate::sinks::{FileSink, NullSink, open_file_write};
 use crate::staged;
 
 /// User-installable factory that builds a [`FrameSource`] for a
@@ -598,15 +598,15 @@ impl<'a> Executor<'a> {
     /// [`ExecutionContext::effective_workers`] against the budget
     /// resolved here.
     fn resolve_threads(&self) -> usize {
-        if let Some(n) = self.explicit_threads {
-            if n > 0 {
-                return n;
-            }
+        if let Some(n) = self.explicit_threads
+            && n > 0
+        {
+            return n;
         }
-        if let Some(n) = self.job.threads {
-            if n > 0 {
-                return n;
-            }
+        if let Some(n) = self.job.threads
+            && n > 0
+        {
+            return n;
         }
         ExecutionContext::auto().threads
     }
@@ -1549,47 +1549,47 @@ impl TrackRuntime {
                     // the decoder) — the spec-level auto-insert already
                     // handled sources whose container declared it,
                     // leaving `running` accepted.
-                    if running.media_type == MediaType::Video {
-                        if let Some(cur) = running.pixel_format {
-                            let target = encoder_input_format(
-                                codecs,
-                                codec,
-                                &running,
-                                self.input_time_base,
-                                mux,
-                            )
-                            .unwrap_or(cur);
-                            if target != cur {
-                                self.frame_stages.push(FrameStage::PixConvert {
-                                    src_info: oxideav_pixfmt::FrameInfo::new(
-                                        cur,
-                                        running.width.unwrap_or(0),
-                                        running.height.unwrap_or(0),
-                                    ),
-                                    target,
-                                });
-                                running.pixel_format = Some(target);
-                            }
+                    if running.media_type == MediaType::Video
+                        && let Some(cur) = running.pixel_format
+                    {
+                        let target = encoder_input_format(
+                            codecs,
+                            codec,
+                            &running,
+                            self.input_time_base,
+                            mux,
+                        )
+                        .unwrap_or(cur);
+                        if target != cur {
+                            self.frame_stages.push(FrameStage::PixConvert {
+                                src_info: oxideav_pixfmt::FrameInfo::new(
+                                    cur,
+                                    running.width.unwrap_or(0),
+                                    running.height.unwrap_or(0),
+                                ),
+                                target,
+                            });
+                            running.pixel_format = Some(target);
                         }
                     }
-                    if running.media_type == MediaType::Audio {
-                        if let Some(caps) = codec_encoder_caps(codecs, codec) {
-                            let want = AudioTarget::negotiate(&caps, &running, params);
-                            for (name, fparams) in want.filters(&running) {
-                                let in_port = port_spec_from_params(&running, self.input_time_base);
-                                let filter =
-                                    filters.make(name, &fparams, std::slice::from_ref(&in_port))?;
-                                let out_port =
-                                    filter.output_ports().first().cloned().ok_or_else(|| {
-                                        Error::invalid(format!(
-                                            "filter '{name}' declares zero output ports"
-                                        ))
-                                    })?;
-                                running = port_params_to_codec_params(&out_port.params, &running);
-                                self.extra_output_port_counts.push(0);
-                                self.frame_stages
-                                    .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
-                            }
+                    if running.media_type == MediaType::Audio
+                        && let Some(caps) = codec_encoder_caps(codecs, codec)
+                    {
+                        let want = AudioTarget::negotiate(&caps, &running, params);
+                        for (name, fparams) in want.filters(&running) {
+                            let in_port = port_spec_from_params(&running, self.input_time_base);
+                            let filter =
+                                filters.make(name, &fparams, std::slice::from_ref(&in_port))?;
+                            let out_port =
+                                filter.output_ports().first().cloned().ok_or_else(|| {
+                                    Error::invalid(format!(
+                                        "filter '{name}' declares zero output ports"
+                                    ))
+                                })?;
+                            running = port_params_to_codec_params(&out_port.params, &running);
+                            self.extra_output_port_counts.push(0);
+                            self.frame_stages
+                                .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
                         }
                     }
                     let mut enc_params = running.clone();
@@ -1754,19 +1754,19 @@ impl TrackRuntime {
         // call. Inner-scope borrow on `self.decoder` keeps `pump_frame`'s
         // `&mut self` borrow legal.
         if self.decoder.is_some() {
-            if let Some(dec) = &mut self.decoder {
-                if let Err(e) = dec.send_packet(pkt) {
-                    // Per-packet decoder errors must not abort the stream.
-                    // Same rationale as `staged.rs::run_decode_stage`: a
-                    // single recoverable bit-stream glitch should be
-                    // logged and skipped, not propagated to the executor.
-                    stats.packets_skipped += 1;
-                    eprintln!(
-                        "executor: decoder skipped packet (track {}, pts {:?}): {}",
-                        track_index, pkt.pts, e
-                    );
-                    return Ok(());
-                }
+            if let Some(dec) = &mut self.decoder
+                && let Err(e) = dec.send_packet(pkt)
+            {
+                // Per-packet decoder errors must not abort the stream.
+                // Same rationale as `staged.rs::run_decode_stage`: a
+                // single recoverable bit-stream glitch should be
+                // logged and skipped, not propagated to the executor.
+                stats.packets_skipped += 1;
+                eprintln!(
+                    "executor: decoder skipped packet (track {}, pts {:?}): {}",
+                    track_index, pkt.pts, e
+                );
+                return Ok(());
             }
             let mut produced_any = false;
             loop {
@@ -1864,13 +1864,13 @@ impl TrackRuntime {
         // Same streaming shape as `pump_packet` — decoder may emit any
         // number of frames during flush (MOD plays its outro after EOF).
         if self.decoder.is_some() {
-            if let Some(dec) = &mut self.decoder {
-                if let Err(e) = dec.flush() {
-                    eprintln!(
-                        "executor: decoder flush error (track {}): {}",
-                        track_index, e
-                    );
-                }
+            if let Some(dec) = &mut self.decoder
+                && let Err(e) = dec.flush()
+            {
+                eprintln!(
+                    "executor: decoder flush error (track {}): {}",
+                    track_index, e
+                );
             }
             loop {
                 let frame = match self.decoder.as_mut().unwrap().receive_frame() {
@@ -2205,32 +2205,31 @@ impl AudioTarget {
             sample_format_name(fmt)
                 .map(|name| ("sample_format", serde_json::json!({ "format": name })))
         };
-        if running.sample_format.is_none() {
-            if let Some(stage) = self.format.and_then(format_stage) {
-                out.push(stage);
-            }
+        if running.sample_format.is_none()
+            && let Some(stage) = self.format.and_then(format_stage)
+        {
+            out.push(stage);
         }
-        if let (Some(want), Some(have)) = (self.channels, running.channels) {
-            if want != have {
-                let to = match want {
-                    1 => "mono".to_string(),
-                    2 => "stereo".to_string(),
-                    n => format!("discrete{n}"),
-                };
-                out.push(("downmix", serde_json::json!({ "to": to })));
-            }
+        if let (Some(want), Some(have)) = (self.channels, running.channels)
+            && want != have
+        {
+            let to = match want {
+                1 => "mono".to_string(),
+                2 => "stereo".to_string(),
+                n => format!("discrete{n}"),
+            };
+            out.push(("downmix", serde_json::json!({ "to": to })));
         }
-        if let (Some(want), Some(have)) = (self.sample_rate, running.sample_rate) {
-            if want != have {
-                out.push(("resample", serde_json::json!({ "rate": want })));
-            }
+        if let (Some(want), Some(have)) = (self.sample_rate, running.sample_rate)
+            && want != have
+        {
+            out.push(("resample", serde_json::json!({ "rate": want })));
         }
-        if let (Some(want), Some(have)) = (self.format, running.sample_format) {
-            if want != have {
-                if let Some(stage) = format_stage(want) {
-                    out.push(stage);
-                }
-            }
+        if let (Some(want), Some(have)) = (self.format, running.sample_format)
+            && want != have
+            && let Some(stage) = format_stage(want)
+        {
+            out.push(stage);
         }
         out
     }
@@ -2738,9 +2737,10 @@ mod tests {
             &audio_cp(44_100, 2, SampleFormat::F32),
             &serde_json::json!({}),
         );
-        assert!(t
-            .filters(&audio_cp(44_100, 2, SampleFormat::F32))
-            .is_empty());
+        assert!(
+            t.filters(&audio_cp(44_100, 2, SampleFormat::F32))
+                .is_empty()
+        );
     }
 
     #[test]
