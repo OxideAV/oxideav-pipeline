@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `preferred_encoder_caps` / `preferred_decoder_caps`: the capabilities
+  of the implementation `make_encoder_with` / `make_decoder_with` would
+  build under a `CodecPreferences`, ranked the same way.
+- First-picture pre-roll for re-encoded video streams whose pixel layout
+  neither the container nor the decoder states up front (WebM, AVI,
+  MPEG-TS, MOV): the decoder is fed until its first picture, the layout
+  is taken from the decoder or read off the picture's plane geometry,
+  and the packets read are replayed, so every packet still reaches the
+  decoder and the muxer exactly once. Applies to the serial and pipelined
+  executors and to `transcode_simple*`.
+
+### Fixed
+
+- Audio resample / downmix / sample-format planning and pixel-format
+  negotiation read the capabilities of the first *registered* encoder
+  and ignored `CodecPreferences`. On macOS that is `opus_audiotoolbox`,
+  which declares no `accepted_sample_rates`, so no resample stage was
+  planned and `convert tone44100.wav x.opus` failed with "unsupported
+  input sample rate 44100 Hz". They now use the encoder that is actually
+  built.
+- Video transcodes from a container with no declared pixel layout into
+  an encoder that requires one failed before the first packet
+  (`rawvideo encoder: pixel_format is required` for webm / avi / ts /
+  mov → y4m).
+- Decoder selection, including the hardware → software
+  `FallbackDecoder` candidate list, goes through the same preference
+  ranking as encoder selection (one shared ranking helper).
+
 ### Changed
 
 - edition 2024, MSRV 1.95

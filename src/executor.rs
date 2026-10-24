@@ -31,6 +31,7 @@ use oxideav_pixfmt::{ConvertOptions, convert as pixfmt_convert};
 use crate::dag::{Dag, DagNode, MuxTrack, ResolvedSelector, codec_encoder_caps};
 use crate::failure::{FailureStage, RunFailure, StageFailure, StageResult, attribute};
 use crate::pix_negotiate::{MuxProbe, encoder_input_format};
+use crate::preroll::prime_unlabelled_video;
 use crate::schema::{Job, is_reserved_sink};
 use crate::selection::{CodecPreferences, make_decoder_with, make_encoder_with};
 use crate::sinks::{FileSink, NullSink, open_file_write};
@@ -689,14 +690,25 @@ impl<'a> Executor<'a> {
             containers: &self.ctx.containers,
             container: c,
         });
+        // The serial path tells codecs to stay single-threaded; the
+        // pipelined path passes its own thread budget below.
+        let ctx = ExecutionContext::serial();
+        // A re-encoded video stream whose container declared no pixel
+        // layout is pre-rolled to its first picture first, so the
+        // passes below plan from a known layout.
+        prime_unlabelled_video(
+            &mut pipelines,
+            &mut sources_by_uri,
+            &self.ctx.codecs,
+            &self.prefs,
+            &ctx,
+        )
+        .map_err(&prep)?;
         for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux);
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux, &self.prefs);
         }
 
-        // Instantiate decoders / filters / encoders for each track. The
-        // serial path tells codecs to stay single-threaded; the pipelined
-        // path passes its own thread budget below.
-        let ctx = ExecutionContext::serial();
+        // Instantiate decoders / filters / encoders for each track.
         for pl in &mut pipelines {
             pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters, mux)
                 .map_err(&prep)?;
@@ -1192,10 +1204,17 @@ impl<'a> Executor<'a> {
             containers: &self.ctx.containers,
             container: c,
         });
-        for pl in &mut pipelines {
-            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux);
-        }
         let ctx = ExecutionContext::with_threads(threads);
+        prime_unlabelled_video(
+            &mut pipelines,
+            &mut sources_by_uri,
+            &self.ctx.codecs,
+            &self.prefs,
+            &ctx,
+        )?;
+        for pl in &mut pipelines {
+            pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux, &self.prefs);
+        }
         for pl in &mut pipelines {
             pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters, mux)?;
         }
@@ -1558,6 +1577,7 @@ impl TrackRuntime {
                             &running,
                             self.input_time_base,
                             mux,
+                            prefs,
                         )
                         .unwrap_or(cur);
                         if target != cur {
@@ -1573,7 +1593,7 @@ impl TrackRuntime {
                         }
                     }
                     if running.media_type == MediaType::Audio
-                        && let Some(caps) = codec_encoder_caps(codecs, codec)
+                        && let Some(caps) = codec_encoder_caps(codecs, codec, &running, prefs)
                     {
                         let want = AudioTarget::negotiate(&caps, &running, params);
                         for (name, fparams) in want.filters(&running) {
@@ -1665,6 +1685,7 @@ impl TrackRuntime {
         &mut self,
         codecs: &CodecRegistry,
         mux: Option<MuxProbe<'_>>,
+        prefs: &CodecPreferences,
     ) {
         let src_fmt = match self.input_params.pixel_format {
             Some(f) => f,
@@ -1689,9 +1710,15 @@ impl TrackRuntime {
                     if let Some(cur_fmt) = running {
                         let mut shape = self.input_params.clone();
                         shape.pixel_format = Some(cur_fmt);
-                        let target =
-                            encoder_input_format(codecs, codec, &shape, self.input_time_base, mux)
-                                .unwrap_or(cur_fmt);
+                        let target = encoder_input_format(
+                            codecs,
+                            codec,
+                            &shape,
+                            self.input_time_base,
+                            mux,
+                            prefs,
+                        )
+                        .unwrap_or(cur_fmt);
                         if target != cur_fmt {
                             rewritten.push(StageSpec::Convert { target });
                             running = Some(target);

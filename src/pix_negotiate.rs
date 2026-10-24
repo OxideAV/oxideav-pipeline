@@ -271,9 +271,9 @@ fn muxer_takes(
         .is_ok()
 }
 
-/// The layout the `codec` encoder should be fed for a video stream
-/// currently shaped like `running` (whose `pixel_format` is known),
-/// muxed into `mux` when given. Returns `running.pixel_format` itself
+/// The layout the `codec` encoder (the one `prefs` selects) should be
+/// fed for a video stream currently shaped like `running` (whose
+/// `pixel_format` is known), muxed into `mux` when given. Returns `running.pixel_format` itself
 /// when no conversion is needed, `None` when the running layout is
 /// unknown. See the module docs for the candidate order.
 pub(crate) fn encoder_input_format(
@@ -282,9 +282,10 @@ pub(crate) fn encoder_input_format(
     running: &CodecParameters,
     time_base: TimeBase,
     mux: Option<MuxProbe<'_>>,
+    prefs: &CodecPreferences,
 ) -> Option<PixelFormat> {
     let src = running.pixel_format?;
-    let accepted = codec_accepted_pixel_formats(codecs, codec).unwrap_or_default();
+    let accepted = codec_accepted_pixel_formats(codecs, codec, running, prefs).unwrap_or_default();
     let enc_ok = |f: PixelFormat| accepted.is_empty() || accepted.contains(&f);
     let mux_ok = |f: PixelFormat| match mux {
         None => true,
@@ -401,13 +402,34 @@ mod tests {
         });
         let tb = TimeBase::new(1, 25);
         // RGB → full-chroma YUV, the least lossy layout the muxer takes.
-        let got = encoder_input_format(&codecs, "raw", &running(PixelFormat::Gbrp8), tb, mux);
+        let got = encoder_input_format(
+            &codecs,
+            "raw",
+            &running(PixelFormat::Gbrp8),
+            tb,
+            mux,
+            &CodecPreferences::default(),
+        );
         assert_eq!(got, Some(PixelFormat::Yuv444P));
         // A layout the muxer takes is kept.
-        let got = encoder_input_format(&codecs, "raw", &running(PixelFormat::Yuv420P), tb, mux);
+        let got = encoder_input_format(
+            &codecs,
+            "raw",
+            &running(PixelFormat::Yuv420P),
+            tb,
+            mux,
+            &CodecPreferences::default(),
+        );
         assert_eq!(got, Some(PixelFormat::Yuv420P));
         // Without a muxer to satisfy nothing changes.
-        let got = encoder_input_format(&codecs, "raw", &running(PixelFormat::Gbrp8), tb, None);
+        let got = encoder_input_format(
+            &codecs,
+            "raw",
+            &running(PixelFormat::Gbrp8),
+            tb,
+            None,
+            &CodecPreferences::default(),
+        );
         assert_eq!(got, Some(PixelFormat::Gbrp8));
     }
 
@@ -425,10 +447,24 @@ mod tests {
         let tb = TimeBase::new(1, 25);
         // Rgb24 is the encoder's first choice but the muxer refuses it;
         // Yuv420P is the next accepted layout.
-        let got = encoder_input_format(&codecs, "raw", &running(PixelFormat::Gbrp8), tb, mux);
+        let got = encoder_input_format(
+            &codecs,
+            "raw",
+            &running(PixelFormat::Gbrp8),
+            tb,
+            mux,
+            &CodecPreferences::default(),
+        );
         assert_eq!(got, Some(PixelFormat::Yuv420P));
         // Encoder-only negotiation: its first accepted layout.
-        let got = encoder_input_format(&codecs, "raw", &running(PixelFormat::Gbrp8), tb, None);
+        let got = encoder_input_format(
+            &codecs,
+            "raw",
+            &running(PixelFormat::Gbrp8),
+            tb,
+            None,
+            &CodecPreferences::default(),
+        );
         assert_eq!(got, Some(PixelFormat::Rgb24));
     }
 

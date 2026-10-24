@@ -16,6 +16,7 @@ pub mod dag;
 pub mod executor;
 pub mod failure;
 mod pix_negotiate;
+mod preroll;
 pub mod schema;
 pub mod selection;
 pub mod sinks;
@@ -33,6 +34,7 @@ pub use schema::{
 };
 pub use selection::{
     CodecPreferences, make_decoder, make_decoder_with, make_encoder, make_encoder_with,
+    preferred_decoder_caps, preferred_encoder_caps,
 };
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
@@ -503,6 +505,7 @@ impl Adapt<'_> {
         decoder: &dyn Decoder,
         in_stream: &StreamInfo,
         output_codec: &str,
+        prefs: &CodecPreferences,
     ) -> Result<(Vec<executor::FrameStage>, CodecParameters)> {
         use executor::{FrameStage, port_params_to_codec_params, port_spec_from_params};
         let mut running = in_stream.params.clone();
@@ -521,6 +524,7 @@ impl Adapt<'_> {
                         &running,
                         in_stream.time_base,
                         self.mux,
+                        prefs,
                     )
                     .unwrap_or(cur);
                     if target != cur {
@@ -537,7 +541,7 @@ impl Adapt<'_> {
                 }
             }
             MediaType::Audio => {
-                let caps = dag::codec_encoder_caps(self.codecs, output_codec);
+                let caps = dag::codec_encoder_caps(self.codecs, output_codec, &running, prefs);
                 if let (Some(filters), Some(caps)) = (self.filters, caps) {
                     let want =
                         executor::AudioTarget::negotiate(&caps, &running, &serde_json::Value::Null);
@@ -573,6 +577,10 @@ fn transcode_routes(
     if in_streams.is_empty() {
         return Err(Error::invalid("no streams in input"));
     }
+    // Packets read while pre-rolling a video decoder to its first
+    // picture (see `preroll`); the pump below replays them first.
+    let mut held: Vec<Packet> = Vec::new();
+    let mut eof_during_preroll = false;
 
     // Build per-stream routes. `route_by_in_idx` maps the input stream
     // index → route slot index (or `None` for Drop). The routes list
@@ -595,8 +603,26 @@ fn transcode_routes(
                 routes.push(TranscodeRoute::Copy { out_index });
             }
             StreamPlan::Reencode { output_codec } => {
-                let decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
-                let (stages, shaped) = adapt.stages(&*decoder, in_stream, &output_codec)?;
+                let mut decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
+                // A video stream whose layout neither the container
+                // nor the decoder states yet: pre-roll to the first
+                // picture so the stages and the encoder are planned
+                // from a known one.
+                if in_stream.params.media_type == MediaType::Video
+                    && in_stream.params.pixel_format.is_none()
+                    && decoder.output_pixel_format().is_none()
+                {
+                    let primed = preroll::prime_video_decoder(
+                        decoder,
+                        &in_stream.params,
+                        in_stream.index,
+                        &mut || demuxer.next_packet(),
+                        &mut held,
+                    )?;
+                    eof_during_preroll |= primed.eof;
+                    decoder = primed.decoder;
+                }
+                let (stages, shaped) = adapt.stages(&*decoder, in_stream, &output_codec, prefs)?;
                 let enc_params = build_encoder_params(
                     &output_codec,
                     &StreamInfo {
@@ -643,10 +669,17 @@ fn transcode_routes(
 
     let mut stats = TranscodeStats::default();
 
-    // Pump packets from the demuxer in source order, dispatching by
-    // input stream index. EOF triggers a flush of every reencode route.
+    // Pump packets from the demuxer in source order — the ones a
+    // pre-roll already read first — dispatching by input stream index.
+    // EOF triggers a flush of every reencode route.
+    let mut held: std::collections::VecDeque<Packet> = held.into();
     loop {
-        match demuxer.next_packet() {
+        let next = match held.pop_front() {
+            Some(pkt) => Ok(pkt),
+            None if eof_during_preroll => Err(Error::Eof),
+            None => demuxer.next_packet(),
+        };
+        match next {
             Ok(pkt) => {
                 stats.packets_in += 1;
                 let Some(&slot) = route_by_in_idx.get(&pkt.stream_index) else {

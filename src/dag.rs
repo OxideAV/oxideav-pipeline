@@ -10,7 +10,9 @@
 //! single demuxer with per-consumer replay buffering.
 
 use indexmap::IndexMap;
-use oxideav_core::{Error, MediaType, PixelFormat, Result};
+use oxideav_core::{CodecParameters, Error, MediaType, PixelFormat, Result};
+
+use crate::selection::{CodecPreferences, preferred_encoder_caps};
 
 use crate::schema::{
     Job, OutputSpec, SourceRef, StreamSelector, TrackInput, TrackSpec, is_playback_sink,
@@ -421,44 +423,61 @@ impl Job {
     }
 }
 
-/// Look up the first encoder implementation registered for `codec` that
-/// declares a non-empty `accepted_pixel_formats`, returning that list.
-/// Used by the executor's auto-insert pass.
+/// The parameters an encoder for `codec` is built with when it is fed
+/// a stream currently shaped like `running`: the same shape under the
+/// new codec id, without the source's bit rate, configuration record
+/// and container option bag when the codec changes (a PCM stream's
+/// 1411 kb/s and an MP4 `elst_*` bag mean nothing to an Opus
+/// encoder). The executor builds its encoder from exactly this; the
+/// capability lookups below rank implementations against it so they
+/// describe the encoder that gets built.
+pub(crate) fn encode_shape(running: &CodecParameters, codec: &str) -> CodecParameters {
+    let mut p = running.clone();
+    if p.codec_id.as_str() != codec {
+        p.bit_rate = None;
+        p.extradata = Vec::new();
+    }
+    p.options = Default::default();
+    p.codec_id = oxideav_core::CodecId::new(codec);
+    p
+}
+
+/// The pixel layouts the encoder [`codec_encoder_caps`] describes
+/// accepts, when it declares any. Used by the executor's auto-insert
+/// pass and the pixel-format negotiation.
 ///
 /// Returns `None` when either:
-/// - no encoder is registered for this codec id (resolution will fail
-///   later with a clearer error), or
-/// - every registered encoder declares an empty accepted set
-///   (treat as "any format OK").
+/// - no encoder is registered for this codec id under `prefs`
+///   (resolution will fail later with a clearer error), or
+/// - the encoder declares an empty accepted set (treat as "any format
+///   OK").
 pub(crate) fn codec_accepted_pixel_formats(
     codecs: &oxideav_core::CodecRegistry,
     codec: &str,
+    running: &CodecParameters,
+    prefs: &CodecPreferences,
 ) -> Option<Vec<PixelFormat>> {
-    let id = oxideav_core::CodecId::new(codec);
-    for imp in codecs.implementations(&id) {
-        if imp.make_encoder.is_none() {
-            continue;
-        }
-        if !imp.caps.accepted_pixel_formats.is_empty() {
-            return Some(imp.caps.accepted_pixel_formats.clone());
-        }
-    }
-    None
+    let caps = codec_encoder_caps(codecs, codec, running, prefs)?;
+    (!caps.accepted_pixel_formats.is_empty()).then_some(caps.accepted_pixel_formats)
 }
 
-/// Capabilities of the implementation the registry would pick to
-/// *encode* `codec` (the first encode-capable implementation in
-/// preference order). `None` when nothing registered can encode it.
+/// Capabilities of the implementation [`make_encoder_with`] picks to
+/// encode `codec` from a stream shaped like `running` under `prefs` —
+/// the same ranking the executor builds the encoder with, so on a host
+/// whose registry lists a hardware bridge first (`opus_audiotoolbox`
+/// declares no `accepted_sample_rates`) software-first preferences
+/// still read the software encoder's rate list, and the resample stage
+/// it needs is planned. `None` when nothing registered under `prefs`
+/// can encode it.
+///
+/// [`make_encoder_with`]: crate::make_encoder_with
 pub(crate) fn codec_encoder_caps(
     codecs: &oxideav_core::CodecRegistry,
     codec: &str,
+    running: &CodecParameters,
+    prefs: &CodecPreferences,
 ) -> Option<oxideav_core::CodecCapabilities> {
-    let id = oxideav_core::CodecId::new(codec);
-    codecs
-        .implementations(&id)
-        .iter()
-        .find(|imp| imp.make_encoder.is_some())
-        .map(|imp| imp.caps.clone())
+    preferred_encoder_caps(codecs, &encode_shape(running, codec), prefs)
 }
 
 /// Pick the single best track from an alias that matches the caller's

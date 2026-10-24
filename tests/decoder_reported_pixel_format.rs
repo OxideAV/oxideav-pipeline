@@ -2,7 +2,9 @@
 //! only authority on it: [`Decoder::output_pixel_format`] feeds the
 //! executor's conversion into the encoder's accepted layouts (without
 //! it, a 4:4:4 source muxed without a declared format reached a 4:2:0
-//! encoder unconverted).
+//! encoder unconverted). A decoder that states nothing is pre-rolled
+//! to its first picture, whose geometry fixes the layout — the encoder
+//! here refuses to be built without one, the way `rawvideo` does.
 
 use std::sync::{Arc, Mutex};
 
@@ -131,6 +133,9 @@ struct PlaneCountingEncoder {
 static SEEN: Mutex<Option<Arc<Mutex<Vec<usize>>>>> = Mutex::new(None);
 
 fn make_encoder(p: &CodecParameters) -> Result<Box<dyn Encoder>> {
+    if p.pixel_format.is_none() {
+        return Err(Error::invalid("drpf encoder: pixel_format is required"));
+    }
     let seen = SEEN.lock().unwrap().clone().expect("test installs SEEN");
     Ok(Box::new(PlaneCountingEncoder {
         params: p.clone(),
@@ -208,8 +213,11 @@ fn decoder_reported_layout_is_converted_for_the_encoder() {
         // three planes.
         let planes = run(make_reporting as DecoderFactory, threads);
         assert_eq!(planes, vec![3; PACKETS as usize], "threads={threads}");
-        // Unknown layout: nothing to convert from, frames pass as-is.
+        // Unknown layout: the first picture is decoded up front, its
+        // single 2×2 byte plane reads as Gray8, and the encoder (which
+        // needs a layout to be built at all) is fed converted pictures
+        // — every one exactly once, in order.
         let planes = run(make_silent as DecoderFactory, threads);
-        assert_eq!(planes, vec![1; PACKETS as usize], "threads={threads}");
+        assert_eq!(planes, vec![3; PACKETS as usize], "threads={threads}");
     }
 }

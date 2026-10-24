@@ -68,6 +68,96 @@ impl CodecPreferences {
     }
 }
 
+/// Which factory of a [`CodecImplementation`] a lookup is about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Side {
+    Decode,
+    Encode,
+}
+
+/// The implementations registered for `params.codec_id` that
+/// [`make_decoder_with`] / [`make_encoder_with`] (per `side`) would
+/// try, in the order they would try them: the ones with the matching
+/// factory that `prefs` does not exclude — and, with `fit`, whose
+/// restrictions (`caps.fits_params`) take `params` — sorted by
+/// [`CodecPreferences::effective_priority`] (registration order breaks
+/// ties). The registry itself keeps registration order, which on a
+/// host with hardware bridges puts e.g. `opus_audiotoolbox` ahead of
+/// the pure-Rust `opus`; every capability lookup in this crate goes
+/// through this ranking so it describes the implementation that is
+/// actually instantiated.
+fn ranked_implementations<'r>(
+    reg: &'r CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+    side: Side,
+    fit: bool,
+) -> Vec<&'r CodecImplementation> {
+    let mut ranked: Vec<&CodecImplementation> = reg
+        .implementations(&params.codec_id)
+        .iter()
+        .filter(|i| match side {
+            Side::Decode => i.make_decoder.is_some(),
+            Side::Encode => i.make_encoder.is_some(),
+        })
+        .filter(|i| !prefs.excludes(&i.caps))
+        .filter(|i| !fit || i.caps.fits_params(params, side == Side::Encode))
+        .collect();
+    ranked.sort_by_key(|i| prefs.effective_priority(&i.caps));
+    ranked
+}
+
+/// The implementation `make_*_with` would try first for `params`
+/// under `prefs`. When no candidate's restrictions take `params` as
+/// they stand, the best-ranked candidate regardless of fit — a
+/// pipeline reads capabilities *before* it negotiates the stream shape
+/// (resample, downmix, pixel conversion), and the negotiation is what
+/// makes the parameters fit.
+fn preferred_implementation<'r>(
+    reg: &'r CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+    side: Side,
+) -> Option<&'r CodecImplementation> {
+    ranked_implementations(reg, params, prefs, side, true)
+        .into_iter()
+        .next()
+        .or_else(|| {
+            ranked_implementations(reg, params, prefs, side, false)
+                .into_iter()
+                .next()
+        })
+}
+
+/// Capabilities of the encoder [`make_encoder_with`] would build for
+/// `params` under `prefs` — the same ranking, so a pipeline planning
+/// its resample / downmix / pixel-conversion stages from
+/// `accepted_sample_rates` / `accepted_sample_formats` /
+/// `accepted_pixel_formats` reads the implementation that is going to
+/// be fed, not the first one registered. `None` when nothing
+/// registered under `prefs` encodes `params.codec_id`.
+///
+/// When no candidate's `max_*` restrictions take `params` as they
+/// stand, the best-ranked candidate's capabilities are returned
+/// anyway: the caller is about to reshape the stream.
+pub fn preferred_encoder_caps(
+    reg: &CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+) -> Option<CodecCapabilities> {
+    preferred_implementation(reg, params, prefs, Side::Encode).map(|i| i.caps.clone())
+}
+
+/// Capabilities of the decoder [`make_decoder_with`] would build for
+/// `params` under `prefs`. See [`preferred_encoder_caps`].
+pub fn preferred_decoder_caps(
+    reg: &CodecRegistry,
+    params: &CodecParameters,
+    prefs: &CodecPreferences,
+) -> Option<CodecCapabilities> {
+    preferred_implementation(reg, params, prefs, Side::Decode).map(|i| i.caps.clone())
+}
+
 /// Free-function shorthand: `make_decoder(reg, params)` with default
 /// preferences. Equivalent to
 /// `make_decoder_with(reg, params, &CodecPreferences::default())`.
@@ -85,16 +175,10 @@ pub fn make_decoder_with(
     params: &CodecParameters,
     prefs: &CodecPreferences,
 ) -> Result<Box<dyn Decoder>> {
-    let candidates = reg.implementations(&params.codec_id);
-    if candidates.is_empty() {
+    if reg.implementations(&params.codec_id).is_empty() {
         return Err(Error::CodecNotFound(params.codec_id.to_string()));
     }
-    let mut ranked: Vec<&CodecImplementation> = candidates
-        .iter()
-        .filter(|i| i.make_decoder.is_some() && !prefs.excludes(&i.caps))
-        .filter(|i| i.caps.fits_params(params, false))
-        .collect();
-    ranked.sort_by_key(|i| prefs.effective_priority(&i.caps));
+    let ranked = ranked_implementations(reg, params, prefs, Side::Decode, true);
     let mut last_err: Option<Error> = None;
     for (n, imp) in ranked.iter().enumerate() {
         match (imp.make_decoder.unwrap())(params) {
@@ -304,16 +388,10 @@ pub fn make_encoder_with(
     params: &CodecParameters,
     prefs: &CodecPreferences,
 ) -> Result<Box<dyn Encoder>> {
-    let candidates = reg.implementations(&params.codec_id);
-    if candidates.is_empty() {
+    if reg.implementations(&params.codec_id).is_empty() {
         return Err(Error::CodecNotFound(params.codec_id.to_string()));
     }
-    let mut ranked: Vec<&CodecImplementation> = candidates
-        .iter()
-        .filter(|i| i.make_encoder.is_some() && !prefs.excludes(&i.caps))
-        .filter(|i| i.caps.fits_params(params, true))
-        .collect();
-    ranked.sort_by_key(|i| prefs.effective_priority(&i.caps));
+    let ranked = ranked_implementations(reg, params, prefs, Side::Encode, true);
     let mut last_err: Option<Error> = None;
     for imp in ranked {
         match (imp.make_encoder.unwrap())(params) {
@@ -466,5 +544,185 @@ mod tests {
         };
         assert!(prefs.excludes(&caps("aac_audiotoolbox", true)));
         assert!(prefs.excludes(&caps("aac_sw", false)));
+    }
+
+    /// An encoder that accepts nothing (never fed in these tests).
+    struct Nop(CodecParameters);
+    impl Encoder for Nop {
+        fn codec_id(&self) -> &CodecId {
+            &self.0.codec_id
+        }
+        fn output_params(&self) -> &CodecParameters {
+            &self.0
+        }
+        fn send_frame(&mut self, _: &Frame) -> Result<()> {
+            Err(Error::unsupported("nop"))
+        }
+        fn receive_packet(&mut self) -> Result<Packet> {
+            Err(Error::NeedMore)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Two encoders for `x`, registered hardware-first the way a host
+    /// with a system bridge registers them: the bridge declares no
+    /// input restrictions, the software one takes 48 kHz only.
+    fn encoder_registry() -> CodecRegistry {
+        let id = CodecId::new("x");
+        let mut reg = CodecRegistry::new();
+        reg.register(
+            CodecInfo::new(id.clone())
+                .capabilities(
+                    CodecCapabilities::audio("x_hw")
+                        .with_hardware(true)
+                        .with_priority(10),
+                )
+                .encoder(|p| Ok(Box::new(Nop(p.clone())))),
+        );
+        reg.register(
+            CodecInfo::new(id)
+                .capabilities(
+                    CodecCapabilities::audio("x_sw")
+                        .with_priority(100)
+                        .with_sample_rates(vec![48_000]),
+                )
+                .encoder(|p| Ok(Box::new(Nop(p.clone())))),
+        );
+        reg
+    }
+
+    fn at_44100() -> CodecParameters {
+        let mut p = CodecParameters::audio(CodecId::new("x"));
+        p.sample_rate = Some(44_100);
+        p.channels = Some(2);
+        p
+    }
+
+    #[test]
+    fn encoder_caps_follow_the_preference_order_not_registration_order() {
+        let reg = encoder_registry();
+        let params = at_44100();
+        // Registered priorities: the bridge wins.
+        let caps = preferred_encoder_caps(&reg, &params, &CodecPreferences::default()).unwrap();
+        assert_eq!(caps.implementation, "x_hw");
+        assert!(caps.accepted_sample_rates.is_empty());
+        // Software-first (what a CLI's default preferences express):
+        // the caps are the software encoder's, whose rate list is what
+        // plans the resample stage in front of it.
+        let software_first = CodecPreferences {
+            prefer: vec!["x_sw".into()],
+            boost: 1_000_000,
+            ..Default::default()
+        };
+        let caps = preferred_encoder_caps(&reg, &params, &software_first).unwrap();
+        assert_eq!(caps.implementation, "x_sw");
+        assert_eq!(caps.accepted_sample_rates, vec![48_000]);
+        // `no_hardware` excludes the bridge outright.
+        let no_hw = CodecPreferences {
+            no_hardware: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            preferred_encoder_caps(&reg, &params, &no_hw)
+                .unwrap()
+                .implementation,
+            "x_sw"
+        );
+        // `exclude` by name.
+        let excluded = CodecPreferences {
+            exclude: vec!["x_hw".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            preferred_encoder_caps(&reg, &params, &excluded)
+                .unwrap()
+                .implementation,
+            "x_sw"
+        );
+        // Everything excluded: no answer, same as `make_encoder_with`.
+        let nothing = CodecPreferences {
+            no_hardware: true,
+            require_hardware: true,
+            ..Default::default()
+        };
+        assert!(preferred_encoder_caps(&reg, &params, &nothing).is_none());
+        assert!(
+            preferred_encoder_caps(&reg, &CodecParameters::audio(CodecId::new("y")), &nothing)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn encoder_caps_and_the_built_encoder_name_the_same_implementation() {
+        let reg = encoder_registry();
+        let params = at_44100();
+        for prefs in [
+            CodecPreferences::default(),
+            CodecPreferences {
+                prefer: vec!["x_sw".into()],
+                boost: 1_000_000,
+                ..Default::default()
+            },
+            CodecPreferences {
+                no_hardware: true,
+                ..Default::default()
+            },
+        ] {
+            let caps = preferred_encoder_caps(&reg, &params, &prefs).unwrap();
+            let built = make_encoder_with(&reg, &params, &prefs).unwrap();
+            // `Nop` publishes its input parameters; the implementation
+            // that was built is the first one the ranking names.
+            assert_eq!(built.codec_id(), &params.codec_id);
+            let first = ranked_implementations(&reg, &params, &prefs, Side::Encode, true)[0];
+            assert_eq!(first.caps.implementation, caps.implementation);
+        }
+    }
+
+    #[test]
+    fn unfitting_parameters_fall_back_to_the_best_ranked_candidate() {
+        let id = CodecId::new("x");
+        let mut reg = CodecRegistry::new();
+        reg.register(
+            CodecInfo::new(id)
+                .capabilities(
+                    CodecCapabilities::audio("x_narrow")
+                        .with_priority(100)
+                        .with_max_channels(2)
+                        .with_sample_rates(vec![48_000]),
+                )
+                .encoder(|p| Ok(Box::new(Nop(p.clone())))),
+        );
+        let mut params = at_44100();
+        params.channels = Some(6);
+        // Nothing fits a 5.1 source, yet the caps name the encoder the
+        // downmix is planned for.
+        let caps = preferred_encoder_caps(&reg, &params, &CodecPreferences::default()).unwrap();
+        assert_eq!(caps.implementation, "x_narrow");
+        assert_eq!(caps.max_channels, Some(2));
+    }
+
+    #[test]
+    fn decoder_caps_follow_the_preference_order() {
+        let reg = registry();
+        let params = CodecParameters::audio(CodecId::new("x"));
+        assert_eq!(
+            preferred_decoder_caps(&reg, &params, &CodecPreferences::default())
+                .unwrap()
+                .implementation,
+            "x_hw"
+        );
+        let software_first = CodecPreferences {
+            prefer: vec!["x_sw".into()],
+            boost: 1_000_000,
+            ..Default::default()
+        };
+        assert_eq!(
+            preferred_decoder_caps(&reg, &params, &software_first)
+                .unwrap()
+                .implementation,
+            "x_sw"
+        );
     }
 }
