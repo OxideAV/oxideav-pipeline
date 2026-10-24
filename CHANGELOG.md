@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.14](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.13...v0.1.14) - 2026-10-24
+
+### Other
+
+- plan from the encoder that gets built; pre-roll unlabelled video to its first picture
+- hardware-engine crates load OS APIs through dlsym, not libloading
+- edition 2024, MSRV 1.95
+
 ### Added
 
 - `preferred_encoder_caps` / `preferred_decoder_caps`: the capabilities
