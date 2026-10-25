@@ -29,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream the decoders are benched on that stream — `oxideav bench h264`
   no longer reports "can't synth decode stream" at 1080p. The decode
   prep no longer keeps a second copy of the synthesised frames.
+- `bench`: the decode-side prep encode stops taking frames once the
+  bench window (`bench_duration_secs`) has elapsed, so a slow encoder
+  (pure-Rust H.264 at 1080p, ~0.2 fps) no longer spends ~40 minutes on
+  the 500-frame prep set before any decoder is timed; `oxideav bench
+  h264` at defaults now finishes in about half a minute.
 
 - `preferred_encoder_caps` / `preferred_decoder_caps`: the capabilities
   of the implementation `make_encoder_with` / `make_decoder_with` would

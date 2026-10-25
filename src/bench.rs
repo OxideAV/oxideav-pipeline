@@ -14,7 +14,10 @@
 //!   frames/second.
 //! - **Decode side**: encode the signal once through the *first*
 //!   available encoder (so every decoder sees the same bitstream),
-//!   then feed those packets through each decoder-side impl. If no
+//!   then feed those packets through each decoder-side impl. A slow
+//!   video encoder stops taking prep frames once the bench window
+//!   (`bench_duration_secs`) has elapsed; the stream is flushed and
+//!   cycled from its first packet. If no
 //!   encoder is registered the decode bench is skipped with an
 //!   "encode-only path unavailable" note.
 //! - HW init failures (`VTCompressionSessionCreate` returning a
@@ -401,7 +404,13 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
     // event that mentions a packet count. Cache the result; if the
     // user only asked for `Side::Encode` we never call this.
     if opts.side != Side::Encode {
-        match self_encode_video(impls, &params, &video_frames_owned, budget) {
+        match self_encode_video(
+            impls,
+            &params,
+            &video_frames_owned,
+            budget,
+            opts.bench_duration_secs,
+        ) {
             Ok((s, encoder_name)) => {
                 on_event(BenchEvent::PrepDone {
                     codec_id: id.as_str(),
@@ -611,6 +620,7 @@ fn self_encode_video(
     params: &CodecParameters,
     frames: &[Frame],
     budget: &ExecutionContext,
+    max_secs: f64,
 ) -> Result<(Vec<Packet>, String), oxideav_core::Error> {
     let imp = impls
         .iter()
@@ -625,7 +635,16 @@ fn self_encode_video(
     let mut enc = (imp.make_encoder.unwrap())(params)?;
     enc.set_execution_context(budget);
     let mut packets = Vec::new();
+    // A slow encoder (pure-Rust H.264 at 1080p codes a few pictures a
+    // second) would spend minutes on the full prep set: stop feeding
+    // once the bench window has elapsed. The decode loop cycles the
+    // stream from its first (key) packet, so a shorter stream is as
+    // valid, just less varied.
+    let started = Instant::now();
     for f in frames {
+        if !packets.is_empty() && started.elapsed().as_secs_f64() >= max_secs {
+            break;
+        }
         enc.send_frame(f)?;
         loop {
             match enc.receive_packet() {
