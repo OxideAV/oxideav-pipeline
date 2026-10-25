@@ -107,6 +107,31 @@ default (`false`) keeps the historical partial-file-stays behaviour,
 which is the debugging-friendly choice. See
 `tests/discard_failed_outputs.rs`.
 
+## Codec thread budgets
+
+`oxideav-core` codecs run serial until they are handed an
+`ExecutionContext`, so every codec this crate builds for you gets one
+before its first packet / frame — default `ExecutionContext::auto()`
+(every core the host reports):
+
+| entry point | default | knob |
+|---|---|---|
+| `transcode_simple` / `_with` / `_in` | auto | `transcode_simple_in_with(.., &budget, ..)` |
+| `Pipeline` | auto | `.with_threads(n)` / `.with_execution_context(ctx)` |
+| `Executor` | auto | `.with_threads(n)` / the job's `threads` key |
+| `bench::run_bench*` | auto | `run_bench_in` / `run_bench_all_in` |
+
+`n = 0` is auto, `n = 1` serial. One budget is split across a run's
+streams by `stream_budget`: a video codec gets all of it, an audio /
+subtitle codec next to a video stream runs serial (an audio-only run
+gives audio the whole budget). Output never depends on the budget.
+If you build codecs yourself (`make_decoder_with`, a registry
+factory), make the same call:
+
+```rust,ignore
+decoder.set_execution_context(&oxideav_core::ExecutionContext::auto());
+```
+
 ## Multi-output parallelism
 
 A job with several outputs and `threads ≥ 2` runs its outputs

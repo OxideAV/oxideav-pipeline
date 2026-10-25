@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Codec thread budgets on every entry point. `transcode_simple`,
+  `transcode_simple_with`, `transcode_simple_in`, `Pipeline` and the
+  bench now hand each decoder / encoder they build an
+  `ExecutionContext` before its first packet / frame, defaulting to
+  `ExecutionContext::auto()` — previously they never called
+  `set_execution_context`, so every codec ran single-threaded (a 1080p
+  AV1 / VP9 / HEVC transcode used one core). New knobs:
+  `transcode_simple_in_with` (explicit budget), `Pipeline::with_threads`
+  / `Pipeline::with_execution_context`, `bench::run_bench_in` /
+  `bench::run_bench_all_in`; helpers `budget_from_threads` (0 = auto,
+  1 = serial) and `stream_budget`, the split rule (video keeps the
+  budget, audio / subtitle next to video runs serial) now also applied
+  per track by the pipelined executor. Output is unchanged at every
+  budget.
+- `bench`: an encoder that refuses the requested size but accepts the
+  next 16-aligned one (the H.264 encoder at 1920x1080) is benched at
+  1920x1088, and when it is the encoder synthesising the decode-side
+  stream the decoders are benched on that stream — `oxideav bench h264`
+  no longer reports "can't synth decode stream" at 1080p. The decode
+  prep no longer keeps a second copy of the synthesised frames.
+
 - `preferred_encoder_caps` / `preferred_decoder_caps`: the capabilities
   of the implementation `make_encoder_with` / `make_decoder_with` would
   build under a `CodecPreferences`, ranked the same way.

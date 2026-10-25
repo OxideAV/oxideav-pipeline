@@ -28,6 +28,7 @@ use oxideav_core::{
 };
 use oxideav_pixfmt::{ConvertOptions, convert as pixfmt_convert};
 
+use crate::budget::stream_budget;
 use crate::dag::{Dag, DagNode, MuxTrack, ResolvedSelector, codec_encoder_caps};
 use crate::failure::{FailureStage, RunFailure, StageFailure, StageResult, attribute};
 use crate::pix_negotiate::{MuxProbe, encoder_input_format};
@@ -1215,8 +1216,20 @@ impl<'a> Executor<'a> {
         for pl in &mut pipelines {
             pl.apply_pixel_format_auto_insert(&self.ctx.codecs, mux, &self.prefs);
         }
+        // Split the output's budget across its tracks (video keeps it,
+        // audio next to video runs serial — see `crate::budget`).
+        let has_video = pipelines
+            .iter()
+            .any(|pl| pl.input_params.media_type == MediaType::Video && !pl.copy);
         for pl in &mut pipelines {
-            pl.instantiate(&self.ctx.codecs, &self.prefs, &ctx, &self.ctx.filters, mux)?;
+            let track_ctx = stream_budget(&ctx, pl.input_params.media_type, has_video);
+            pl.instantiate(
+                &self.ctx.codecs,
+                &self.prefs,
+                &track_ctx,
+                &self.ctx.filters,
+                mux,
+            )?;
         }
         let out_streams = build_output_streams(&mut pipelines);
         let sink = self.open_sink(name, &out_streams)?;

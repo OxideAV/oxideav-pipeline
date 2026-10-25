@@ -23,12 +23,24 @@
 //!
 //! `run_bench_all` walks every codec id with at least one registered
 //! impl, grouping by `MediaType` (video first, then audio).
+//!
+//! Threading: every encoder / decoder under test gets an
+//! [`ExecutionContext::auto`] budget (what a transcode through this
+//! crate gives it); [`run_bench_in`] / [`run_bench_all_in`] take an
+//! explicit one (`ExecutionContext::serial()` for single-core numbers).
+//!
+//! Geometry: an encoder that only codes whole macroblocks rejects a
+//! size that is not a multiple of 16 (H.264 at 1920x1080). When the
+//! requested size is refused and the next 16-aligned size (1920x1088)
+//! is accepted, that encoder — and, when it is the one synthesising
+//! the decode-side stream, every decoder — is benched at the aligned
+//! size; the extra eight rows are under 1 % of a 1080p picture.
 
 use std::time::Instant;
 
 use oxideav_core::{
-    AudioFrame, CodecId, CodecParameters, CodecRegistry, Frame, MediaType, Packet, PixelFormat,
-    Rational, SampleFormat, VideoFrame, VideoPlane,
+    AudioFrame, CodecId, CodecParameters, CodecRegistry, ExecutionContext, Frame, MediaType,
+    Packet, PixelFormat, Rational, SampleFormat, VideoFrame, VideoPlane,
 };
 
 /// Tunables for a single bench run.
@@ -202,6 +214,18 @@ pub fn run_bench_with<F: FnMut(BenchEvent)>(
     reg: &CodecRegistry,
     codec_id: &str,
     opts: &BenchOpts,
+    on_event: F,
+) -> Vec<BenchResult> {
+    run_bench_in(reg, codec_id, opts, &ExecutionContext::auto(), on_event)
+}
+
+/// [`run_bench_with`] under an explicit thread budget, announced to
+/// every encoder and decoder before it is timed.
+pub fn run_bench_in<F: FnMut(BenchEvent)>(
+    reg: &CodecRegistry,
+    codec_id: &str,
+    opts: &BenchOpts,
+    budget: &ExecutionContext,
     mut on_event: F,
 ) -> Vec<BenchResult> {
     let id = CodecId::new(codec_id);
@@ -218,8 +242,12 @@ pub fn run_bench_with<F: FnMut(BenchEvent)>(
     let mut results = Vec::new();
 
     match media_type {
-        MediaType::Video => bench_video_codec(&id, impls, opts, &mut results, &mut on_event),
-        MediaType::Audio => bench_audio_codec(&id, impls, opts, &mut results, &mut on_event),
+        MediaType::Video => {
+            bench_video_codec(&id, impls, opts, budget, &mut results, &mut on_event)
+        }
+        MediaType::Audio => {
+            bench_audio_codec(&id, impls, opts, budget, &mut results, &mut on_event)
+        }
         _ => {
             // Subtitles / data — no time-domain throughput meaningful.
             results.push(BenchResult {
@@ -273,6 +301,16 @@ pub fn run_bench_all(reg: &CodecRegistry, opts: &BenchOpts) -> Vec<BenchResult> 
 pub fn run_bench_all_with<F: FnMut(BenchEvent)>(
     reg: &CodecRegistry,
     opts: &BenchOpts,
+    on_event: F,
+) -> Vec<BenchResult> {
+    run_bench_all_in(reg, opts, &ExecutionContext::auto(), on_event)
+}
+
+/// [`run_bench_all_with`] under an explicit thread budget.
+pub fn run_bench_all_in<F: FnMut(BenchEvent)>(
+    reg: &CodecRegistry,
+    opts: &BenchOpts,
+    budget: &ExecutionContext,
     mut on_event: F,
 ) -> Vec<BenchResult> {
     let mut seen = std::collections::BTreeSet::new();
@@ -293,7 +331,7 @@ pub fn run_bench_all_with<F: FnMut(BenchEvent)>(
     });
     let mut all = Vec::new();
     for (_, id) in ids {
-        all.extend(run_bench_with(reg, &id, opts, &mut on_event));
+        all.extend(run_bench_in(reg, &id, opts, budget, &mut on_event));
     }
     all
 }
@@ -336,16 +374,26 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
     id: &CodecId,
     impls: &[oxideav_core::CodecImplementation],
     opts: &BenchOpts,
+    budget: &ExecutionContext,
     results: &mut Vec<BenchResult>,
     on_event: &mut F,
 ) {
-    let params = video_params(id, opts);
     on_event(BenchEvent::PrepStart {
         codec_id: id.as_str(),
     });
-    let frames = video_frames(opts);
-
-    let video_frames_owned: Vec<Frame> = frames.iter().cloned().map(Frame::Video).collect();
+    // The geometry the decode-side stream is coded at: the requested
+    // one, or its 16-aligned neighbour when only that one is accepted
+    // by the encoder synthesising the stream.
+    let aligned = aligned_opts(opts);
+    let base_opts = match &aligned {
+        Some(a) if prep_encoder_needs(impls, id, opts, a) => a,
+        _ => opts,
+    };
+    let params = video_params(id, base_opts);
+    let video_frames_owned: Vec<Frame> = video_frames(base_opts)
+        .into_iter()
+        .map(Frame::Video)
+        .collect();
     let nominal = opts.fps_num as f64 / opts.fps_den as f64;
     let mut prep_stream: Option<(Vec<Packet>, String)> = None;
 
@@ -353,7 +401,7 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
     // event that mentions a packet count. Cache the result; if the
     // user only asked for `Side::Encode` we never call this.
     if opts.side != Side::Encode {
-        match self_encode_video(impls, &params, &frames) {
+        match self_encode_video(impls, &params, &video_frames_owned, budget) {
             Ok((s, encoder_name)) => {
                 on_event(BenchEvent::PrepDone {
                     codec_id: id.as_str(),
@@ -408,9 +456,36 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
                     imp,
                     &p,
                     &video_frames_owned,
+                    budget,
                     opts.bench_duration_secs,
                     nominal,
                 );
+                // Refused at the stream geometry: retry at the
+                // other one (requested vs 16-aligned).
+                let other = match &aligned {
+                    Some(a) if std::ptr::eq(base_opts, opts) => Some(a),
+                    Some(_) => Some(opts),
+                    None => None,
+                };
+                if let (Some(alt), Some(err)) = (other, r.error.as_deref())
+                    && err.starts_with("init:")
+                {
+                    let mut alt_p = video_params(id, alt);
+                    alt_p.device_index = device_index;
+                    if (imp.make_encoder.unwrap())(&alt_p).is_ok() {
+                        let alt_frames: Vec<Frame> =
+                            video_frames(alt).into_iter().map(Frame::Video).collect();
+                        r = time_encode(
+                            id,
+                            imp,
+                            &alt_p,
+                            &alt_frames,
+                            budget,
+                            opts.bench_duration_secs,
+                            nominal,
+                        );
+                    }
+                }
                 r.device_index = device_index;
                 r.device_label = device_label;
                 on_event(BenchEvent::BenchDone { result: &r });
@@ -431,7 +506,15 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
                     hw: imp.caps.hardware_accelerated,
                     priority: imp.caps.priority,
                 });
-                let mut r = time_decode(id, imp, &p, &stream, opts.bench_duration_secs, nominal);
+                let mut r = time_decode(
+                    id,
+                    imp,
+                    &p,
+                    &stream,
+                    budget,
+                    opts.bench_duration_secs,
+                    nominal,
+                );
                 r.device_index = device_index;
                 r.device_label = device_label;
                 on_event(BenchEvent::BenchDone { result: &r });
@@ -439,6 +522,38 @@ fn bench_video_codec<F: FnMut(BenchEvent)>(
             }
         }
     }
+}
+
+/// `opts` at the next 16-aligned geometry, or `None` when it already
+/// is aligned.
+fn aligned_opts(opts: &BenchOpts) -> Option<BenchOpts> {
+    let (w, h) = (
+        opts.width.next_multiple_of(16),
+        opts.height.next_multiple_of(16),
+    );
+    (w != opts.width || h != opts.height).then(|| BenchOpts {
+        width: w,
+        height: h,
+        ..opts.clone()
+    })
+}
+
+/// Whether the encoder [`self_encode_video`] picks refuses `opts`'
+/// geometry but accepts `aligned`'s.
+fn prep_encoder_needs(
+    impls: &[oxideav_core::CodecImplementation],
+    id: &CodecId,
+    opts: &BenchOpts,
+    aligned: &BenchOpts,
+) -> bool {
+    let Some(factory) = impls
+        .iter()
+        .find(|i| i.caps.encode && i.make_encoder.is_some())
+        .and_then(|i| i.make_encoder)
+    else {
+        return false;
+    };
+    factory(&video_params(id, opts)).is_err() && factory(&video_params(id, aligned)).is_ok()
 }
 
 fn video_params(id: &CodecId, opts: &BenchOpts) -> CodecParameters {
@@ -494,7 +609,8 @@ fn video_frames(opts: &BenchOpts) -> Vec<VideoFrame> {
 fn self_encode_video(
     impls: &[oxideav_core::CodecImplementation],
     params: &CodecParameters,
-    frames: &[VideoFrame],
+    frames: &[Frame],
+    budget: &ExecutionContext,
 ) -> Result<(Vec<Packet>, String), oxideav_core::Error> {
     let imp = impls
         .iter()
@@ -507,9 +623,10 @@ fn self_encode_video(
         })?;
     let encoder_name = imp.caps.implementation.clone();
     let mut enc = (imp.make_encoder.unwrap())(params)?;
+    enc.set_execution_context(budget);
     let mut packets = Vec::new();
     for f in frames {
-        enc.send_frame(&Frame::Video(f.clone()))?;
+        enc.send_frame(f)?;
         loop {
             match enc.receive_packet() {
                 Ok(p) => packets.push(p),
@@ -535,6 +652,7 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
     id: &CodecId,
     impls: &[oxideav_core::CodecImplementation],
     opts: &BenchOpts,
+    budget: &ExecutionContext,
     results: &mut Vec<BenchResult>,
     on_event: &mut F,
 ) {
@@ -550,7 +668,7 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
     let mut prep_stream: Option<(Vec<Packet>, String)> = None;
 
     if opts.side != Side::Encode {
-        match self_encode_audio(impls, &params, &frames) {
+        match self_encode_audio(impls, &params, &frames, budget) {
             Ok((s, encoder_name)) => {
                 on_event(BenchEvent::PrepDone {
                     codec_id: id.as_str(),
@@ -605,6 +723,7 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
                     imp,
                     &p,
                     &audio_frames_owned,
+                    budget,
                     opts.bench_duration_secs,
                     nominal_fps,
                 );
@@ -628,8 +747,15 @@ fn bench_audio_codec<F: FnMut(BenchEvent)>(
                     hw: imp.caps.hardware_accelerated,
                     priority: imp.caps.priority,
                 });
-                let mut r =
-                    time_decode(id, imp, &p, &stream, opts.bench_duration_secs, nominal_fps);
+                let mut r = time_decode(
+                    id,
+                    imp,
+                    &p,
+                    &stream,
+                    budget,
+                    opts.bench_duration_secs,
+                    nominal_fps,
+                );
                 r.device_index = device_index;
                 r.device_label = device_label;
                 on_event(BenchEvent::BenchDone { result: &r });
@@ -702,6 +828,7 @@ fn self_encode_audio(
     impls: &[oxideav_core::CodecImplementation],
     params: &CodecParameters,
     frames: &[AudioFrame],
+    budget: &ExecutionContext,
 ) -> Result<(Vec<Packet>, String), oxideav_core::Error> {
     let imp = impls
         .iter()
@@ -714,6 +841,7 @@ fn self_encode_audio(
         })?;
     let encoder_name = imp.caps.implementation.clone();
     let mut enc = (imp.make_encoder.unwrap())(params)?;
+    enc.set_execution_context(budget);
     let mut packets = Vec::new();
     for f in frames {
         enc.send_frame(&Frame::Audio(f.clone()))?;
@@ -743,6 +871,7 @@ fn time_encode(
     imp: &oxideav_core::CodecImplementation,
     params: &CodecParameters,
     prep: &[Frame],
+    budget: &ExecutionContext,
     duration_secs: f64,
     nominal_fps: f64,
 ) -> BenchResult {
@@ -756,6 +885,7 @@ fn time_encode(
         Ok(e) => e,
         Err(e) => return error_result(id, imp, BenchSide::Encode, format!("init: {e}")),
     };
+    enc.set_execution_context(budget);
     if prep.is_empty() {
         return error_result(id, imp, BenchSide::Encode, "no prep frames".into());
     }
@@ -807,6 +937,7 @@ fn time_decode(
     imp: &oxideav_core::CodecImplementation,
     params: &CodecParameters,
     stream: &[Packet],
+    budget: &ExecutionContext,
     duration_secs: f64,
     nominal_fps: f64,
 ) -> BenchResult {
@@ -820,6 +951,7 @@ fn time_decode(
         Ok(d) => d,
         Err(e) => return error_result(id, imp, BenchSide::Decode, format!("init: {e}")),
     };
+    dec.set_execution_context(budget);
     if stream.is_empty() {
         return error_result(id, imp, BenchSide::Decode, "empty prep stream".into());
     }
@@ -1067,5 +1199,121 @@ mod device_iteration_tests {
         assert_eq!(devs.len(), 1);
         assert!(devs[0].0.is_none());
         assert!(devs[0].1.is_none());
+    }
+}
+
+#[cfg(test)]
+mod geometry_and_budget_tests {
+    //! A macroblock-only encoder (refuses sizes that are not multiples
+    //! of 16) is benched at the aligned size, its stream feeds the
+    //! decode bench, and both sides receive the bench budget.
+    use super::*;
+    use oxideav_core::{
+        CodecCapabilities, CodecInfo, Decoder, Encoder, Error, Result as CoreResult,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static ENC_THREADS: AtomicUsize = AtomicUsize::new(0);
+    static DEC_THREADS: AtomicUsize = AtomicUsize::new(0);
+    const ID: &str = "bench_mb_only";
+
+    struct MbEncoder {
+        params: CodecParameters,
+        out: Option<Packet>,
+    }
+    impl Encoder for MbEncoder {
+        fn codec_id(&self) -> &CodecId {
+            &self.params.codec_id
+        }
+        fn output_params(&self) -> &CodecParameters {
+            &self.params
+        }
+        fn send_frame(&mut self, _: &Frame) -> CoreResult<()> {
+            self.out = Some(Packet::new(0, oxideav_core::TimeBase::new(1, 30), vec![1]));
+            Ok(())
+        }
+        fn receive_packet(&mut self) -> CoreResult<Packet> {
+            self.out.take().ok_or(Error::NeedMore)
+        }
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+        fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+            ENC_THREADS.store(ctx.threads, Ordering::SeqCst);
+        }
+    }
+    struct MbDecoder {
+        id: CodecId,
+        have: bool,
+    }
+    impl Decoder for MbDecoder {
+        fn codec_id(&self) -> &CodecId {
+            &self.id
+        }
+        fn send_packet(&mut self, _: &Packet) -> CoreResult<()> {
+            self.have = true;
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> CoreResult<Frame> {
+            if !std::mem::take(&mut self.have) {
+                return Err(Error::NeedMore);
+            }
+            Ok(Frame::Video(VideoFrame {
+                pts: None,
+                planes: Vec::new(),
+            }))
+        }
+        fn flush(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+        fn reset(&mut self) -> CoreResult<()> {
+            Ok(())
+        }
+        fn set_execution_context(&mut self, ctx: &ExecutionContext) {
+            DEC_THREADS.store(ctx.threads, Ordering::SeqCst);
+        }
+    }
+    fn make_enc(p: &CodecParameters) -> CoreResult<Box<dyn Encoder>> {
+        let (w, h) = (p.width.unwrap_or(0), p.height.unwrap_or(0));
+        if w % 16 != 0 || h % 16 != 0 {
+            return Err(Error::invalid("16-aligned dimensions only"));
+        }
+        Ok(Box::new(MbEncoder {
+            params: p.clone(),
+            out: None,
+        }))
+    }
+    fn make_dec(_: &CodecParameters) -> CoreResult<Box<dyn Decoder>> {
+        Ok(Box::new(MbDecoder {
+            id: CodecId::new(ID),
+            have: false,
+        }))
+    }
+
+    #[test]
+    fn unaligned_size_benches_at_the_aligned_one_under_the_budget() {
+        let mut reg = CodecRegistry::default();
+        reg.register(
+            CodecInfo::new(CodecId::new(ID))
+                .capabilities(CodecCapabilities::video(ID).with_encode().with_decode())
+                .encoder(make_enc)
+                .decoder(make_dec),
+        );
+        let opts = BenchOpts {
+            prep_frames: 3,
+            bench_duration_secs: 0.02,
+            width: 40,
+            height: 18,
+            ..BenchOpts::default()
+        };
+        let budget = ExecutionContext::with_threads(3);
+        let results = run_bench_in(&reg, ID, &opts, &budget, |_| {});
+        assert_eq!(results.len(), 2, "{results:?}");
+        for r in &results {
+            assert!(r.error.is_none(), "{r:?}");
+            assert!(r.fps.is_some_and(|f| f > 0.0), "{r:?}");
+        }
+        assert_eq!(ENC_THREADS.load(Ordering::SeqCst), 3);
+        assert_eq!(DEC_THREADS.load(Ordering::SeqCst), 3);
     }
 }

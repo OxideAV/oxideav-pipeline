@@ -12,6 +12,7 @@
 //!   plug in via [`JobSink`].
 
 pub mod bench;
+pub mod budget;
 pub mod dag;
 pub mod executor;
 pub mod failure;
@@ -24,6 +25,7 @@ pub mod staged;
 pub mod stream_fit;
 pub mod validate;
 
+pub use budget::{budget_from_threads, stream_budget};
 pub use dag::{Dag, DagNode, NodeId};
 pub use executor::{Executor, ExecutorHandle, JobSink, RenderSourceFactory};
 pub use failure::{FailureStage, RunFailure};
@@ -41,8 +43,8 @@ pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
 pub use stream_fit::{OutputKind, StreamSelection, select_streams};
 
 use oxideav_core::{
-    CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, Frame, MediaType, Muxer,
-    Packet, Result, StreamInfo, TimeBase,
+    CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext, Frame,
+    MediaType, Muxer, Packet, Result, StreamInfo, TimeBase,
 };
 
 // ───────────────────────── Sink trait ─────────────────────────
@@ -101,6 +103,7 @@ enum RouteMode {
 
 struct Route {
     source_stream: u32,
+    media_type: MediaType,
     sink: Box<dyn Sink>,
     mode: RouteMode,
 }
@@ -117,6 +120,10 @@ pub struct Pipeline {
     /// (`CodecPreferences { no_hardware: true, .. }`) without removing
     /// them from the registry.
     prefs: CodecPreferences,
+    /// Thread budget announced to every codec a route builds, split
+    /// across the routes by [`stream_budget`]. Default
+    /// [`ExecutionContext::auto`].
+    budget: ExecutionContext,
 }
 
 /// Stats returned by [`Pipeline::run`].
@@ -138,7 +145,25 @@ impl Pipeline {
             codecs,
             prepared: false,
             prefs: CodecPreferences::default(),
+            budget: ExecutionContext::auto(),
         }
+    }
+
+    /// Thread budget for the codecs this pipeline builds (default
+    /// [`ExecutionContext::auto`]). Announced to every decoder /
+    /// encoder in [`prepare`](Self::prepare), split across the routes
+    /// by [`stream_budget`]. Builder-style.
+    pub fn with_execution_context(mut self, budget: ExecutionContext) -> Self {
+        self.budget = budget;
+        self
+    }
+
+    /// [`with_execution_context`](Self::with_execution_context) from a
+    /// thread count: `0` = auto (the default), `1` = serial, `n` = at
+    /// most `n` workers — the same knob as
+    /// [`Executor::with_threads`].
+    pub fn with_threads(self, threads: usize) -> Self {
+        self.with_execution_context(budget_from_threads(threads))
     }
 
     /// Set the codec-resolution preferences (priority bias, hardware
@@ -168,8 +193,10 @@ impl Pipeline {
             .ok_or_else(|| Error::invalid(format!("no stream with index {stream_index}")))?;
         let acceptance = sink.accepts(&stream.params);
         let mode = self.resolve_mode(&stream.params, &acceptance)?;
+        let media_type = stream.params.media_type;
         self.routes.push(Route {
             source_stream: stream_index,
+            media_type,
             sink,
             mode,
         });
@@ -195,6 +222,23 @@ impl Pipeline {
         }
         let active: Vec<u32> = self.routes.iter().map(|r| r.source_stream).collect();
         self.source.set_active_streams(&active);
+        // Codecs run serial until told otherwise: announce each route's
+        // share of the budget before the first packet.
+        let has_video = self
+            .routes
+            .iter()
+            .any(|r| r.media_type == MediaType::Video && !matches!(r.mode, RouteMode::Copy));
+        for route in &mut self.routes {
+            let ctx = stream_budget(&self.budget, route.media_type, has_video);
+            match &mut route.mode {
+                RouteMode::Copy => {}
+                RouteMode::Decode { decoder } => decoder.set_execution_context(&ctx),
+                RouteMode::Transcode { decoder, encoder } => {
+                    decoder.set_execution_context(&ctx);
+                    encoder.set_execution_context(&ctx);
+                }
+            }
+        }
         self.prepared = true;
         Ok(())
     }
@@ -410,6 +454,11 @@ pub enum StreamPlan {
 /// interleave matches the source. Reencode-route packets emerge from
 /// the encoder in decode order which the muxer is responsible for
 /// interleaving (most container muxers handle this internally via pts).
+///
+/// Every decoder and encoder built here gets an
+/// [`ExecutionContext::auto`] thread budget (split across the routes by
+/// [`stream_budget`]); [`transcode_simple_in_with`] takes an explicit
+/// one.
 pub fn transcode_simple(
     demuxer: &mut dyn Demuxer,
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
@@ -432,6 +481,8 @@ pub fn transcode_simple(
 /// Video frames are converted into a pixel layout the encoder declares
 /// it accepts. Audio frames reach the encoder in the decoder's shape;
 /// [`transcode_simple_in`] also adapts audio (and probes the muxer).
+/// Codecs get an [`ExecutionContext::auto`] budget, as with
+/// [`transcode_simple`].
 pub fn transcode_simple_with(
     demuxer: &mut dyn Demuxer,
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
@@ -448,6 +499,7 @@ pub fn transcode_simple_with(
             mux: None,
         },
         prefs,
+        &ExecutionContext::auto(),
         plan_for,
     )
 }
@@ -464,12 +516,42 @@ pub fn transcode_simple_with(
 ///   filters (from `ctx.filters`) the encoder's declared capabilities
 ///   call for (a decoder's interleaved `s16` into Vorbis' float
 ///   planar input).
+///
+/// Codecs get an [`ExecutionContext::auto`] budget;
+/// [`transcode_simple_in_with`] takes an explicit one.
 pub fn transcode_simple_in(
     demuxer: &mut dyn Demuxer,
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
     ctx: &oxideav_core::RuntimeContext,
     container: Option<&str>,
     prefs: &CodecPreferences,
+    plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
+) -> Result<TranscodeStats> {
+    transcode_simple_in_with(
+        demuxer,
+        muxer_open,
+        ctx,
+        container,
+        prefs,
+        &ExecutionContext::auto(),
+        plan_for,
+    )
+}
+
+/// [`transcode_simple_in`] under an explicit thread budget for the
+/// codecs it builds (`ExecutionContext::serial()` for a
+/// single-threaded run, [`budget_from_threads`] for a CLI-style
+/// `--threads N` knob). The budget is split across the re-encoded
+/// streams by [`stream_budget`]: video codecs get all of it, an audio
+/// codec next to a video stream runs serial. Output does not depend on
+/// the budget.
+pub fn transcode_simple_in_with(
+    demuxer: &mut dyn Demuxer,
+    muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
+    ctx: &oxideav_core::RuntimeContext,
+    container: Option<&str>,
+    prefs: &CodecPreferences,
+    budget: &ExecutionContext,
     plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
 ) -> Result<TranscodeStats> {
     transcode_routes(
@@ -484,6 +566,7 @@ pub fn transcode_simple_in(
             }),
         },
         prefs,
+        budget,
         plan_for,
     )
 }
@@ -570,6 +653,7 @@ fn transcode_routes(
     muxer_open: impl FnOnce(&[StreamInfo]) -> Result<Box<dyn Muxer>>,
     adapt: Adapt<'_>,
     prefs: &CodecPreferences,
+    budget: &ExecutionContext,
     plan_for: impl Fn(&StreamInfo) -> Result<StreamPlan>,
 ) -> Result<TranscodeStats> {
     let codecs = adapt.codecs;
@@ -590,8 +674,18 @@ fn transcode_routes(
     let mut route_by_in_idx: std::collections::HashMap<u32, usize> =
         std::collections::HashMap::with_capacity(in_streams.len());
 
-    for in_stream in &in_streams {
-        let plan = plan_for(in_stream)?;
+    // Plan every stream first: the budget split depends on whether any
+    // video stream is re-encoded.
+    let plans = in_streams
+        .iter()
+        .map(&plan_for)
+        .collect::<Result<Vec<StreamPlan>>>()?;
+    let has_video = in_streams.iter().zip(&plans).any(|(s, p)| {
+        s.params.media_type == MediaType::Video && matches!(p, StreamPlan::Reencode { .. })
+    });
+
+    for (in_stream, plan) in in_streams.iter().zip(plans) {
+        let stream_ctx = stream_budget(budget, in_stream.params.media_type, has_video);
         match plan {
             StreamPlan::Drop => continue,
             StreamPlan::Copy => {
@@ -604,6 +698,7 @@ fn transcode_routes(
             }
             StreamPlan::Reencode { output_codec } => {
                 let mut decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
+                decoder.set_execution_context(&stream_ctx);
                 // A video stream whose layout neither the container
                 // nor the decoder states yet: pre-roll to the first
                 // picture so the stages and the encoder are planned
@@ -630,7 +725,8 @@ fn transcode_routes(
                         ..in_stream.clone()
                     },
                 )?;
-                let encoder = selection::make_encoder_with(codecs, &enc_params, prefs)?;
+                let mut encoder = selection::make_encoder_with(codecs, &enc_params, prefs)?;
+                encoder.set_execution_context(&stream_ctx);
                 let out_params = encoder.output_params().clone();
                 let out_index = out_streams.len() as u32;
                 let out_time_base = match out_params.media_type {
