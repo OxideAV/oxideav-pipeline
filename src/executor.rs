@@ -31,6 +31,7 @@ use oxideav_pixfmt::{ConvertOptions, convert as pixfmt_convert};
 use crate::budget::stream_budget;
 use crate::dag::{Dag, DagNode, MuxTrack, ResolvedSelector, codec_encoder_caps};
 use crate::failure::{FailureStage, RunFailure, StageFailure, StageResult, attribute};
+use crate::params_watch::{DecodedStream, reshape_chain};
 use crate::pix_negotiate::{MuxProbe, encoder_input_format};
 use crate::preroll::prime_unlabelled_video;
 use crate::schema::{Job, is_reserved_sink};
@@ -1345,6 +1346,10 @@ pub(crate) struct TrackRuntime {
     pub(crate) input_params: CodecParameters,
     pub(crate) input_time_base: TimeBase,
     pub(crate) decoder: Option<Box<dyn Decoder>>,
+    /// The decoder's reported output merged into `input_params`, kept
+    /// in step after every frame (see [`crate::params_watch`]). Set
+    /// when `instantiate` installs the decoder.
+    pub(crate) decoded: Option<DecodedStream>,
     /// Per-frame stages in order (filters + pixel-format conversions)
     /// between the decoder and the encoder. The pipelined runner
     /// drains this vector to spawn one worker per stage.
@@ -1449,6 +1454,7 @@ impl TrackRuntime {
             input_params: CodecParameters::audio(CodecId::new("")),
             input_time_base: TimeBase::new(1, 1),
             decoder: None,
+            decoded: None,
             frame_stages: Vec::new(),
             encoder: None,
             encoder_time_base: None,
@@ -1496,17 +1502,23 @@ impl TrackRuntime {
         for stage in &self.stages {
             match stage {
                 StageSpec::Decode => {
-                    if self.decoder.is_none() {
-                        let mut d = make_decoder_with(codecs, &self.input_params, prefs)?;
-                        d.set_execution_context(ctx);
-                        self.decoder = Some(d);
-                    }
-                    // A container that declared no pixel layout leaves
-                    // the decoder as the only authority on it.
-                    if running.media_type == MediaType::Video && running.pixel_format.is_none() {
-                        running.pixel_format =
-                            self.decoder.as_ref().and_then(|d| d.output_pixel_format());
-                    }
+                    let decoder = match &mut self.decoder {
+                        Some(d) => d,
+                        slot => {
+                            let mut d = make_decoder_with(codecs, &self.input_params, prefs)?;
+                            d.set_execution_context(ctx);
+                            slot.insert(d)
+                        }
+                    };
+                    // The decoder is the authority on what it emits
+                    // (cropped size, pixel layout, sample format …):
+                    // its answer wins over the container's claim, and
+                    // every stage below is planned from the merge.
+                    let mut decoded = DecodedStream::new(self.input_params.clone());
+                    decoded.prime(&**decoder);
+                    running.merge_output_params(&decoded.params);
+                    self.input_params = decoded.params.clone();
+                    self.decoded = Some(decoded);
                 }
                 StageSpec::Filter { name, params } => {
                     let in_port = port_spec_from_params(&running, self.input_time_base);
@@ -1833,10 +1845,31 @@ impl TrackRuntime {
                 };
                 produced_any = true;
                 stats.frames_decoded += 1;
+                self.observe_decoder(track_index)?;
                 self.pump_frame(frame, track_index, sink, stats)?;
             }
         }
         Ok(())
+    }
+
+    /// After a successful `receive_frame`: fold the decoder's answer
+    /// into the stream parameters and, when the shape the stages were
+    /// planned for changed, re-plan them (see
+    /// [`crate::params_watch`] for what can follow a change).
+    fn observe_decoder(&mut self, track_index: u32) -> StageResult<()> {
+        let (Some(decoded), Some(decoder)) = (&mut self.decoded, &self.decoder) else {
+            return Ok(());
+        };
+        let Some(reshape) = decoded.observe(&**decoder) else {
+            return Ok(());
+        };
+        self.input_params = decoded.params.clone();
+        reshape_chain(
+            &mut self.frame_stages,
+            reshape,
+            self.encoder.is_some(),
+            track_index,
+        )
     }
 
     fn pump_frame(
@@ -1925,6 +1958,7 @@ impl TrackRuntime {
                     }
                 };
                 stats.frames_decoded += 1;
+                self.observe_decoder(track_index)?;
                 self.pump_frame(frame, track_index, sink, stats)?;
             }
         }

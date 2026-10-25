@@ -6,8 +6,8 @@
 //! from the stream parameters the container declared. Containers
 //! that carry no layout (WebM, AVI, MPEG-TS, MOV for most codecs)
 //! leave the decoder as the only authority — and
-//! [`Decoder::output_pixel_format`] is allowed to answer `None` until
-//! the decoder has seen its first packet. Without a layout, an
+//! [`Decoder::output_params`] is allowed to answer `None` until the
+//! decoder has seen its first packet. Without a layout, an
 //! encoder that needs one (`rawvideo` into Y4M: "pixel_format is
 //! required") cannot even be built.
 //!
@@ -27,8 +27,8 @@ use std::collections::VecDeque;
 
 use oxideav_core::{
     AttachedPicture, Attachment, Chapter, CodecId, CodecParameters, CodecRegistry, Decoder,
-    Demuxer, Error, ExecutionContext, Frame, MediaType, Packet, PacketSource, PixelFormat, Result,
-    StreamInfo, VideoFrame, VideoPlane, signal::ColorRange,
+    Demuxer, Error, ExecutionContext, Frame, MediaType, OutputParamsWatch, Packet, PacketSource,
+    PixelFormat, Result, StreamInfo, VideoFrame, VideoPlane, signal::ColorRange,
 };
 use oxideav_pixfmt::FormatInfo;
 
@@ -108,11 +108,15 @@ pub(crate) fn prime_video_decoder(
         }
         collect_frames(&mut *decoder, &mut pending);
     }
-    let mut pixel_format = decoder.output_pixel_format();
+    // The decoder's own answer first (it has seen packets now), the
+    // first picture's geometry only when it still says nothing.
+    let mut shape = params.clone();
+    OutputParamsWatch::new().prime(&*decoder, &mut shape);
+    let mut pixel_format = shape.pixel_format;
     if pixel_format.is_none()
         && let Some(Frame::Video(v)) = pending.front()
     {
-        pixel_format = infer_pixel_format(v, params.width.unwrap_or(0), params.height.unwrap_or(0));
+        pixel_format = infer_pixel_format(v, shape.width.unwrap_or(0), shape.height.unwrap_or(0));
     }
     Ok(Primed {
         decoder: Box::new(PrimedDecoder {
@@ -207,9 +211,30 @@ impl Decoder for PrimedDecoder {
         self.inner.set_execution_context(ctx);
     }
 
+    /// The inner decoder's answer, with the layout the pre-roll
+    /// established filling in a pixel format it does not state.
+    fn output_params(&self) -> Option<CodecParameters> {
+        match (self.inner.output_params(), self.pixel_format) {
+            (Some(mut p), Some(pf)) => {
+                p.pixel_format.get_or_insert(pf);
+                Some(p)
+            }
+            (Some(p), None) => Some(p),
+            (None, Some(pf)) => {
+                let mut p = CodecParameters::video(self.codec_id.clone());
+                p.pixel_format = Some(pf);
+                Some(p)
+            }
+            (None, None) => None,
+        }
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.inner.output_params_generation()
+    }
+
     fn output_pixel_format(&self) -> Option<PixelFormat> {
-        self.pixel_format
-            .or_else(|| self.inner.output_pixel_format())
+        self.output_params().and_then(|p| p.pixel_format)
     }
 }
 
@@ -361,10 +386,12 @@ pub(crate) fn prime_unlabelled_video(
         };
         let mut decoder = make_decoder_with(codecs, &pl.input_params, prefs)?;
         decoder.set_execution_context(ctx);
-        if decoder.output_pixel_format().is_some() {
+        let watch = OutputParamsWatch::new();
+        watch.prime(&*decoder, &mut pl.input_params);
+        if pl.input_params.pixel_format.is_some() {
             // The decoder knows from its configuration record: no
-            // packet needs reading. `instantiate` reads the layout off
-            // the decoder it finds installed.
+            // packet needs reading. `instantiate` merges the rest of
+            // its answer off the decoder it finds installed.
             pl.decoder = Some(decoder);
             continue;
         }
@@ -396,8 +423,11 @@ pub(crate) fn prime_unlabelled_video(
             }
             SourcePump::Frames { .. } => continue,
         };
+        // The primed decoder answers with what it learned (its own
+        // report, or the first picture's layout).
+        watch.prime(&*primed.decoder, &mut pl.input_params);
         if let Some(fmt) = primed.pixel_format {
-            pl.input_params.pixel_format = Some(fmt);
+            pl.input_params.pixel_format.get_or_insert(fmt);
         }
         pl.decoder = Some(primed.decoder);
     }

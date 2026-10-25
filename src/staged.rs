@@ -47,6 +47,7 @@ use crate::executor::{
     frame_stage_failure_kind, run_frame_stage_emit,
 };
 use crate::failure::{FailureStage, StageFailure, StageResult, attribute};
+use crate::params_watch::{DecodedStream, Reshape, check_encoder, reshape_stage};
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
 /// stage when it receives a [`SeekCmd`] from the
@@ -441,11 +442,17 @@ impl QueueBudget {
 /// * `Data` — payload (packet/frame).
 /// * `Barrier` — flow-control marker. Today only `SeekFlush` is in use;
 ///   workers reset codec/filter state and forward unchanged.
+/// * `Reshape` — frame channels only: the decoder's output shape
+///   changed (or was first resolved) and the frames after it have the
+///   new one. Each frame stage re-plans itself and forwards the shape
+///   of its own output; an encoder that cannot follow fails the track
+///   (see [`crate::params_watch`]).
 /// * `Eof` — in-band end-of-stream so downstream stages can flush state
 ///   before exiting.
 enum Msg<T> {
     Data(T),
     Barrier(BarrierKind),
+    Reshape(Reshape),
     Eof,
 }
 
@@ -749,6 +756,7 @@ pub(crate) fn run_pipelined_inner(
             // Each FrameStage runs on its own worker thread so audio
             // filters, pixel-format converts, and future video filters
             // can overlap the encoder's back-pressure.
+            let decoded = pl.decoded.take();
             let decoder = match pl.decoder.take() {
                 Some(d) => d,
                 None => {
@@ -775,7 +783,9 @@ pub(crate) fn run_pipelined_inner(
                 FailureStage::Decode,
                 Some(track_idx as u32),
                 move |abort| {
-                    run_decode_stage(decoder, pkt_rx, frame0_tx, abort, counters_d, budget_d)
+                    run_decode_stage(
+                        decoder, decoded, pkt_rx, frame0_tx, abort, counters_d, budget_d,
+                    )
                 },
             ));
             frame0_rx
@@ -827,6 +837,7 @@ pub(crate) fn run_pipelined_inner(
                 move |abort| {
                     run_frame_stage_worker(
                         stage,
+                        track_idx as u32,
                         upstream,
                         ftx,
                         stage_extras_tx,
@@ -1087,6 +1098,8 @@ pub(crate) fn run_pipelined_inner(
                         });
                     }
                 }
+                // Reshape travels on frame channels only.
+                Ok(Msg::Reshape(_)) => {}
                 Ok(Msg::Barrier(kind)) => {
                     made_progress = true;
                     if let Err(e) = sink.barrier(kind) {
@@ -1573,6 +1586,8 @@ fn run_copy_stage(
                 }
                 counters.packets_copied.fetch_add(1, Ordering::SeqCst);
             }
+            // Reshape travels on frame channels only.
+            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Barrier(b)) => {
                 // Copy stages have no internal state — just forward.
                 if out_tx.send(Msg::Barrier(b)).is_err() {
@@ -1589,6 +1604,7 @@ fn run_copy_stage(
 /// Decoder stage: packets -> frames.
 fn run_decode_stage(
     mut decoder: Box<dyn Decoder>,
+    mut decoded: Option<DecodedStream>,
     rx: Receiver<Msg<Packet>>,
     tx: SyncSender<Msg<Frame>>,
     abort: Arc<AbortState>,
@@ -1649,6 +1665,12 @@ fn run_decode_stage(
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             produced_any = true;
+                            if let Some(r) = decoded.as_mut().and_then(|d| d.observe(&*decoder))
+                                && tx.send(Msg::Reshape(r)).is_err()
+                            {
+                                abort.abort.store(true, Ordering::SeqCst);
+                                break 'outer;
+                            }
                             if tx.send(Msg::Data(frame)).is_err() {
                                 abort.abort.store(true, Ordering::SeqCst);
                                 break 'outer;
@@ -1688,6 +1710,8 @@ fn run_decode_stage(
                     }
                 }
             }
+            // Reshape travels on frame channels only.
+            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Barrier(b)) => {
                 // SeekFlush: drop any in-flight buffered frames + reset
                 // codec state so reference frames from the pre-seek
@@ -1714,6 +1738,11 @@ fn run_decode_stage(
                     match decoder.receive_frame() {
                         Ok(frame) => {
                             counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                            if let Some(r) = decoded.as_mut().and_then(|d| d.observe(&*decoder))
+                                && tx.send(Msg::Reshape(r)).is_err()
+                            {
+                                break 'outer;
+                            }
                             if tx.send(Msg::Data(frame)).is_err() {
                                 break 'outer;
                             }
@@ -1742,8 +1771,10 @@ fn run_decode_stage(
 /// straight to the output channel tagged with the extra stream's
 /// global index (starting at `extras_base`) — they bypass the rest of
 /// the frame-stage chain and land on the sink directly.
+#[allow(clippy::too_many_arguments)]
 fn run_frame_stage_worker(
     mut stage: FrameStage,
+    track: u32,
     rx: Receiver<Msg<Frame>>,
     tx: SyncSender<Msg<Frame>>,
     extras_tx: Option<SyncSender<Msg<OutputItem>>>,
@@ -1783,6 +1814,12 @@ fn run_frame_stage_worker(
                     let _ = etx.send(Msg::Barrier(b));
                 }
                 if tx.send(Msg::Barrier(b)).is_err() {
+                    break;
+                }
+            }
+            Ok(Msg::Reshape(mut r)) => {
+                reshape_stage(&mut stage, &mut r, track)?;
+                if tx.send(Msg::Reshape(r)).is_err() {
                     break;
                 }
             }
@@ -1863,6 +1900,7 @@ fn run_encode_stage(
                 encoder.send_frame(&frame)?;
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
             }
+            Ok(Msg::Reshape(r)) => check_encoder(&r, track_index)?,
             Ok(Msg::Barrier(b)) => {
                 // The encoder trait has no `reset()` today — flush
                 // anything pending and forward the barrier. A future
@@ -1923,6 +1961,9 @@ fn run_frame_fanout(
                     break;
                 }
             }
+            // A raw-frame sink has no reconfigure call: the frames
+            // after a reshape simply have the new shape.
+            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Eof) | Err(_) => break,
         }
     }

@@ -16,6 +16,7 @@ pub mod budget;
 pub mod dag;
 pub mod executor;
 pub mod failure;
+mod params_watch;
 mod pix_negotiate;
 mod preroll;
 pub mod schema;
@@ -41,6 +42,8 @@ pub use selection::{
 pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
 pub use stream_fit::{OutputKind, StreamSelection, select_streams};
+
+use params_watch::DecodedStream;
 
 use oxideav_core::{
     CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext, Frame,
@@ -94,10 +97,12 @@ enum RouteMode {
     Copy,
     Decode {
         decoder: Box<dyn Decoder>,
+        decoded: DecodedStream,
     },
     Transcode {
         decoder: Box<dyn Decoder>,
         encoder: Box<dyn Encoder>,
+        decoded: DecodedStream,
     },
 }
 
@@ -180,6 +185,39 @@ impl Pipeline {
         self.source.streams()
     }
 
+    /// The parameters of a bound source stream as the pipeline knows
+    /// them: for a route that decodes, the container's parameters with
+    /// the decoder's own report merged over them
+    /// ([`Decoder::output_params`] — cropped size, pixel layout,
+    /// sample format, …), kept current through mid-stream changes as
+    /// [`run`](Self::run) decodes; for a copy route, the container's.
+    /// `None` for a stream no sink is bound to.
+    ///
+    /// Frames carry no format fields by design — a frame's shape is
+    /// this stream description. A transcode route whose decoder
+    /// changes its output shape mid-stream (size, pixel or sample
+    /// format, rate, channels) fails [`run`](Self::run) with
+    /// [`Error::Unsupported`]: the encoder was opened for the former.
+    /// A decode route hands the sink the new-shape frames and updates
+    /// what this returns.
+    pub fn stream_params(&self, stream_index: u32) -> Option<&CodecParameters> {
+        let route = self
+            .routes
+            .iter()
+            .find(|r| r.source_stream == stream_index)?;
+        match &route.mode {
+            RouteMode::Copy => self
+                .source
+                .streams()
+                .iter()
+                .find(|s| s.index == stream_index)
+                .map(|s| &s.params),
+            RouteMode::Decode { decoded, .. } | RouteMode::Transcode { decoded, .. } => {
+                Some(&decoded.params)
+            }
+        }
+    }
+
     /// Bind a sink to a specific source stream by index.
     pub fn bind(&mut self, stream_index: u32, sink: Box<dyn Sink>) -> Result<()> {
         if self.prepared {
@@ -232,8 +270,10 @@ impl Pipeline {
             let ctx = stream_budget(&self.budget, route.media_type, has_video);
             match &mut route.mode {
                 RouteMode::Copy => {}
-                RouteMode::Decode { decoder } => decoder.set_execution_context(&ctx),
-                RouteMode::Transcode { decoder, encoder } => {
+                RouteMode::Decode { decoder, .. } => decoder.set_execution_context(&ctx),
+                RouteMode::Transcode {
+                    decoder, encoder, ..
+                } => {
                     decoder.set_execution_context(&ctx);
                     encoder.set_execution_context(&ctx);
                 }
@@ -272,15 +312,21 @@ impl Pipeline {
                     route.sink.write_packet(&pkt)?;
                     stats.packets_copied += 1;
                 }
-                RouteMode::Decode { decoder } => {
+                RouteMode::Decode { decoder, decoded } => {
                     decoder.send_packet(&pkt)?;
-                    drain_decoder_to_sink(&mut **decoder, &mut *route.sink, &mut stats)?;
+                    drain_decoder_to_sink(&mut **decoder, decoded, &mut *route.sink, &mut stats)?;
                 }
-                RouteMode::Transcode { decoder, encoder } => {
+                RouteMode::Transcode {
+                    decoder,
+                    encoder,
+                    decoded,
+                } => {
                     decoder.send_packet(&pkt)?;
                     drain_transcode_to_sink(
                         &mut **decoder,
                         &mut **encoder,
+                        decoded,
+                        route.source_stream,
                         &mut *route.sink,
                         &mut stats,
                     )?;
@@ -291,15 +337,21 @@ impl Pipeline {
         for route in &mut self.routes {
             match &mut route.mode {
                 RouteMode::Copy => {}
-                RouteMode::Decode { decoder } => {
+                RouteMode::Decode { decoder, decoded } => {
                     decoder.flush()?;
-                    drain_decoder_to_sink(&mut **decoder, &mut *route.sink, &mut stats)?;
+                    drain_decoder_to_sink(&mut **decoder, decoded, &mut *route.sink, &mut stats)?;
                 }
-                RouteMode::Transcode { decoder, encoder } => {
+                RouteMode::Transcode {
+                    decoder,
+                    encoder,
+                    decoded,
+                } => {
                     decoder.flush()?;
                     drain_transcode_to_sink(
                         &mut **decoder,
                         &mut **encoder,
+                        decoded,
+                        route.source_stream,
                         &mut *route.sink,
                         &mut stats,
                     )?;
@@ -330,12 +382,20 @@ impl Pipeline {
                     // handle the format difference (e.g. resample).
                     let decoder =
                         selection::make_decoder_with(&self.codecs, src_params, &self.prefs)?;
-                    Ok(RouteMode::Decode { decoder })
+                    let mut decoded = DecodedStream::new(src_params.clone());
+                    decoded.prime(&*decoder);
+                    Ok(RouteMode::Decode { decoder, decoded })
                 } else {
                     let decoder =
                         selection::make_decoder_with(&self.codecs, src_params, &self.prefs)?;
+                    let mut decoded = DecodedStream::new(src_params.clone());
+                    decoded.prime(&*decoder);
                     let encoder = selection::make_encoder_with(&self.codecs, target, &self.prefs)?;
-                    Ok(RouteMode::Transcode { decoder, encoder })
+                    Ok(RouteMode::Transcode {
+                        decoder,
+                        encoder,
+                        decoded,
+                    })
                 }
             }
         }
@@ -344,6 +404,7 @@ impl Pipeline {
 
 fn drain_decoder_to_sink(
     decoder: &mut dyn Decoder,
+    decoded: &mut DecodedStream,
     sink: &mut dyn Sink,
     stats: &mut PipelineStats,
 ) -> Result<()> {
@@ -351,6 +412,9 @@ fn drain_decoder_to_sink(
         match decoder.receive_frame() {
             Ok(frame) => {
                 stats.frames_decoded += 1;
+                // A raw-frame sink has no reconfigure call: the new
+                // shape is readable from `Pipeline::stream_params`.
+                let _ = decoded.observe(decoder);
                 sink.write_frame(&frame)?;
             }
             Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
@@ -362,6 +426,8 @@ fn drain_decoder_to_sink(
 fn drain_transcode_to_sink(
     decoder: &mut dyn Decoder,
     encoder: &mut dyn Encoder,
+    decoded: &mut DecodedStream,
+    stream_index: u32,
     sink: &mut dyn Sink,
     stats: &mut PipelineStats,
 ) -> Result<()> {
@@ -369,6 +435,9 @@ fn drain_transcode_to_sink(
         match decoder.receive_frame() {
             Ok(frame) => {
                 stats.frames_decoded += 1;
+                if let Some(r) = decoded.observe(decoder) {
+                    params_watch::check_encoder(&r, stream_index)?;
+                }
                 encoder.send_frame(&frame)?;
                 drain_encoder_to_sink(encoder, sink, stats)?;
             }
@@ -585,7 +654,6 @@ impl Adapt<'_> {
     /// shape after them (the encoder's input parameters).
     fn stages(
         &self,
-        decoder: &dyn Decoder,
         in_stream: &StreamInfo,
         output_codec: &str,
         prefs: &CodecPreferences,
@@ -595,11 +663,8 @@ impl Adapt<'_> {
         let mut stages = Vec::new();
         match running.media_type {
             MediaType::Video => {
-                // A container that declared no pixel layout leaves the
-                // decoder as the only authority on it.
-                if running.pixel_format.is_none() {
-                    running.pixel_format = decoder.output_pixel_format();
-                }
+                // `in_stream` already carries the decoder's report
+                // merged over the container's claim.
                 if let Some(cur) = running.pixel_format {
                     let target = pix_negotiate::encoder_input_format(
                         self.codecs,
@@ -699,13 +764,16 @@ fn transcode_routes(
             StreamPlan::Reencode { output_codec } => {
                 let mut decoder = selection::make_decoder_with(codecs, &in_stream.params, prefs)?;
                 decoder.set_execution_context(&stream_ctx);
+                // The decoder's report (cropped size, layout, sample
+                // format …) wins over the container's claim.
+                let mut decoded = DecodedStream::new(in_stream.params.clone());
+                decoded.prime(&*decoder);
                 // A video stream whose layout neither the container
                 // nor the decoder states yet: pre-roll to the first
                 // picture so the stages and the encoder are planned
                 // from a known one.
-                if in_stream.params.media_type == MediaType::Video
-                    && in_stream.params.pixel_format.is_none()
-                    && decoder.output_pixel_format().is_none()
+                if decoded.params.media_type == MediaType::Video
+                    && decoded.params.pixel_format.is_none()
                 {
                     let primed = preroll::prime_video_decoder(
                         decoder,
@@ -716,8 +784,13 @@ fn transcode_routes(
                     )?;
                     eof_during_preroll |= primed.eof;
                     decoder = primed.decoder;
+                    decoded.prime(&*decoder);
                 }
-                let (stages, shaped) = adapt.stages(&*decoder, in_stream, &output_codec, prefs)?;
+                let decoded_stream = StreamInfo {
+                    params: decoded.params.clone(),
+                    ..in_stream.clone()
+                };
+                let (stages, shaped) = adapt.stages(&decoded_stream, &output_codec, prefs)?;
                 let enc_params = build_encoder_params(
                     &output_codec,
                     &StreamInfo {
@@ -747,6 +820,7 @@ fn transcode_routes(
                 routes.push(TranscodeRoute::Reencode {
                     out_index,
                     decoder,
+                    decoded: Box::new(decoded),
                     stages,
                     encoder,
                 });
@@ -791,6 +865,7 @@ fn transcode_routes(
                     if let TranscodeRoute::Reencode {
                         out_index,
                         decoder,
+                        decoded,
                         stages,
                         encoder,
                     } = route
@@ -800,6 +875,7 @@ fn transcode_routes(
                             match decoder.receive_frame() {
                                 Ok(frame) => {
                                     stats.frames_decoded += 1;
+                                    follow_decoder(&**decoder, decoded, stages, *out_index)?;
                                     for f in run_stages(stages, frame)? {
                                         encoder.send_frame(&f)?;
                                     }
@@ -829,6 +905,22 @@ fn transcode_routes(
 
     muxer.write_trailer()?;
     Ok(stats)
+}
+
+/// After a successful `receive_frame` on a re-encode route: merge the
+/// decoder's report and, on a shape change, re-plan the conversion
+/// stages — or fail with [`Error::Unsupported`] when the encoder would
+/// have to follow (see `params_watch`).
+fn follow_decoder(
+    decoder: &dyn Decoder,
+    decoded: &mut DecodedStream,
+    stages: &mut [executor::FrameStage],
+    out_index: u32,
+) -> Result<()> {
+    match decoded.observe(decoder) {
+        Some(r) => params_watch::reshape_chain(stages, r, true, out_index).map_err(|f| f.error),
+        None => Ok(()),
+    }
 }
 
 /// Push `frame` through every stage in order; returns what reaches
@@ -895,6 +987,9 @@ enum TranscodeRoute {
     Reencode {
         out_index: u32,
         decoder: Box<dyn Decoder>,
+        /// The input stream's parameters with the decoder's report
+        /// merged in, kept current per frame.
+        decoded: Box<DecodedStream>,
         /// Format adaptation between decoder and encoder.
         stages: Vec<executor::FrameStage>,
         encoder: Box<dyn Encoder>,
@@ -919,6 +1014,7 @@ fn process_packet(
         TranscodeRoute::Reencode {
             out_index,
             decoder,
+            decoded,
             stages,
             encoder,
         } => {
@@ -927,6 +1023,7 @@ fn process_packet(
                 match decoder.receive_frame() {
                     Ok(frame) => {
                         stats.frames_decoded += 1;
+                        follow_decoder(&**decoder, decoded, stages, *out_index)?;
                         for f in run_stages(stages, frame)? {
                             encoder.send_frame(&f)?;
                         }

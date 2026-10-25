@@ -374,6 +374,17 @@ impl Decoder for FallbackDecoder {
     fn output_pixel_format(&self) -> Option<PixelFormat> {
         self.current.output_pixel_format()
     }
+
+    // A swap only happens before the first frame, where resolving the
+    // description is not a change: forwarding the current decoder's
+    // answer and generation keeps the contract.
+    fn output_params(&self) -> Option<CodecParameters> {
+        self.current.output_params()
+    }
+
+    fn output_params_generation(&self) -> u64 {
+        self.current.output_params_generation()
+    }
 }
 
 /// Free-function shorthand for encoder construction with default prefs.

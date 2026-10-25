@@ -107,6 +107,31 @@ default (`false`) keeps the historical partial-file-stays behaviour,
 which is the debugging-friendly choice. See
 `tests/discard_failed_outputs.rs`.
 
+## Decoder-reported stream parameters
+
+Frames carry no width / height / pixel format / sample format / rate
+by design — the stream's `CodecParameters` describe them. The
+container's claim is only a first guess: wherever the pipeline builds a
+decoder (`transcode_simple*`, `Pipeline` routes, the serial and
+pipelined executor, the unlabelled-video pre-roll) it merges the
+decoder's own report (`Decoder::output_params`, oxideav-core 0.1.42)
+over the stream parameters right after construction, so the
+conversion stages, the encoder and the sink's `start()` are planned
+from what the decoder actually emits (cropped size, layout, sample
+format). After every `receive_frame` an `OutputParamsWatch` compares
+one integer (`output_params_generation`). A mid-stream change:
+
+* is absorbed by a pixel-format conversion stage, which re-plans its
+  source side (new layout / size in, same layout out);
+* fails the track with `Error::Unsupported` (naming both shapes) when
+  it would reach a filter or an encoder whose input shape changes —
+  e.g. a resolution switch under a re-encode;
+* reaches a raw-frame sink as frames of the new shape; the merged
+  parameters are readable from `Pipeline::stream_params(index)`.
+
+The pre-roll to the first picture still runs for decoders that answer
+`None` until they have decoded something.
+
 ## Codec thread budgets
 
 `oxideav-core` codecs run serial until they are handed an

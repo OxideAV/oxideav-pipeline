@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Decoder-reported stream parameters (oxideav-core 0.1.42
+  `Decoder::output_params` / `OutputParamsWatch`). Every decoder the
+  pipeline builds — `transcode_simple*`, `Pipeline` routes, the serial
+  and pipelined executor, the unlabelled-video pre-roll — has its
+  report merged over the container's stream parameters right after
+  construction, so conversion stages, encoder parameters and the
+  sink's `start()` streams are planned from what the decoder emits
+  (cropped size, pixel layout, sample format) rather than the
+  container's claim; the watch is observed after every
+  `receive_frame` (one integer compare per frame). A mid-stream change
+  re-plans pixel-format conversion stages; a change a filter or an
+  encoder would have to follow fails with `Error::Unsupported` naming
+  both shapes; raw-frame sinks receive the new-shape frames.
+- `Pipeline::stream_params(index)`: a bound stream's parameters with
+  the decoder's report merged in, kept current through `run`.
+
+### Changed
+
+- The pre-roll wrapper and the hardware-fallback decoder forward
+  `output_params` / `output_params_generation` to the decoder they
+  wrap; the pre-roll is skipped whenever `output_params` already
+  states the layout (it stays the fallback for decoders that answer
+  `None`).
+
 ## [0.1.14](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.13...v0.1.14) - 2026-10-25
 
 ### Other
