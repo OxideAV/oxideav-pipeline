@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.15](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.14...v0.1.15) - 2026-10-25
+
+### Other
+
+- Merge decoder-reported parameters into the stream at every decoder site; follow mid-stream changes
+
 ### Added
 
 - Decoder-reported stream parameters (oxideav-core 0.1.42
