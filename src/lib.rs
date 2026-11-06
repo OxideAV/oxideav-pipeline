@@ -43,7 +43,7 @@ pub use sinks::{FileSink, NullSink};
 pub use staged::{BarrierKind, ChannelCaps, Progress, SeekCmd};
 pub use stream_fit::{OutputKind, StreamSelection, select_streams};
 
-use params_watch::DecodedStream;
+use params_watch::{DecodedStream, EncoderFeed};
 
 use oxideav_core::{
     CodecParameters, CodecRegistry, Decoder, Demuxer, Encoder, Error, ExecutionContext, Frame,
@@ -83,11 +83,26 @@ pub trait Sink: Send {
     /// Copy path: receive a raw encoded packet.
     fn write_packet(&mut self, pkt: &Packet) -> Result<()>;
 
-    /// Decoded/transcoded path: receive a decoded frame.
+    /// Decoded/transcoded path: receive a decoded media frame. The
+    /// in-band [`Frame::StreamParams`] event never arrives here — it
+    /// goes to [`stream_params`](Sink::stream_params).
     fn write_frame(&mut self, frame: &Frame) -> Result<()>;
 
     /// Called once after all data has been sent through this sink.
     fn flush(&mut self) -> Result<()>;
+
+    /// The stream changed its parameters mid-stream: `params`
+    /// describes every frame (decode route) or packet (transcode route
+    /// whose encoder re-configured for the new input) from the next
+    /// one on. Called once per change, in order with the frames /
+    /// packets, from the in-band [`Frame::StreamParams`] event — which
+    /// is never handed to [`write_frame`](Sink::write_frame). The same
+    /// parameters stay readable from [`Pipeline::stream_params`].
+    ///
+    /// Default: no-op — the frames after it simply have the new shape.
+    fn stream_params(&mut self, _params: &CodecParameters) -> Result<()> {
+        Ok(())
+    }
 }
 
 // ───────────────────────── Pipeline ──────────────────────────
@@ -103,6 +118,7 @@ enum RouteMode {
         decoder: Box<dyn Decoder>,
         encoder: Box<dyn Encoder>,
         decoded: DecodedStream,
+        feed: Box<EncoderFeed>,
     },
 }
 
@@ -194,12 +210,16 @@ impl Pipeline {
     /// `None` for a stream no sink is bound to.
     ///
     /// Frames carry no format fields by design — a frame's shape is
-    /// this stream description. A transcode route whose decoder
-    /// changes its output shape mid-stream (size, pixel or sample
-    /// format, rate, channels) fails [`run`](Self::run) with
-    /// [`Error::Unsupported`]: the encoder was opened for the former.
-    /// A decode route hands the sink the new-shape frames and updates
-    /// what this returns.
+    /// this stream description. When the decoder changes its output
+    /// shape mid-stream (size, pixel or sample format, rate, channels)
+    /// — announced by its [`Frame::StreamParams`] event, or by its
+    /// generation counter for a decoder that emits none — a decode
+    /// route tells the sink ([`Sink::stream_params`]) before the first
+    /// new-shape frame; a transcode route hands the event to the
+    /// encoder, and fails [`run`](Self::run) with
+    /// [`Error::Unsupported`] naming both shapes when the encoder
+    /// cannot re-configure. Either way this returns the new
+    /// parameters.
     pub fn stream_params(&self, stream_index: u32) -> Option<&CodecParameters> {
         let route = self
             .routes
@@ -320,12 +340,14 @@ impl Pipeline {
                     decoder,
                     encoder,
                     decoded,
+                    feed,
                 } => {
                     decoder.send_packet(&pkt)?;
                     drain_transcode_to_sink(
                         &mut **decoder,
                         &mut **encoder,
                         decoded,
+                        feed,
                         route.source_stream,
                         &mut *route.sink,
                         &mut stats,
@@ -345,12 +367,14 @@ impl Pipeline {
                     decoder,
                     encoder,
                     decoded,
+                    feed,
                 } => {
                     decoder.flush()?;
                     drain_transcode_to_sink(
                         &mut **decoder,
                         &mut **encoder,
                         decoded,
+                        feed,
                         route.source_stream,
                         &mut *route.sink,
                         &mut stats,
@@ -391,10 +415,12 @@ impl Pipeline {
                     let mut decoded = DecodedStream::new(src_params.clone());
                     decoded.prime(&*decoder);
                     let encoder = selection::make_encoder_with(&self.codecs, target, &self.prefs)?;
+                    let feed = Box::new(EncoderFeed::new(decoded.params.clone(), &*encoder));
                     Ok(RouteMode::Transcode {
                         decoder,
                         encoder,
                         decoded,
+                        feed,
                     })
                 }
             }
@@ -411,11 +437,16 @@ fn drain_decoder_to_sink(
     loop {
         match decoder.receive_frame() {
             Ok(frame) => {
-                stats.frames_decoded += 1;
-                // A raw-frame sink has no reconfigure call: the new
-                // shape is readable from `Pipeline::stream_params`.
-                let _ = decoded.observe(decoder);
-                sink.write_frame(&frame)?;
+                let followed = decoded.follow(decoder, frame);
+                if let Some(ev) = &followed.event
+                    && let Some(p) = ev.stream_params()
+                {
+                    sink.stream_params(p)?;
+                }
+                if let Some(frame) = followed.frame {
+                    stats.frames_decoded += 1;
+                    sink.write_frame(&frame)?;
+                }
             }
             Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
             Err(e) => return Err(e),
@@ -427,6 +458,7 @@ fn drain_transcode_to_sink(
     decoder: &mut dyn Decoder,
     encoder: &mut dyn Encoder,
     decoded: &mut DecodedStream,
+    feed: &mut EncoderFeed,
     stream_index: u32,
     sink: &mut dyn Sink,
     stats: &mut PipelineStats,
@@ -434,11 +466,15 @@ fn drain_transcode_to_sink(
     loop {
         match decoder.receive_frame() {
             Ok(frame) => {
-                stats.frames_decoded += 1;
-                if let Some(r) = decoded.observe(decoder) {
-                    params_watch::check_encoder(&r, stream_index)?;
+                let followed = decoded.follow(decoder, frame);
+                if followed.has_media() {
+                    stats.frames_decoded += 1;
                 }
-                encoder.send_frame(&frame)?;
+                for f in followed {
+                    if let Some(out) = feed.send(encoder, &f, stream_index)? {
+                        sink.stream_params(&out)?;
+                    }
+                }
                 drain_encoder_to_sink(encoder, sink, stats)?;
             }
             Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
@@ -700,10 +736,9 @@ impl Adapt<'_> {
                         let out_port = filter.output_ports().first().cloned().ok_or_else(|| {
                             Error::invalid(format!("filter '{name}' declares zero output ports"))
                         })?;
+                        let filter = executor::RuntimeFilter::new(filter, &running, false);
                         running = port_params_to_codec_params(&out_port.params, &running);
-                        stages.push(FrameStage::Filter(executor::RuntimeFilter {
-                            inner: filter,
-                        }));
+                        stages.push(FrameStage::Filter(filter));
                     }
                 }
             }
@@ -791,6 +826,7 @@ fn transcode_routes(
                     ..in_stream.clone()
                 };
                 let (stages, shaped) = adapt.stages(&decoded_stream, &output_codec, prefs)?;
+                let shaped_input = shaped.clone();
                 let enc_params = build_encoder_params(
                     &output_codec,
                     &StreamInfo {
@@ -800,6 +836,7 @@ fn transcode_routes(
                 )?;
                 let mut encoder = selection::make_encoder_with(codecs, &enc_params, prefs)?;
                 encoder.set_execution_context(&stream_ctx);
+                let feed = EncoderFeed::new(shaped_input, &*encoder);
                 let out_params = encoder.output_params().clone();
                 let out_index = out_streams.len() as u32;
                 let out_time_base = match out_params.media_type {
@@ -823,6 +860,7 @@ fn transcode_routes(
                     decoded: Box::new(decoded),
                     stages,
                     encoder,
+                    feed: Box::new(feed),
                 });
             }
         }
@@ -868,16 +906,21 @@ fn transcode_routes(
                         decoded,
                         stages,
                         encoder,
+                        feed,
                     } = route
                     {
                         decoder.flush()?;
                         loop {
                             match decoder.receive_frame() {
                                 Ok(frame) => {
-                                    stats.frames_decoded += 1;
-                                    follow_decoder(&**decoder, decoded, stages, *out_index)?;
-                                    for f in run_stages(stages, frame)? {
-                                        encoder.send_frame(&f)?;
+                                    let followed = decoded.follow(&**decoder, frame);
+                                    if followed.has_media() {
+                                        stats.frames_decoded += 1;
+                                    }
+                                    for f in followed {
+                                        for f in run_stages(stages, f, *out_index)? {
+                                            feed.send(&mut **encoder, &f, *out_index)?;
+                                        }
                                     }
                                     drain_encoder(
                                         &mut **encoder,
@@ -890,8 +933,8 @@ fn transcode_routes(
                                 Err(e) => return Err(e),
                             }
                         }
-                        for f in flush_stages(stages)? {
-                            encoder.send_frame(&f)?;
+                        for f in flush_stages(stages, *out_index)? {
+                            feed.send(&mut **encoder, &f, *out_index)?;
                         }
                         encoder.flush()?;
                         drain_encoder(&mut **encoder, *out_index, &mut *muxer, &mut stats)?;
@@ -907,30 +950,15 @@ fn transcode_routes(
     Ok(stats)
 }
 
-/// After a successful `receive_frame` on a re-encode route: merge the
-/// decoder's report and, on a shape change, re-plan the conversion
-/// stages — or fail with [`Error::Unsupported`] when the encoder would
-/// have to follow (see `params_watch`).
-fn follow_decoder(
-    decoder: &dyn Decoder,
-    decoded: &mut DecodedStream,
-    stages: &mut [executor::FrameStage],
-    out_index: u32,
-) -> Result<()> {
-    match decoded.observe(decoder) {
-        Some(r) => params_watch::reshape_chain(stages, r, true, out_index).map_err(|f| f.error),
-        None => Ok(()),
-    }
-}
-
-/// Push `frame` through every stage in order; returns what reaches
-/// the end of the chain.
-fn run_stages(stages: &mut [executor::FrameStage], frame: Frame) -> Result<Vec<Frame>> {
+/// Push `frame` (a media frame or a stream-parameters event, which
+/// re-plans each stage it passes — see `params_watch`) through every
+/// stage in order; returns what reaches the end of the chain.
+fn run_stages(stages: &mut [executor::FrameStage], frame: Frame, track: u32) -> Result<Vec<Frame>> {
     let mut frames = vec![frame];
     for stage in stages.iter_mut() {
         let mut next = Vec::new();
         for f in frames {
-            next.extend(executor::run_frame_stage_emit(stage, f)?.primary);
+            next.extend(executor::run_frame_stage_emit(stage, f, track)?.primary);
         }
         frames = next;
     }
@@ -939,12 +967,12 @@ fn run_stages(stages: &mut [executor::FrameStage], frame: Frame) -> Result<Vec<F
 
 /// Flush every stage in order, carrying each stage's tail through the
 /// stages after it.
-fn flush_stages(stages: &mut [executor::FrameStage]) -> Result<Vec<Frame>> {
+fn flush_stages(stages: &mut [executor::FrameStage], track: u32) -> Result<Vec<Frame>> {
     let mut out = Vec::new();
     for i in 0..stages.len() {
         let tail = executor::flush_frame_stage_emit(&mut stages[i])?.primary;
         for f in tail {
-            out.extend(run_stages(&mut stages[i + 1..], f)?);
+            out.extend(run_stages(&mut stages[i + 1..], f, track)?);
         }
     }
     Ok(out)
@@ -993,6 +1021,9 @@ enum TranscodeRoute {
         /// Format adaptation between decoder and encoder.
         stages: Vec<executor::FrameStage>,
         encoder: Box<dyn Encoder>,
+        /// The encoder's input side (decides whether a
+        /// stream-parameters event reaches it).
+        feed: Box<EncoderFeed>,
     },
 }
 
@@ -1017,15 +1048,24 @@ fn process_packet(
             decoded,
             stages,
             encoder,
+            feed,
         } => {
             decoder.send_packet(pkt)?;
             loop {
                 match decoder.receive_frame() {
                     Ok(frame) => {
-                        stats.frames_decoded += 1;
-                        follow_decoder(&**decoder, decoded, stages, *out_index)?;
-                        for f in run_stages(stages, frame)? {
-                            encoder.send_frame(&f)?;
+                        let followed = decoded.follow(&**decoder, frame);
+                        if followed.has_media() {
+                            stats.frames_decoded += 1;
+                        }
+                        for f in followed {
+                            for f in run_stages(stages, f, *out_index)? {
+                                // The muxer has no call to re-state a
+                                // stream mid-file: an encoder that
+                                // re-configured keeps writing into the
+                                // stream it opened.
+                                feed.send(&mut **encoder, &f, *out_index)?;
+                            }
                         }
                         drain_encoder(&mut **encoder, *out_index, muxer, stats)?;
                     }

@@ -985,6 +985,8 @@ fn time_decode(
         sent += 1;
         loop {
             match dec.receive_frame() {
+                // A stream-parameters event is not a decoded picture.
+                Ok(f) if f.is_stream_params() => {}
                 Ok(_) => frames_out += 1,
                 Err(oxideav_core::Error::NeedMore) | Err(oxideav_core::Error::Eof) => break,
                 Err(e) => return error_result(id, imp, BenchSide::Decode, format!("recv: {e}")),
@@ -992,8 +994,10 @@ fn time_decode(
         }
     }
     let _ = dec.flush();
-    while dec.receive_frame().is_ok() {
-        frames_out += 1;
+    while let Ok(f) = dec.receive_frame() {
+        if !f.is_stream_params() {
+            frames_out += 1;
+        }
     }
     let elapsed = start.elapsed().as_secs_f64();
     let fps = if elapsed > 0.0 {

@@ -47,7 +47,7 @@ use crate::executor::{
     frame_stage_failure_kind, run_frame_stage_emit,
 };
 use crate::failure::{FailureStage, StageFailure, StageResult, attribute};
-use crate::params_watch::{DecodedStream, Reshape, check_encoder, reshape_stage};
+use crate::params_watch::{DecodedStream, EncoderFeed, SinkFeed};
 
 /// Flow-barrier kind in [`Msg::Barrier`]. Broadcast by the demuxer
 /// stage when it receives a [`SeekCmd`] from the
@@ -442,17 +442,11 @@ impl QueueBudget {
 /// * `Data` — payload (packet/frame).
 /// * `Barrier` — flow-control marker. Today only `SeekFlush` is in use;
 ///   workers reset codec/filter state and forward unchanged.
-/// * `Reshape` — frame channels only: the decoder's output shape
-///   changed (or was first resolved) and the frames after it have the
-///   new one. Each frame stage re-plans itself and forwards the shape
-///   of its own output; an encoder that cannot follow fails the track
-///   (see [`crate::params_watch`]).
 /// * `Eof` — in-band end-of-stream so downstream stages can flush state
 ///   before exiting.
 enum Msg<T> {
     Data(T),
     Barrier(BarrierKind),
-    Reshape(Reshape),
     Eof,
 }
 
@@ -792,6 +786,9 @@ pub(crate) fn run_pipelined_inner(
         };
         let frame_stages = std::mem::take(&mut pl.frame_stages);
         let encoder = pl.encoder.take();
+        let encoder_feed = pl.encoder_feed.take();
+        let sink_feed = pl.sink_feed.clone();
+        let encoder_input = pl.input_params.clone();
 
         // Count extras as we go: the first filter stage on this track
         // starts at the track's `extras_base_for_this_track`, the next
@@ -860,8 +857,11 @@ pub(crate) fn run_pipelined_inner(
                 FailureStage::Encode,
                 Some(track_idx as u32),
                 move |abort| {
+                    let feed =
+                        encoder_feed.unwrap_or_else(|| EncoderFeed::new(encoder_input, &*enc));
                     run_encode_stage(
                         enc,
+                        feed,
                         upstream,
                         out_tx,
                         track_idx as u32,
@@ -884,7 +884,9 @@ pub(crate) fn run_pipelined_inner(
                 name,
                 FailureStage::Sink,
                 Some(track_idx as u32),
-                move |abort| run_frame_fanout(upstream, out_tx, track_idx as u32, kind, abort),
+                move |abort| {
+                    run_frame_fanout(sink_feed, upstream, out_tx, track_idx as u32, kind, abort)
+                },
             ));
         }
     }
@@ -1067,6 +1069,19 @@ pub(crate) fn run_pipelined_inner(
                                 break;
                             }
                         }
+                        // The in-band stream-parameters event is the
+                        // sink's `stream_params` call, never a frame.
+                        OutputPayload::Frame(Frame::StreamParams(p)) => {
+                            if let Err(e) = sink.stream_params(item.kind, &p) {
+                                abort.record_failure(StageFailure::new(
+                                    FailureStage::Sink,
+                                    Some(item.track_index),
+                                    e,
+                                ));
+                                break;
+                            }
+                            continue;
+                        }
                         OutputPayload::Frame(f) => {
                             if let Err(e) = sink.write_frame(item.kind, &f) {
                                 abort.record_failure(StageFailure::new(
@@ -1098,8 +1113,6 @@ pub(crate) fn run_pipelined_inner(
                         });
                     }
                 }
-                // Reshape travels on frame channels only.
-                Ok(Msg::Reshape(_)) => {}
                 Ok(Msg::Barrier(kind)) => {
                     made_progress = true;
                     if let Err(e) = sink.barrier(kind) {
@@ -1535,7 +1548,11 @@ fn run_frame_source_stage(
         }
         match src.next_frame() {
             Ok(frame) => {
-                counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                // A source's stream-parameters event flows down the
+                // tracks like a decoder's; it is not a frame produced.
+                if !frame.is_stream_params() {
+                    counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                }
                 for tx in &routes {
                     if tx.send(Msg::Data(frame.clone())).is_err() {
                         abort.abort.store(true, Ordering::SeqCst);
@@ -1586,8 +1603,6 @@ fn run_copy_stage(
                 }
                 counters.packets_copied.fetch_add(1, Ordering::SeqCst);
             }
-            // Reshape travels on frame channels only.
-            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Barrier(b)) => {
                 // Copy stages have no internal state — just forward.
                 if out_tx.send(Msg::Barrier(b)).is_err() {
@@ -1663,15 +1678,11 @@ fn run_decode_stage(
                     }
                     match decoder.receive_frame() {
                         Ok(frame) => {
-                            counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
-                            produced_any = true;
-                            if let Some(r) = decoded.as_mut().and_then(|d| d.observe(&*decoder))
-                                && tx.send(Msg::Reshape(r)).is_err()
-                            {
-                                abort.abort.store(true, Ordering::SeqCst);
-                                break 'outer;
+                            if !frame.is_stream_params() {
+                                counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
+                                produced_any = true;
                             }
-                            if tx.send(Msg::Data(frame)).is_err() {
+                            if !send_followed(&mut decoded, &*decoder, frame, &tx) {
                                 abort.abort.store(true, Ordering::SeqCst);
                                 break 'outer;
                             }
@@ -1710,8 +1721,6 @@ fn run_decode_stage(
                     }
                 }
             }
-            // Reshape travels on frame channels only.
-            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Barrier(b)) => {
                 // SeekFlush: drop any in-flight buffered frames + reset
                 // codec state so reference frames from the pre-seek
@@ -1737,13 +1746,10 @@ fn run_decode_stage(
                     }
                     match decoder.receive_frame() {
                         Ok(frame) => {
-                            counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
-                            if let Some(r) = decoded.as_mut().and_then(|d| d.observe(&*decoder))
-                                && tx.send(Msg::Reshape(r)).is_err()
-                            {
-                                break 'outer;
+                            if !frame.is_stream_params() {
+                                counters.frames_decoded.fetch_add(1, Ordering::SeqCst);
                             }
-                            if tx.send(Msg::Data(frame)).is_err() {
+                            if !send_followed(&mut decoded, &*decoder, frame, &tx) {
                                 break 'outer;
                             }
                         }
@@ -1761,6 +1767,25 @@ fn run_decode_stage(
     }
     let _ = tx.send(Msg::Eof);
     Ok(())
+}
+
+/// Fold one frame the decoder returned into the stream parameters and
+/// send what goes downstream — the stream-parameters event first when
+/// the shape moved, then the media frame (see
+/// [`DecodedStream::follow`]). `false` when the receiver is gone.
+fn send_followed(
+    decoded: &mut Option<DecodedStream>,
+    decoder: &dyn Decoder,
+    frame: Frame,
+    tx: &SyncSender<Msg<Frame>>,
+) -> bool {
+    match decoded {
+        Some(d) => d
+            .follow(decoder, frame)
+            .into_iter()
+            .all(|f| tx.send(Msg::Data(f)).is_ok()),
+        None => tx.send(Msg::Data(frame)).is_ok(),
+    }
 }
 
 /// Frame-stage worker: consumes frames, runs them through an audio
@@ -1787,7 +1812,7 @@ fn run_frame_stage_worker(
         }
         match rx.recv() {
             Ok(Msg::Data(frame)) => {
-                let emissions = run_frame_stage_emit(&mut stage, frame)?;
+                let emissions = run_frame_stage_emit(&mut stage, frame, track)?;
                 dispatch_extras(&emissions, &extras_tx, extras_base, &abort);
                 for o in emissions.primary {
                     if tx.send(Msg::Data(o)).is_err() {
@@ -1814,12 +1839,6 @@ fn run_frame_stage_worker(
                     let _ = etx.send(Msg::Barrier(b));
                 }
                 if tx.send(Msg::Barrier(b)).is_err() {
-                    break;
-                }
-            }
-            Ok(Msg::Reshape(mut r)) => {
-                reshape_stage(&mut stage, &mut r, track)?;
-                if tx.send(Msg::Reshape(r)).is_err() {
                     break;
                 }
             }
@@ -1882,8 +1901,10 @@ fn dispatch_extras(
 }
 
 /// Encoder stage: frames -> packets -> OutputItem.
+#[allow(clippy::too_many_arguments)]
 fn run_encode_stage(
     mut encoder: Box<dyn Encoder>,
+    mut feed: EncoderFeed,
     rx: Receiver<Msg<Frame>>,
     out_tx: SyncSender<Msg<OutputItem>>,
     track_index: u32,
@@ -1897,10 +1918,23 @@ fn run_encode_stage(
         }
         match rx.recv() {
             Ok(Msg::Data(frame)) => {
-                encoder.send_frame(&frame)?;
+                // A stream-parameters event reaches the encoder only
+                // when its input shape really changes; one that
+                // re-configured into a new output description is
+                // announced to the sink in order with its packets.
+                if let Some(out) = feed.send(encoder.as_mut(), &frame, track_index)?
+                    && out_tx
+                        .send(Msg::Data(OutputItem {
+                            track_index,
+                            kind,
+                            payload: OutputPayload::Frame(Frame::StreamParams(Box::new(out))),
+                        }))
+                        .is_err()
+                {
+                    break;
+                }
                 drain_and_send(encoder.as_mut(), &out_tx, track_index, kind, &counters)?;
             }
-            Ok(Msg::Reshape(r)) => check_encoder(&r, track_index)?,
             Ok(Msg::Barrier(b)) => {
                 // The encoder trait has no `reset()` today — flush
                 // anything pending and forward the barrier. A future
@@ -1933,6 +1967,7 @@ fn run_encode_stage(
 /// Frame fan-out (no encoder): just forwards raw frames to the mux /
 /// sink. Used when the output sink is something like the SDL2 player.
 fn run_frame_fanout(
+    mut feed: SinkFeed,
     rx: Receiver<Msg<Frame>>,
     out_tx: SyncSender<Msg<OutputItem>>,
     track_index: u32,
@@ -1945,6 +1980,16 @@ fn run_frame_fanout(
         }
         match rx.recv() {
             Ok(Msg::Data(f)) => {
+                // A stream-parameters event goes on (to the sink's
+                // `stream_params` hook) only when it changes what the
+                // sink was told.
+                let f = match f.stream_params() {
+                    Some(p) => match feed.update(p) {
+                        Some(p) => Frame::StreamParams(Box::new(p.clone())),
+                        None => continue,
+                    },
+                    None => f,
+                };
                 if out_tx
                     .send(Msg::Data(OutputItem {
                         track_index,
@@ -1961,9 +2006,6 @@ fn run_frame_fanout(
                     break;
                 }
             }
-            // A raw-frame sink has no reconfigure call: the frames
-            // after a reshape simply have the new shape.
-            Ok(Msg::Reshape(_)) => {}
             Ok(Msg::Eof) | Err(_) => break,
         }
     }

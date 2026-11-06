@@ -118,16 +118,38 @@ decoder's own report (`Decoder::output_params`, oxideav-core 0.1.42)
 over the stream parameters right after construction, so the
 conversion stages, the encoder and the sink's `start()` are planned
 from what the decoder actually emits (cropped size, layout, sample
-format). After every `receive_frame` an `OutputParamsWatch` compares
-one integer (`output_params_generation`). A mid-stream change:
+format).
 
-* is absorbed by a pixel-format conversion stage, which re-plans its
-  source side (new layout / size in, same layout out);
-* fails the track with `Error::Unsupported` (naming both shapes) when
-  it would reach a filter or an encoder whose input shape changes —
-  e.g. a resolution switch under a re-encode;
-* reaches a raw-frame sink as frames of the new shape; the merged
-  parameters are readable from `Pipeline::stream_params(index)`.
+### Mid-stream changes: the `Frame::StreamParams` event
+
+A decoder whose output shape changes mid-stream says so two ways that
+always agree (oxideav-core 0.1.43): `output_params_generation()` moves
+and, for a decoder that emits it, `receive_frame` returns one
+`Frame::StreamParams` right before the first frame of the new shape.
+The pipeline folds the event into the stream's parameters
+(`OutputParamsWatch::observe_frame`); for a decoder that emits none it
+notices the generation move (one integer compare per frame) and
+synthesises the event itself. Either way exactly one event per change
+travels down the track, in order with the frames:
+
+| stage | what it does with the event |
+|---|---|
+| pixel-format conversion (explicit or auto-inserted) | re-plans its source side (new layout / size in, same layout out) and forwards the event restated for its output |
+| filter | hands it to the `StreamFilter`, which re-plans (emitting its own event when its output changes) or refuses; a pass-through filter that swallows it still has it forwarded |
+| auto-inserted resample / downmix / sample-format stage | a filter like the above: one that re-plans for the new input keeps its output at the encoder's shape, so the encoder behind it sees no change |
+| encoder | handed the event only when its input shape really changes; one that re-configures carries on and the sink is told its new output parameters |
+| raw-frame sink | told through `JobSink::stream_params` / `Sink::stream_params` (default no-op) — never through `write_frame` |
+
+A filter or encoder that cannot follow a real change fails the run
+with `Error::Unsupported` naming both shapes, attributed to that stage
+(`FailureStage::Filter` / `Encode`); the pipeline neither re-opens the
+encoder nor inserts a scaler behind the caller's back. Filling in a
+field the plan did not know never fails. A muxer-backed output keeps
+the stream header it already wrote (core's `Muxer` has no call to
+re-state a stream mid-file). The merged parameters stay readable from
+`Pipeline::stream_params(index)`. Pinned by
+`tests/stream_params_event.rs` (emitting and generation-only decoders,
+serial and pipelined, `transcode_simple*`, `Pipeline` routes).
 
 The pre-roll to the first picture still runs for decoders that answer
 `None` until they have decoded something.

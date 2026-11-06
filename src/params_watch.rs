@@ -1,39 +1,54 @@
-//! Decoder-reported stream parameters, merged into the stream.
+//! Decoder-reported stream parameters, merged into the stream, and the
+//! in-band [`Frame::StreamParams`] event that carries a mid-stream
+//! change down a track.
 //!
 //! Frames carry no width / height / pixel format / sample format /
 //! rate by design: those live in the stream's [`CodecParameters`]. The
 //! container's claim is only a first guess — the decoder knows what it
 //! actually emits ([`Decoder::output_params`]) and says when that
-//! changes mid-stream ([`Decoder::output_params_generation`]). Every
-//! place this crate builds a decoder keeps a [`DecodedStream`]:
-//! [`prime`](DecodedStream::prime) right after construction, before any
-//! stage downstream is planned, then
-//! [`observe`](DecodedStream::observe) after every `receive_frame` —
-//! one integer compare per frame while nothing changes.
+//! changes mid-stream, two ways that always agree: the
+//! [`Decoder::output_params_generation`] counter moves, and a decoder
+//! that emits it returns a `Frame::StreamParams` event immediately
+//! before the first frame of the new shape.
 //!
-//! A change of the shape the downstream stages were planned for is
-//! handed to them as a [`Reshape`]:
+//! Every place this crate builds a decoder keeps a [`DecodedStream`]:
+//! [`prime`](DecodedStream::prime) right after construction, before any
+//! stage downstream is planned, then [`follow`](DecodedStream::follow)
+//! on every frame `receive_frame` returns. `follow` folds the decoder's
+//! event into the stream ([`OutputParamsWatch::observe_frame`]) — or,
+//! for a decoder that does not emit one, notices the generation move
+//! ([`OutputParamsWatch::observe`]) and synthesises the event itself —
+//! so the stages downstream always see exactly one event per change,
+//! in place, whichever kind of decoder sits upstream (one integer
+//! compare per frame while nothing changes).
+//!
+//! Downstream of the decoder the event travels with the frames:
 //!
 //! * a pixel-format conversion stage re-plans its source side (new
-//!   layout / size in, the same layout out), so whatever follows it is
-//!   unaffected;
-//! * a filter stage, and an encoder whose input shape would change,
-//!   cannot follow: the run fails with [`Error::Unsupported`] naming
-//!   the old and the new shape;
-//! * a raw-frame sink receives the frames in their new shape (the sink
-//!   contracts have no reconfigure call); the merged parameters stay
-//!   readable from the stream.
+//!   layout / size in, the same layout out) and forwards the event
+//!   restated for its own output;
+//! * a filter stage hands it to the [`StreamFilter`](oxideav_core::StreamFilter),
+//!   which re-plans (forwarding its own event when its output changes)
+//!   or refuses; a refusal of a change the filter's plan depends on
+//!   fails the run with [`Error::Unsupported`] naming both shapes (see
+//!   `RuntimeFilter` for the pass-through and fill-in cases);
+//! * an encoder is handed the event only when its input shape really
+//!   changes ([`EncoderFeed`]); one that re-configures carries on, one
+//!   that refuses fails the run with [`Error::Unsupported`] naming both
+//!   shapes — the pipeline neither re-opens the encoder nor inserts a
+//!   scaler behind the caller's back;
+//! * a raw-frame sink is told through its stream-parameters hook, never
+//!   through its frame-writing call ([`SinkFeed`]); a sink downstream of
+//!   an encoder that re-configured is told the encoder's new output
+//!   parameters.
 //!
-//! Filling a field the plan did not know (`None` → `Some`) re-plans the
-//! conversion stages the same way but never fails.
+//! Filling a field the plan did not know (`None` → `Some`) travels the
+//! same way but never fails.
 
 use oxideav_core::{
-    CodecParameters, Decoder, Error, MediaType, OutputParamsWatch, PixelFormat, Result,
-    SampleFormat,
+    CodecParameters, Decoder, Encoder, Error, Frame, MediaType, OutputParamsWatch, PixelFormat,
+    Result, SampleFormat,
 };
-
-use crate::executor::{FrameStage, frame_stage_failure_kind};
-use crate::failure::{FailureStage, StageResult, attribute};
 
 /// The output-describing fields downstream stages are planned from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,14 +114,29 @@ impl std::fmt::Display for Shape {
     }
 }
 
-/// The decoded shape moved away from the one the stages downstream
-/// were planned for: `old` is the plan, `new` the frames from now on.
-/// Each stage rewrites both to its own output shape before handing the
-/// pair on ([`reshape_stage`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Reshape {
-    pub(crate) old: Shape,
-    pub(crate) new: Shape,
+/// What [`DecodedStream::follow`] hands downstream for one frame the
+/// decoder returned, in order: the change event (when the shape moved)
+/// first, then the media frame (absent when the decoder's frame was
+/// the event itself).
+#[derive(Debug, Default)]
+pub(crate) struct Followed {
+    pub(crate) event: Option<Frame>,
+    pub(crate) frame: Option<Frame>,
+}
+
+impl Followed {
+    /// `true` when this carries a media frame (not only an event).
+    pub(crate) fn has_media(&self) -> bool {
+        self.frame.is_some()
+    }
+}
+
+impl IntoIterator for Followed {
+    type Item = Frame;
+    type IntoIter = std::iter::Chain<std::option::IntoIter<Frame>, std::option::IntoIter<Frame>>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.event.into_iter().chain(self.frame)
+    }
 }
 
 /// A stream's parameters plus the watch that keeps them in step with
@@ -117,8 +147,11 @@ pub(crate) struct DecodedStream {
     /// answer merged over them.
     pub(crate) params: CodecParameters,
     watch: OutputParamsWatch,
-    /// What the stages downstream were planned from.
+    /// What the stages downstream were planned from (or last told).
     planned: Shape,
+    /// The watch has read the decoder after a frame at least once:
+    /// from then on every change it reports is a mid-stream one.
+    read: bool,
 }
 
 impl DecodedStream {
@@ -128,6 +161,7 @@ impl DecodedStream {
             params,
             watch: OutputParamsWatch::new(),
             planned,
+            read: false,
         }
     }
 
@@ -140,137 +174,239 @@ impl DecodedStream {
         changed
     }
 
-    /// Call after every successful `receive_frame`. `Some` when the
-    /// shape downstream was planned for no longer describes the frame
-    /// just returned; the caller hands it to the stages before the
-    /// frame.
-    pub(crate) fn observe(&mut self, decoder: &dyn Decoder) -> Option<Reshape> {
-        if !self.watch.observe(decoder, &mut self.params) {
-            return None;
+    /// Fold one frame `decoder` just returned into the stream and say
+    /// what goes downstream.
+    ///
+    /// * The decoder's own [`Frame::StreamParams`] event is merged
+    ///   ([`OutputParamsWatch::observe_frame`]); the generation it has
+    ///   already moved is absorbed in the same step, so the media frame
+    ///   after it reports nothing a second time.
+    /// * A media frame from a decoder that moved its generation without
+    ///   an event gets one synthesised in front of it.
+    ///
+    /// The event handed on carries the stream's whole merged
+    /// parameters. On the first read after the decoder's first frame
+    /// (the description may still be refined up to there) an event is
+    /// produced only when a planning field moved; a mid-stream change
+    /// of anything the decoder describes always produces one.
+    pub(crate) fn follow(&mut self, decoder: &dyn Decoder, frame: Frame) -> Followed {
+        let is_event = frame.is_stream_params();
+        let changed = if is_event {
+            let merged = self.watch.observe_frame(&frame, &mut self.params);
+            // The decoder bumped its counter together with the event:
+            // record that read now (it merges the same description,
+            // so it reports no change of its own).
+            self.watch.observe(decoder, &mut self.params) | merged
+        } else {
+            self.watch.observe(decoder, &mut self.params)
+        };
+        let first_read = !self.read;
+        if !is_event {
+            self.read = true;
+        }
+        let frame = (!is_event).then_some(frame);
+        if !changed {
+            return Followed { event: None, frame };
         }
         let new = Shape::of(&self.params);
-        if new == self.planned {
-            return None;
+        let moved = new != self.planned;
+        self.planned = new;
+        if !moved && first_read && !is_event {
+            return Followed { event: None, frame };
         }
-        let old = std::mem::replace(&mut self.planned, new);
-        Some(Reshape { old, new })
-    }
-}
-
-/// Carry `r` through one frame stage: a pixel-format conversion takes
-/// the new source shape (and outputs what it did before); a filter
-/// refuses a real change. On return `r` describes the stage's output.
-pub(crate) fn reshape_stage(stage: &mut FrameStage, r: &mut Reshape, track: u32) -> Result<()> {
-    match stage {
-        FrameStage::PixConvert { src_info, target } => {
-            if r.new.media_type != MediaType::Video {
-                return Ok(());
-            }
-            if let Some(f) = r.new.pixel_format {
-                src_info.format = f;
-            }
-            if let Some(w) = r.new.width {
-                src_info.width = w;
-            }
-            if let Some(h) = r.new.height {
-                src_info.height = h;
-            }
-            r.old.pixel_format = Some(*target);
-            r.new.pixel_format = Some(*target);
-            Ok(())
-        }
-        FrameStage::Filter(_) => {
-            if r.old.conflicts(&r.new) {
-                Err(change_error(track, "a filter", r))
-            } else {
-                Ok(())
-            }
+        Followed {
+            event: Some(Frame::StreamParams(Box::new(self.params.clone()))),
+            frame,
         }
     }
 }
 
-/// [`reshape_stage`] over a whole chain, then the encoder check when
-/// one follows it.
-/// A refusal is attributed to the stage that cannot follow.
-pub(crate) fn reshape_chain(
-    stages: &mut [FrameStage],
-    mut r: Reshape,
-    has_encoder: bool,
-    track: u32,
-) -> StageResult<()> {
-    for stage in stages.iter_mut() {
-        reshape_stage(stage, &mut r, track)
-            .map_err(attribute(frame_stage_failure_kind(stage), Some(track)))?;
-    }
-    if has_encoder {
-        check_encoder(&r, track).map_err(attribute(FailureStage::Encode, Some(track)))?;
-    }
-    Ok(())
+/// The input side of an encoder: the shape it was opened for, kept in
+/// step with the [`Frame::StreamParams`] events reaching it.
+#[derive(Clone, Debug)]
+pub(crate) struct EncoderFeed {
+    input: CodecParameters,
+    output: CodecParameters,
 }
 
-/// An encoder was opened for `r.old`: a real change of its input
-/// shape cannot be followed.
-pub(crate) fn check_encoder(r: &Reshape, track: u32) -> Result<()> {
-    if r.old.conflicts(&r.new) {
-        Err(change_error(track, "the encoder", r))
-    } else {
-        Ok(())
+impl EncoderFeed {
+    /// `input` is the shape of the frames the encoder was opened for
+    /// (the end of the frame-stage chain), `encoder` the one built for
+    /// it.
+    pub(crate) fn new(input: CodecParameters, encoder: &dyn Encoder) -> Self {
+        Self {
+            input,
+            output: encoder.output_params().clone(),
+        }
+    }
+
+    /// Hand `frame` to `encoder`.
+    ///
+    /// A media frame goes straight to `send_frame`. A
+    /// [`Frame::StreamParams`] event is merged into the planned input:
+    /// when that only fills in what the plan did not know (or touches
+    /// nothing the encoder was opened from) the encoder is not
+    /// bothered; a real change is handed to the encoder, which either
+    /// re-configures (`Ok`) or cannot follow — any error then fails
+    /// with [`Error::Unsupported`] naming both shapes.
+    ///
+    /// Returns the encoder's new output parameters when it
+    /// re-configured into a different output description (for the sink
+    /// / muxer side), `None` otherwise.
+    pub(crate) fn send(
+        &mut self,
+        encoder: &mut dyn Encoder,
+        frame: &Frame,
+        track: u32,
+    ) -> Result<Option<CodecParameters>> {
+        let Some(p) = frame.stream_params() else {
+            encoder.send_frame(frame)?;
+            return Ok(None);
+        };
+        let mut next = self.input.clone();
+        if !next.merge_output_params(p) {
+            return Ok(None);
+        }
+        let (old, new) = (Shape::of(&self.input), Shape::of(&next));
+        if !old.conflicts(&new) {
+            self.input = next;
+            return Ok(None);
+        }
+        if let Err(why) = encoder.send_frame(frame) {
+            return Err(change_error(track, "the encoder", &old, &new, &why));
+        }
+        self.input = next;
+        let mut out = self.output.clone();
+        if out.merge_output_params(encoder.output_params()) {
+            self.output = out.clone();
+            Ok(Some(out))
+        } else {
+            Ok(None)
+        }
     }
 }
 
-fn change_error(track: u32, what: &str, r: &Reshape) -> Error {
+/// The parameters a raw-frame sink was started with, kept in step with
+/// the [`Frame::StreamParams`] events reaching the end of the chain so
+/// the sink hears of each actual change once.
+#[derive(Clone, Debug)]
+pub(crate) struct SinkFeed {
+    params: CodecParameters,
+}
+
+impl SinkFeed {
+    pub(crate) fn new(params: CodecParameters) -> Self {
+        Self { params }
+    }
+
+    /// Merge `event`'s parameters; `Some` (the sink's new stream
+    /// parameters) when that changed something the sink was told.
+    pub(crate) fn update(&mut self, event: &CodecParameters) -> Option<&CodecParameters> {
+        self.params
+            .merge_output_params(event)
+            .then_some(&self.params)
+    }
+}
+
+/// The run-failing error for a change a stage cannot follow.
+pub(crate) fn change_error(track: u32, what: &str, old: &Shape, new: &Shape, why: &Error) -> Error {
     Error::unsupported(format!(
-        "track {track}: the decoder changed its output mid-stream from {} to {}; \
-         {what} was set up for the former and cannot follow",
-        r.old, r.new
+        "track {track}: the stream changed its shape mid-stream from {old} to {new}; \
+         {what} was set up for the former and cannot follow ({why})"
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use oxideav_core::CodecId;
+    use oxideav_core::{CodecId, Packet, VideoFrame, VideoPlane};
 
-    fn video(w: u32, h: u32, f: Option<PixelFormat>) -> Shape {
+    fn video(w: u32, h: u32, f: Option<PixelFormat>) -> CodecParameters {
         let mut p = CodecParameters::video(CodecId::new("x"));
         p.width = Some(w);
         p.height = Some(h);
         p.pixel_format = f;
-        Shape::of(&p)
+        p
     }
 
     #[test]
     fn filling_is_not_a_conflict() {
-        assert!(!video(4, 4, None).conflicts(&video(4, 4, Some(PixelFormat::Yuv420P))));
-        assert!(video(4, 4, Some(PixelFormat::Yuv420P)).conflicts(&video(8, 4, None)));
+        let s = |w, h, f| Shape::of(&video(w, h, f));
+        assert!(!s(4, 4, None).conflicts(&s(4, 4, Some(PixelFormat::Yuv420P))));
+        assert!(s(4, 4, Some(PixelFormat::Yuv420P)).conflicts(&s(8, 4, None)));
+    }
+
+    /// A decoder whose output description the test drives by hand.
+    struct Dec {
+        id: CodecId,
+        params: CodecParameters,
+        generation: u64,
+    }
+
+    impl Decoder for Dec {
+        fn codec_id(&self) -> &CodecId {
+            &self.id
+        }
+        fn send_packet(&mut self, _: &Packet) -> Result<()> {
+            Ok(())
+        }
+        fn receive_frame(&mut self) -> Result<Frame> {
+            Err(Error::NeedMore)
+        }
+        fn flush(&mut self) -> Result<()> {
+            Ok(())
+        }
+        fn output_params(&self) -> Option<CodecParameters> {
+            Some(self.params.clone())
+        }
+        fn output_params_generation(&self) -> u64 {
+            self.generation
+        }
+    }
+
+    fn picture() -> Frame {
+        Frame::Video(VideoFrame {
+            pts: Some(0),
+            planes: vec![VideoPlane {
+                stride: 1,
+                data: vec![0],
+            }],
+        })
     }
 
     #[test]
-    fn convert_stage_absorbs_a_change() {
-        let mut stage = FrameStage::PixConvert {
-            src_info: oxideav_pixfmt::FrameInfo::new(PixelFormat::Yuv420P, 4, 4),
-            target: PixelFormat::Rgb24,
+    fn follow_reports_each_change_once_either_way() {
+        let p4 = video(4, 4, Some(PixelFormat::Yuv420P));
+        let p8 = video(8, 8, Some(PixelFormat::Yuv420P));
+        let mut dec = Dec {
+            id: CodecId::new("x"),
+            params: p4.clone(),
+            generation: 0,
         };
-        let r = Reshape {
-            old: video(4, 4, Some(PixelFormat::Yuv420P)),
-            new: video(4, 4, Some(PixelFormat::Yuv444P)),
-        };
-        reshape_chain(std::slice::from_mut(&mut stage), r, true, 0).unwrap();
-        let FrameStage::PixConvert { src_info, .. } = stage else {
-            unreachable!()
-        };
-        assert_eq!(src_info.format, PixelFormat::Yuv444P);
-        // A size change still reaches the encoder.
-        let r = Reshape {
-            old: video(4, 4, Some(PixelFormat::Yuv420P)),
-            new: video(8, 8, Some(PixelFormat::Yuv420P)),
-        };
-        let fail = reshape_chain(&mut [], r, true, 3).unwrap_err();
-        assert_eq!(fail.stage, FailureStage::Encode);
-        let err = fail.error;
-        assert!(matches!(err, Error::Unsupported(_)), "{err}");
-        assert!(err.to_string().contains("4x4"), "{err}");
-        // Without an encoder the new shape just flows on.
-        reshape_chain(&mut [], r, false, 3).unwrap();
+        let mut s = DecodedStream::new(CodecParameters::video(CodecId::new("x")));
+        s.prime(&dec);
+        // Constant shape: nothing but the frame.
+        let f = s.follow(&dec, picture());
+        assert!(f.event.is_none() && f.has_media());
+        // Generation-only change: one synthesised event, then quiet.
+        dec.params = p8.clone();
+        dec.generation = 1;
+        let f = s.follow(&dec, picture());
+        assert_eq!(
+            f.event
+                .as_ref()
+                .and_then(|e| e.stream_params())
+                .and_then(|p| p.width),
+            Some(8)
+        );
+        assert!(s.follow(&dec, picture()).event.is_none());
+        // Event + generation (an emitting decoder): the event is handed
+        // on once, the frame after it reports nothing.
+        dec.params = p4.clone();
+        dec.generation = 2;
+        let f = s.follow(&dec, Frame::StreamParams(Box::new(p4.clone())));
+        assert!(f.event.is_some() && !f.has_media());
+        assert!(s.follow(&dec, picture()).event.is_none());
+        assert_eq!(s.params.width, Some(4));
     }
 }

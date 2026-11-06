@@ -18,15 +18,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sink's `start()` streams are planned from what the decoder emits
   (cropped size, pixel layout, sample format) rather than the
   container's claim; the watch is observed after every
-  `receive_frame` (one integer compare per frame). A mid-stream change
-  re-plans pixel-format conversion stages; a change a filter or an
-  encoder would have to follow fails with `Error::Unsupported` naming
-  both shapes; raw-frame sinks receive the new-shape frames.
+  `receive_frame` (one integer compare per frame).
+- Mid-stream shape changes travel as oxideav-core 0.1.43's in-band
+  `Frame::StreamParams` event. A decoder's own event is merged into the
+  stream (`OutputParamsWatch::observe_frame`); for a decoder that emits
+  none the generation move is turned into the event — exactly one per
+  change either way, in order with the frames, on every entry point
+  (`transcode_simple*`, `Pipeline` routes, serial and pipelined
+  executor). Pixel-format conversions re-plan and restate it for their
+  output; filters are handed it (re-plan / forward / refuse — a
+  pass-through filter that swallows it still has it forwarded); an
+  encoder gets it only when its input shape really changes and may
+  re-configure; a filter or encoder that cannot follow a real change
+  fails the run with `Error::Unsupported` naming both shapes.
+- `JobSink::stream_params(kind, params)` and
+  `Sink::stream_params(params)` (default no-op): a raw-frame output is
+  told of each change there — the event never reaches `write_frame` —
+  and an output behind an encoder that re-configured is told the
+  encoder's new output parameters.
 - `Pipeline::stream_params(index)`: a bound stream's parameters with
   the decoder's report merged in, kept current through `run`.
 
 ### Changed
 
+- Stream-parameters events are not counted as decoded / written frames
+  (`ExecutorStats`, `PipelineStats`, `TranscodeStats`, the bench's
+  decode fps).
 - The pre-roll wrapper and the hardware-fallback decoder forward
   `output_params` / `output_params_generation` to the decoder they
   wrap; the pre-roll is skipped whenever `output_params` already

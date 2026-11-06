@@ -31,7 +31,7 @@ use oxideav_pixfmt::{ConvertOptions, convert as pixfmt_convert};
 use crate::budget::stream_budget;
 use crate::dag::{Dag, DagNode, MuxTrack, ResolvedSelector, codec_encoder_caps};
 use crate::failure::{FailureStage, RunFailure, StageFailure, StageResult, attribute};
-use crate::params_watch::{DecodedStream, reshape_chain};
+use crate::params_watch::{DecodedStream, EncoderFeed, Followed, Shape, SinkFeed, change_error};
 use crate::pix_negotiate::{MuxProbe, encoder_input_format};
 use crate::preroll::prime_unlabelled_video;
 use crate::schema::{Job, is_reserved_sink};
@@ -133,9 +133,27 @@ pub trait JobSink {
     /// container header here.
     fn start(&mut self, streams: &[StreamInfo]) -> Result<()>;
     fn write_packet(&mut self, kind: MediaType, pkt: &Packet) -> Result<()>;
+    /// A decoded media frame (`Audio` / `Video` / `Subtitle` /
+    /// `Vector`). The in-band [`Frame::StreamParams`] event never
+    /// arrives here — it goes to [`stream_params`](Self::stream_params).
     fn write_frame(&mut self, kind: MediaType, frm: &Frame) -> Result<()>;
     /// Drain any remaining internal state and finalise the output.
     fn finish(&mut self) -> Result<()>;
+
+    /// A stream of this output changed its parameters mid-stream:
+    /// `params` describes every frame (raw-frame outputs) or packet
+    /// (an encoder that re-configured for a new input shape) of the
+    /// `kind` stream from the next one on. Called once per change, in
+    /// order with the frames / packets, from the in-band
+    /// [`Frame::StreamParams`] event — which is never handed to
+    /// [`write_frame`](Self::write_frame).
+    ///
+    /// Default: no-op — the frames after it simply have the new shape
+    /// (a muxer-backed sink keeps the stream header it already wrote;
+    /// core's `Muxer` has no call to re-state a stream mid-file).
+    fn stream_params(&mut self, _kind: MediaType, _params: &CodecParameters) -> Result<()> {
+        Ok(())
+    }
 
     /// Flow-barrier hook. Called by the mux loop when a worker
     /// forwards a [`crate::BarrierKind`] (today only `SeekFlush`).
@@ -828,8 +846,12 @@ fn pump_serial_streams(
                         // Frame sources have a single synthetic
                         // stream — every track on this URI consumes
                         // the same frame. We clone for each track
-                        // beyond the first so ownership works out.
-                        stats.frames_decoded += 1;
+                        // beyond the first so ownership works out. A
+                        // stream-parameters event flows down the tracks
+                        // like a decoder's but is not a frame produced.
+                        if !frame.is_stream_params() {
+                            stats.frames_decoded += 1;
+                        }
                         let mut consumers: Vec<usize> = Vec::new();
                         for (track_idx, pl) in pipelines.iter().enumerate() {
                             if pl.source_uri == *uri {
@@ -1355,6 +1377,12 @@ pub(crate) struct TrackRuntime {
     /// drains this vector to spawn one worker per stage.
     pub(crate) frame_stages: Vec<FrameStage>,
     pub(crate) encoder: Option<Box<dyn Encoder>>,
+    /// The encoder's input side: the shape it was opened for, kept in
+    /// step with the stream-parameters events reaching it.
+    pub(crate) encoder_feed: Option<EncoderFeed>,
+    /// Without an encoder: the parameters the raw-frame sink is told
+    /// about, so it hears of each change once.
+    pub(crate) sink_feed: SinkFeed,
     pub(crate) encoder_time_base: Option<TimeBase>,
     /// Additional output-stream descriptors synthesised for multi-port
     /// filters on this track (e.g. spectrogram's video-port).
@@ -1380,6 +1408,71 @@ pub(crate) struct TrackRuntime {
 /// directly to the sink (ports ≥ 1).
 pub(crate) struct RuntimeFilter {
     pub(crate) inner: Box<dyn StreamFilter>,
+    /// The input shape the filter was built for, kept in step with the
+    /// stream-parameters events it is handed.
+    input: Box<CodecParameters>,
+    /// Port 0 passes its input shape through unchanged (a volume
+    /// stage, a spectrogram's audio port), so its output follows a
+    /// change of its input.
+    passthrough: bool,
+}
+
+impl RuntimeFilter {
+    /// `input` is the stream shape feeding port 0 when the filter was
+    /// built; `passthrough` whether port 0's output shape is its input
+    /// shape.
+    pub(crate) fn new(
+        inner: Box<dyn StreamFilter>,
+        input: &CodecParameters,
+        passthrough: bool,
+    ) -> Self {
+        Self {
+            inner,
+            input: Box::new(input.clone()),
+            passthrough,
+        }
+    }
+
+    /// Hand the filter a [`Frame::StreamParams`] event (`event`, with
+    /// parameters `p`).
+    ///
+    /// * Accepted: whatever the filter emits goes on — its own event
+    ///   when its output shape changes, nothing when it re-planned to
+    ///   keep its output constant. A pass-through filter that swallowed
+    ///   the event still has its output follow its input, so the event
+    ///   is forwarded for it.
+    /// * Refused (any error) while the change conflicts with what the
+    ///   filter was built for: the run fails with [`Error::Unsupported`]
+    ///   naming both shapes.
+    /// * Refused while it only fills in fields the plan did not know,
+    ///   or touches nothing the filter was built from: the filter keeps
+    ///   running as planned (forwarding the event when it is a
+    ///   pass-through).
+    fn follow(&mut self, event: Frame, p: &CodecParameters, track: u32) -> Result<FilterEmissions> {
+        let mut next = (*self.input).clone();
+        let changed = next.merge_output_params(p);
+        let (old, new) = (Shape::of(&self.input), Shape::of(&next));
+        let forward = self.passthrough && changed;
+        match run_filter(self, event.clone()) {
+            Ok(mut emitted) => {
+                *self.input = next;
+                if forward && !emitted.primary.iter().any(Frame::is_stream_params) {
+                    emitted.primary.push(event);
+                }
+                Ok(emitted)
+            }
+            Err(why) if old.conflicts(&new) => {
+                Err(change_error(track, "a filter", &old, &new, &why))
+            }
+            Err(_) => {
+                *self.input = next;
+                Ok(FilterEmissions {
+                    primary: if forward { vec![event] } else { Vec::new() },
+                    extras: Vec::new(),
+                })
+            }
+        }
+    }
 }
 
 /// A per-frame stage in the decoded-frame pipeline. Decoder output
@@ -1457,6 +1550,8 @@ impl TrackRuntime {
             decoded: None,
             frame_stages: Vec::new(),
             encoder: None,
+            encoder_feed: None,
+            sink_feed: SinkFeed::new(CodecParameters::audio(CodecId::new(""))),
             encoder_time_base: None,
             extra_output_streams: Vec::new(),
             extra_output_port_counts: Vec::new(),
@@ -1540,6 +1635,7 @@ impl TrackRuntime {
                     // params rather than a filter's placeholder.
                     let input_matches_output = !in_ports.is_empty()
                         && port_params_equal(&in_ports[0].params, &out_ports[0].params);
+                    let filter = RuntimeFilter::new(filter, &running, input_matches_output);
                     if !input_matches_output {
                         running = port_params_to_codec_params(&out_ports[0].params, &running);
                     }
@@ -1558,8 +1654,7 @@ impl TrackRuntime {
                     let extra_count = out_ports.len().saturating_sub(1) as u32;
                     extra_stream_index_base += extra_count;
                     self.extra_output_port_counts.push(extra_count);
-                    self.frame_stages
-                        .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
+                    self.frame_stages.push(FrameStage::Filter(filter));
                 }
                 StageSpec::Convert { target } => {
                     // Snapshot the running source shape (format + dims)
@@ -1631,10 +1726,10 @@ impl TrackRuntime {
                                         "filter '{name}' declares zero output ports"
                                     ))
                                 })?;
+                            let filter = RuntimeFilter::new(filter, &running, false);
                             running = port_params_to_codec_params(&out_port.params, &running);
                             self.extra_output_port_counts.push(0);
-                            self.frame_stages
-                                .push(FrameStage::Filter(RuntimeFilter { inner: filter }));
+                            self.frame_stages.push(FrameStage::Filter(filter));
                         }
                     }
                     let mut enc_params = running.clone();
@@ -1677,6 +1772,7 @@ impl TrackRuntime {
                     }
                     let mut encoder = make_encoder_with(codecs, &enc_params, prefs)?;
                     encoder.set_execution_context(ctx);
+                    self.encoder_feed = Some(EncoderFeed::new(running.clone(), &*encoder));
                     let out_params = encoder.output_params().clone();
                     running = out_params.clone();
                     self.encoder_time_base = Some(match out_params.sample_rate {
@@ -1686,6 +1782,9 @@ impl TrackRuntime {
                     self.encoder = Some(encoder);
                 }
             }
+        }
+        if self.encoder.is_none() {
+            self.sink_feed = SinkFeed::new(running);
         }
         Ok(())
     }
@@ -1843,33 +1942,36 @@ impl TrackRuntime {
                         break;
                     }
                 };
-                produced_any = true;
-                stats.frames_decoded += 1;
-                self.observe_decoder(track_index)?;
-                self.pump_frame(frame, track_index, sink, stats)?;
+                let followed = self.follow_decoder(frame);
+                if followed.has_media() {
+                    produced_any = true;
+                    stats.frames_decoded += 1;
+                }
+                for f in followed {
+                    self.pump_frame(f, track_index, sink, stats)?;
+                }
             }
         }
         Ok(())
     }
 
-    /// After a successful `receive_frame`: fold the decoder's answer
-    /// into the stream parameters and, when the shape the stages were
-    /// planned for changed, re-plan them (see
-    /// [`crate::params_watch`] for what can follow a change).
-    fn observe_decoder(&mut self, track_index: u32) -> StageResult<()> {
+    /// After a successful `receive_frame`: fold the frame (the
+    /// decoder's stream-parameters event, or a media frame after which
+    /// the decoder's generation moved) into the stream parameters, and
+    /// return what goes down the stage chain — exactly one event per
+    /// change (see [`crate::params_watch`] for what can follow one).
+    fn follow_decoder(&mut self, frame: Frame) -> Followed {
         let (Some(decoded), Some(decoder)) = (&mut self.decoded, &self.decoder) else {
-            return Ok(());
+            return Followed {
+                event: None,
+                frame: Some(frame),
+            };
         };
-        let Some(reshape) = decoded.observe(&**decoder) else {
-            return Ok(());
-        };
-        self.input_params = decoded.params.clone();
-        reshape_chain(
-            &mut self.frame_stages,
-            reshape,
-            self.encoder.is_some(),
-            track_index,
-        )
+        let followed = decoded.follow(&**decoder, frame);
+        if followed.event.is_some() {
+            self.input_params = decoded.params.clone();
+        }
+        followed
     }
 
     fn pump_frame(
@@ -1880,47 +1982,61 @@ impl TrackRuntime {
         stats: &mut ExecutorStats,
     ) -> StageResult<()> {
         let sinkf = attribute(FailureStage::Sink, Some(track_index));
-        let encf = attribute(FailureStage::Encode, Some(track_index));
         let mut frames: Vec<Frame> = vec![frame];
         for stage in &mut self.frame_stages {
             let stagef = attribute(frame_stage_failure_kind(stage), Some(track_index));
             let mut next = Vec::new();
             for f in frames {
-                let produced = run_frame_stage_emit(stage, f).map_err(&stagef)?;
+                let produced = run_frame_stage_emit(stage, f, track_index).map_err(&stagef)?;
                 // Extras (multi-port filter emissions) go straight to the
                 // sink as auto-attached streams.
                 for (kind, frm) in produced.extras {
-                    sink.write_frame(kind, &frm).map_err(&sinkf)?;
-                    stats.frames_written += 1;
+                    write_extra(sink, kind, &frm, stats).map_err(&sinkf)?;
                 }
                 next.extend(produced.primary);
             }
             frames = next;
         }
-
-        if let Some(enc) = &mut self.encoder {
-            for frame in frames {
-                enc.send_frame(&frame).map_err(&encf)?;
-                loop {
-                    match enc.receive_packet() {
-                        Ok(mut p) => {
-                            p.stream_index = track_index;
-                            sink.write_packet(self.kind, &p).map_err(&sinkf)?;
-                            stats.packets_encoded += 1;
-                        }
-                        Err(Error::NeedMore) | Err(Error::Eof) => break,
-                        Err(e) => return Err(encf(e)),
-                    }
-                }
-            }
-        } else {
-            // Raw frame to sink (player sink consumes this).
-            for f in frames {
-                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
-                stats.frames_written += 1;
-            }
+        for f in frames {
+            self.deliver(f, track_index, sink, stats)?;
         }
         Ok(())
+    }
+
+    /// Hand one frame from the end of the stage chain to the encoder
+    /// (and its packets to the sink) or, without an encoder, to the
+    /// sink. A stream-parameters event never reaches
+    /// [`JobSink::write_frame`]: the encoder's input side decides
+    /// whether the encoder sees it ([`EncoderFeed`]), the sink hears of
+    /// an actual change through [`JobSink::stream_params`].
+    fn deliver(
+        &mut self,
+        frame: Frame,
+        track_index: u32,
+        sink: &mut dyn JobSink,
+        stats: &mut ExecutorStats,
+    ) -> StageResult<()> {
+        let sinkf = attribute(FailureStage::Sink, Some(track_index));
+        let encf = attribute(FailureStage::Encode, Some(track_index));
+        if let Some(enc) = &mut self.encoder {
+            let feed = self
+                .encoder_feed
+                .get_or_insert_with(|| EncoderFeed::new(self.input_params.clone(), &**enc));
+            if let Some(out) = feed.send(&mut **enc, &frame, track_index).map_err(&encf)? {
+                sink.stream_params(self.kind, &out).map_err(&sinkf)?;
+            }
+            drain_encoder_packets(&mut **enc, track_index, self.kind, sink, stats)
+        } else if let Some(p) = frame.stream_params() {
+            // Raw frames to the sink (a player sink consumes these).
+            if let Some(p) = self.sink_feed.update(p) {
+                sink.stream_params(self.kind, p).map_err(&sinkf)?;
+            }
+            Ok(())
+        } else {
+            sink.write_frame(self.kind, &frame).map_err(&sinkf)?;
+            stats.frames_written += 1;
+            Ok(())
+        }
     }
 
     fn drain(
@@ -1957,9 +2073,13 @@ impl TrackRuntime {
                         break;
                     }
                 };
-                stats.frames_decoded += 1;
-                self.observe_decoder(track_index)?;
-                self.pump_frame(frame, track_index, sink, stats)?;
+                let followed = self.follow_decoder(frame);
+                if followed.has_media() {
+                    stats.frames_decoded += 1;
+                }
+                for f in followed {
+                    self.pump_frame(f, track_index, sink, stats)?;
+                }
             }
         }
         // Flush frame stages. Filters may hold internal buffers
@@ -1976,8 +2096,7 @@ impl TrackRuntime {
             let flushed = flush_frame_stage_emit(&mut self.frame_stages[i]).map_err(&stagef)?;
             // Extras from a flushing filter go straight to the sink.
             for (kind, frm) in flushed.extras {
-                sink.write_frame(kind, &frm).map_err(&sinkf)?;
-                stats.frames_written += 1;
+                write_extra(sink, kind, &frm, stats).map_err(&sinkf)?;
             }
             let mut primary = flushed.primary;
             // Push the flushed frames through the remaining downstream
@@ -1989,11 +2108,10 @@ impl TrackRuntime {
                 );
                 let mut next: Vec<Frame> = Vec::new();
                 for f in primary.drain(..) {
-                    let produced =
-                        run_frame_stage_emit(&mut self.frame_stages[j], f).map_err(&stagef)?;
+                    let produced = run_frame_stage_emit(&mut self.frame_stages[j], f, track_index)
+                        .map_err(&stagef)?;
                     for (kind, frm) in produced.extras {
-                        sink.write_frame(kind, &frm).map_err(&sinkf)?;
-                        stats.frames_written += 1;
+                        write_extra(sink, kind, &frm, stats).map_err(&sinkf)?;
                     }
                     next.extend(produced.primary);
                 }
@@ -2001,40 +2119,57 @@ impl TrackRuntime {
             }
             tail.extend(primary);
         }
+        for f in tail {
+            self.deliver(f, track_index, sink, stats)?;
+        }
         if let Some(enc) = &mut self.encoder {
-            for frame in tail {
-                enc.send_frame(&frame).map_err(&encf)?;
-                loop {
-                    match enc.receive_packet() {
-                        Ok(mut p) => {
-                            p.stream_index = track_index;
-                            sink.write_packet(self.kind, &p).map_err(&sinkf)?;
-                            stats.packets_encoded += 1;
-                        }
-                        Err(Error::NeedMore) | Err(Error::Eof) => break,
-                        Err(e) => return Err(encf(e)),
-                    }
-                }
-            }
             enc.flush().map_err(&encf)?;
-            loop {
-                match enc.receive_packet() {
-                    Ok(mut p) => {
-                        p.stream_index = track_index;
-                        sink.write_packet(self.kind, &p).map_err(&sinkf)?;
-                        stats.packets_encoded += 1;
-                    }
-                    Err(Error::NeedMore) | Err(Error::Eof) => break,
-                    Err(e) => return Err(encf(e)),
-                }
-            }
-        } else {
-            for f in tail {
-                sink.write_frame(self.kind, &f).map_err(&sinkf)?;
-                stats.frames_written += 1;
-            }
+            drain_encoder_packets(&mut **enc, track_index, self.kind, sink, stats)?;
         }
         Ok(())
+    }
+}
+
+/// Move every packet `enc` has ready to the sink, tagged with the
+/// output's stream index.
+fn drain_encoder_packets(
+    enc: &mut dyn Encoder,
+    track_index: u32,
+    kind: MediaType,
+    sink: &mut dyn JobSink,
+    stats: &mut ExecutorStats,
+) -> StageResult<()> {
+    let sinkf = attribute(FailureStage::Sink, Some(track_index));
+    let encf = attribute(FailureStage::Encode, Some(track_index));
+    loop {
+        match enc.receive_packet() {
+            Ok(mut p) => {
+                p.stream_index = track_index;
+                sink.write_packet(kind, &p).map_err(&sinkf)?;
+                stats.packets_encoded += 1;
+            }
+            Err(Error::NeedMore) | Err(Error::Eof) => return Ok(()),
+            Err(e) => return Err(encf(e)),
+        }
+    }
+}
+
+/// A frame a multi-port filter emitted on an extra port: media to
+/// [`JobSink::write_frame`], a stream-parameters event to
+/// [`JobSink::stream_params`].
+fn write_extra(
+    sink: &mut dyn JobSink,
+    kind: MediaType,
+    frame: &Frame,
+    stats: &mut ExecutorStats,
+) -> Result<()> {
+    match frame.stream_params() {
+        Some(p) => sink.stream_params(kind, p),
+        None => {
+            sink.write_frame(kind, frame)?;
+            stats.frames_written += 1;
+            Ok(())
+        }
     }
 }
 
@@ -2059,17 +2194,45 @@ pub(crate) fn frame_stage_failure_kind(stage: &FrameStage) -> FailureStage {
 /// non-video frame pass through unchanged; multi-port filters
 /// (spectrogram) put port-1+ frames into `extras` for the caller to
 /// route straight to the sink as an auto-attached output stream.
+///
+/// A [`Frame::StreamParams`] event re-plans the stage: a conversion
+/// takes the new source layout / size and forwards the event restated
+/// for its output (same target layout, the new size); a filter is
+/// handed the event (see [`RuntimeFilter`]'s `follow`).
 pub(crate) fn run_frame_stage_emit(
     stage: &mut FrameStage,
     frame: Frame,
+    track: u32,
 ) -> Result<FilterEmissions> {
     match stage {
-        FrameStage::Filter(f) => run_filter(f, frame),
+        FrameStage::Filter(f) => match frame.stream_params() {
+            Some(p) => {
+                let p = p.clone();
+                f.follow(frame, &p, track)
+            }
+            None => run_filter(f, frame),
+        },
         FrameStage::PixConvert { src_info, target } => match frame {
             Frame::Video(v) => {
                 let out = pixfmt_convert(&v, *src_info, *target, &ConvertOptions::default())?;
                 Ok(FilterEmissions {
                     primary: vec![Frame::Video(out)],
+                    extras: Vec::new(),
+                })
+            }
+            Frame::StreamParams(mut p) if p.media_type == MediaType::Video => {
+                if let Some(f) = p.pixel_format {
+                    src_info.format = f;
+                }
+                if let Some(w) = p.width {
+                    src_info.width = w;
+                }
+                if let Some(h) = p.height {
+                    src_info.height = h;
+                }
+                p.pixel_format = Some(*target);
+                Ok(FilterEmissions {
+                    primary: vec![Frame::StreamParams(p)],
                     extras: Vec::new(),
                 })
             }
