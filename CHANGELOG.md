@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/OxideAV/oxideav-pipeline/compare/v0.1.15...v0.2.0) - 2026-11-07
+
+### Other
+
+- move the API-hygiene entries under [Unreleased]
+- API hygiene: #[non_exhaustive] on growable enums and records, constructors for callers
+
 ### Added
 
 - Constructors / builders so callers can build records without
