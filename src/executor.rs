@@ -2905,6 +2905,7 @@ impl Drop for ExecutorHandle {
 // ───────────────────────── stats ─────────────────────────
 
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct ExecutorStats {
     pub packets_read: u64,
     pub packets_copied: u64,

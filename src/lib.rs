@@ -60,6 +60,7 @@ use oxideav_core::{
 /// stream/route resolution, so it's not on a hot path.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum SinkAcceptance {
     /// Take raw packets as-is — stream copy, no decoding.
     Copy,
@@ -149,6 +150,7 @@ pub struct Pipeline {
 
 /// Stats returned by [`Pipeline::run`].
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct PipelineStats {
     pub packets_read: u64,
     pub packets_copied: u64,
@@ -522,6 +524,7 @@ pub fn remux(demuxer: &mut dyn Demuxer, muxer: &mut dyn Muxer) -> Result<u64> {
 
 /// Plan describing how to derive an output stream from one input stream.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum StreamPlan {
     /// Stream-copy (codec passthrough, no decode).
     Copy,
@@ -1101,6 +1104,7 @@ fn drain_encoder(
 }
 
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct TranscodeStats {
     pub packets_in: u64,
     pub packets_out: u64,

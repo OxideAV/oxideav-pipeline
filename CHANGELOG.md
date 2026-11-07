@@ -16,6 +16,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Constructors / builders so callers can build records without
+  struct literals: `MuxTrack::new`, `SeekCmd::new`,
+  `ChannelCaps::new` + `with_packets` / `with_frames`,
+  `ResolvedSelector::with_index`, `TrackSpec::new` + `with_codec` /
+  `with_params` / `with_stream_selector`, `SourceRef::new`,
+  `FilterNode::new` + `with_params`, `ConvertNode::new`,
+  `Render3DNode::new` + `with_opts`, `StreamSelector::new`,
+  `Job::with_outputs` / `with_aliases` / `with_threads`,
+  `OutputSpec::with_audio` / `with_video` / `with_subtitle` /
+  `with_all`, `CodecPreferences::with_*` (every field), and
+  `BenchOpts::with_*` (every field).
 - Decoder-reported stream parameters (oxideav-core 0.1.42
   `Decoder::output_params` / `OutputParamsWatch`). Every decoder the
   pipeline builds — `transcode_simple*`, `Pipeline` routes, the serial
@@ -47,6 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the decoder's report merged in, kept current through `run`.
 
 ### Changed
+
+- API hygiene: `#[non_exhaustive]` on the enums `DagNode`,
+  `OutputKind`, `SinkAcceptance`, `StreamPlan`, `TrackInput` and
+  `bench::Side`, and on the records `ResolvedSelector`, `MuxTrack`,
+  `Dag`, `StreamSelection`, `PipelineStats`, `TranscodeStats`,
+  `SeekCmd`, `Progress`, `ChannelCaps`, `ExecutorStats`, `NullSink`,
+  `FileSink`, `BenchResult`, `SystemInfo` and `RunFailure`. Build
+  them through `Default` / the new constructors. No behaviour change.
 
 - Stream-parameters events are not counted as decoded / written frames
   (`ExecutorStats`, `PipelineStats`, `TranscodeStats`, the bench's

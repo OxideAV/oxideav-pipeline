@@ -144,13 +144,7 @@ fn tightest_caps_one_one_runs_to_completion() {
     // If the staged runner's barrier-broadcast / EOF-cascade logic
     // assumed any minimum queue depth > 1, this test would deadlock
     // and the harness would kill it (test runner timeout).
-    let count = run_with_caps(
-        Some(ChannelCaps {
-            packets: 1,
-            frames: 1,
-        }),
-        "channel_caps_tight",
-    );
+    let count = run_with_caps(Some(ChannelCaps::new(1, 1)), "channel_caps_tight");
     assert!(
         count > 0,
         "tight caps run produced no payloads — pipeline did not progress"
@@ -163,13 +157,7 @@ fn zero_caps_clamped_up_to_one() {
     // promote 0 → 1 instead of panicking. Verified end-to-end (a panic
     // anywhere inside the runner would mark the test failed via the
     // joined worker-thread error).
-    let count = run_with_caps(
-        Some(ChannelCaps {
-            packets: 0,
-            frames: 0,
-        }),
-        "channel_caps_zero",
-    );
+    let count = run_with_caps(Some(ChannelCaps::new(0, 0)), "channel_caps_zero");
     assert!(
         count > 0,
         "zero caps run produced no payloads — clamp logic failed"

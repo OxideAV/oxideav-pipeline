@@ -115,6 +115,7 @@ pub enum BarrierKind {
 /// demuxer's counter and any dropped / out-of-order delivery would
 /// silently desync the engine's seek-pending bookkeeping).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct SeekCmd {
     pub stream_idx: u32,
     pub pts: i64,
@@ -123,6 +124,18 @@ pub struct SeekCmd {
     /// every resulting barrier so the caller can match its dispatch
     /// with the corresponding `SeekFlush` / `SeekRejected`.
     pub generation: u32,
+}
+
+impl SeekCmd {
+    /// Build a [`SeekCmd`] from its fields.
+    pub fn new(stream_idx: u32, pts: i64, time_base: TimeBase, generation: u32) -> Self {
+        Self {
+            stream_idx,
+            pts,
+            time_base,
+            generation,
+        }
+    }
 }
 
 /// Per-frame progress event consumed by [`crate::ExecutorHandle::try_progress`].
@@ -168,6 +181,7 @@ pub struct SeekCmd {
 /// surface grows. Use the struct-update syntax (`Progress { pts, .. }`)
 /// or read fields by name to stay forward-compatible.
 #[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
 pub struct Progress {
     pub pts: Option<i64>,
     pub frames: u64,
@@ -306,6 +320,7 @@ const FRAME_CAP: usize = 8;
 /// underlying `sync_channel` rejects a depth of zero — that's a
 /// rendezvous channel and would serialise the entire pipeline).
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub struct ChannelCaps {
     /// Depth of the per-track packet channels (demuxer → worker, and
     /// worker → mux loop). Default: 16.
@@ -313,6 +328,25 @@ pub struct ChannelCaps {
     /// Depth of the per-stage frame channels (decode → filter →
     /// pix-convert → encode). Default: 8.
     pub frames: usize,
+}
+
+impl ChannelCaps {
+    /// Build a [`ChannelCaps`] from its fields.
+    pub fn new(packets: usize, frames: usize) -> Self {
+        Self { packets, frames }
+    }
+
+    /// Set `packets`.
+    pub fn with_packets(mut self, v: usize) -> Self {
+        self.packets = v;
+        self
+    }
+
+    /// Set `frames`.
+    pub fn with_frames(mut self, v: usize) -> Self {
+        self.frames = v;
+        self
+    }
 }
 
 impl Default for ChannelCaps {

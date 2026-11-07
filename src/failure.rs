@@ -95,6 +95,7 @@ impl fmt::Display for FailureStage {
 /// surface reports, so the two surfaces never diverge on the root
 /// cause.
 #[derive(Debug)]
+#[non_exhaustive]
 pub struct RunFailure {
     /// The output key the failure belongs to (`"out.mp4"`,
     /// `"@display"`, …). `None` for job-level failures that precede any

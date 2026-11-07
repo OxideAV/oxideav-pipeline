@@ -540,10 +540,7 @@ fn tight_budgets_propagate_to_every_wave_output() {
     let job = Job::from_json(&json).expect("parse job");
     let mut exec = Executor::new(&job, &ctx)
         .with_threads(2)
-        .with_channel_caps(oxideav_pipeline::ChannelCaps {
-            packets: 1,
-            frames: 1,
-        })
+        .with_channel_caps(oxideav_pipeline::ChannelCaps::new(1, 1))
         .with_max_queue_bytes(64);
     let mut counters = Vec::new();
     for name in ["t0", "t1", "t2", "t3"] {

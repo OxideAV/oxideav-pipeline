@@ -32,6 +32,7 @@ use oxideav_core::{
 
 /// The outcome of [`select_streams`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct StreamSelection {
     /// Input stream indices (`StreamInfo::index`) to write, in input
     /// order.
@@ -52,6 +53,7 @@ impl StreamSelection {
 
 /// What the output is.
 #[derive(Clone, Copy, Debug)]
+#[non_exhaustive]
 pub enum OutputKind<'a> {
     /// A container muxer registered under this name; its stream
     /// capacity is probed.

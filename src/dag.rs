@@ -25,6 +25,7 @@ pub struct NodeId(pub usize);
 
 /// A single node in the resolved DAG.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub enum DagNode {
     /// Open a demuxer from a source URI. Emits packets stream-by-stream;
     /// downstream `Select` nodes filter. Built when `SourceRegistry::open`
@@ -98,9 +99,18 @@ pub enum DagNode {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct ResolvedSelector {
     pub kind: Option<MediaType>,
     pub index: Option<u32>,
+}
+
+impl ResolvedSelector {
+    /// Set `index`.
+    pub fn with_index(mut self, v: Option<u32>) -> Self {
+        self.index = v;
+        self
+    }
 }
 
 impl ResolvedSelector {
@@ -119,6 +129,7 @@ impl ResolvedSelector {
 }
 
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct MuxTrack {
     /// Intended media type for this output track.
     pub kind: MediaType,
@@ -133,8 +144,20 @@ pub struct MuxTrack {
     pub copy: bool,
 }
 
+impl MuxTrack {
+    /// Build a [`MuxTrack`] from its fields.
+    pub fn new(kind: MediaType, upstream: NodeId, copy: bool) -> Self {
+        Self {
+            kind,
+            upstream,
+            copy,
+        }
+    }
+}
+
 /// Resolved DAG: nodes addressed by NodeId, with one `roots` entry per output.
 #[derive(Clone, Debug, Default)]
+#[non_exhaustive]
 pub struct Dag {
     nodes: Vec<DagNode>,
     /// Output name → Mux node id.

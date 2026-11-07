@@ -27,6 +27,26 @@ pub struct Job {
     pub threads: Option<usize>,
 }
 
+impl Job {
+    /// Set `outputs`.
+    pub fn with_outputs(mut self, v: IndexMap<String, OutputSpec>) -> Self {
+        self.outputs = v;
+        self
+    }
+
+    /// Set `aliases`.
+    pub fn with_aliases(mut self, v: IndexMap<String, OutputSpec>) -> Self {
+        self.aliases = v;
+        self
+    }
+
+    /// Set `threads`.
+    pub fn with_threads(mut self, v: Option<usize>) -> Self {
+        self.threads = v;
+        self
+    }
+}
+
 /// Per-file/per-alias spec: track lists grouped by media type.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -41,6 +61,32 @@ pub struct OutputSpec {
     /// kind-specific lists at DAG-build time.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub all: Vec<TrackSpec>,
+}
+
+impl OutputSpec {
+    /// Set `audio`.
+    pub fn with_audio(mut self, v: Vec<TrackSpec>) -> Self {
+        self.audio = v;
+        self
+    }
+
+    /// Set `video`.
+    pub fn with_video(mut self, v: Vec<TrackSpec>) -> Self {
+        self.video = v;
+        self
+    }
+
+    /// Set `subtitle`.
+    pub fn with_subtitle(mut self, v: Vec<TrackSpec>) -> Self {
+        self.subtitle = v;
+        self
+    }
+
+    /// Set `all`.
+    pub fn with_all(mut self, v: Vec<TrackSpec>) -> Self {
+        self.all = v;
+        self
+    }
 }
 
 impl OutputSpec {
@@ -88,6 +134,36 @@ pub struct TrackSpec {
     pub stream_selector: Option<StreamSelector>,
 }
 
+impl TrackSpec {
+    /// Build a [`TrackSpec`] from its mandatory fields; the rest take their defaults.
+    pub fn new(input: TrackInput) -> Self {
+        Self {
+            input,
+            codec: None,
+            params: serde_json::Value::Null,
+            stream_selector: None,
+        }
+    }
+
+    /// Set `codec`.
+    pub fn with_codec(mut self, v: Option<String>) -> Self {
+        self.codec = v;
+        self
+    }
+
+    /// Set `params`.
+    pub fn with_params(mut self, v: serde_json::Value) -> Self {
+        self.params = v;
+        self
+    }
+
+    /// Set `stream_selector`.
+    pub fn with_stream_selector(mut self, v: Option<StreamSelector>) -> Self {
+        self.stream_selector = v;
+        self
+    }
+}
+
 /// Recursive input node.
 ///
 /// Deserialization is key-directed: the variant is picked by which
@@ -102,6 +178,7 @@ pub struct TrackSpec {
 /// derive (emit the inner struct's fields directly).
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
+#[non_exhaustive]
 pub enum TrackInput {
     /// `{"from": "path-or-@alias"}`.
     Source(SourceRef),
@@ -193,6 +270,13 @@ pub struct SourceRef {
     pub from: String,
 }
 
+impl SourceRef {
+    /// Build a [`SourceRef`] from its fields.
+    pub fn new(from: String) -> Self {
+        Self { from }
+    }
+}
+
 /// Filter node — single-input for now.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct FilterNode {
@@ -204,6 +288,23 @@ pub struct FilterNode {
     pub params: serde_json::Value,
     /// Upstream node.
     pub input: Box<TrackInput>,
+}
+
+impl FilterNode {
+    /// Build a [`FilterNode`] from its mandatory fields; the rest take their defaults.
+    pub fn new(filter: String, input: Box<TrackInput>) -> Self {
+        Self {
+            filter,
+            input,
+            params: serde_json::Value::Null,
+        }
+    }
+
+    /// Set `params`.
+    pub fn with_params(mut self, v: serde_json::Value) -> Self {
+        self.params = v;
+        self
+    }
 }
 
 /// Explicit pixel-format conversion node.
@@ -220,6 +321,13 @@ pub struct ConvertNode {
     pub convert: String,
     /// Upstream node.
     pub input: Box<TrackInput>,
+}
+
+impl ConvertNode {
+    /// Build a [`ConvertNode`] from its fields.
+    pub fn new(convert: String, input: Box<TrackInput>) -> Self {
+        Self { convert, input }
+    }
 }
 
 /// [`TrackInput::Render3D`] payload.
@@ -241,6 +349,23 @@ pub struct Render3DNode {
     /// renderer options struct.
     #[serde(default, skip_serializing_if = "is_null_or_empty")]
     pub opts: serde_json::Value,
+}
+
+impl Render3DNode {
+    /// Build a [`Render3DNode`] from its mandatory fields; the rest take their defaults.
+    pub fn new(source: String, backend: String) -> Self {
+        Self {
+            source,
+            backend,
+            opts: serde_json::Value::Null,
+        }
+    }
+
+    /// Set `opts`.
+    pub fn with_opts(mut self, v: serde_json::Value) -> Self {
+        self.opts = v;
+        self
+    }
 }
 
 impl TrackInput {
@@ -428,6 +553,13 @@ pub struct StreamSelector {
     /// 0-based index within the filtered pool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub index: Option<u32>,
+}
+
+impl StreamSelector {
+    /// Build a [`StreamSelector`] from its fields.
+    pub fn new(kind: Option<MediaType>, index: Option<u32>) -> Self {
+        Self { kind, index }
+    }
 }
 
 fn is_null_or_empty(v: &serde_json::Value) -> bool {

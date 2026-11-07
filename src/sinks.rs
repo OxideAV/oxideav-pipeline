@@ -16,6 +16,7 @@ use crate::executor::JobSink;
 /// Discarding sink. Keeps a counter of packets/frames received for test
 /// assertions.
 #[derive(Default)]
+#[non_exhaustive]
 pub struct NullSink {
     pub packets: u64,
     pub frames: u64,
@@ -53,6 +54,7 @@ impl JobSink for NullSink {
 /// platforms where an open handle blocks deletion the drop must come
 /// first. Every other hook errors with a descriptive message if it is
 /// called after `abandon`.
+#[non_exhaustive]
 pub struct FileSink {
     pub path: PathBuf,
     muxer: Option<Box<dyn Muxer>>,

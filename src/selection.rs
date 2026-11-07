@@ -53,6 +53,38 @@ pub struct CodecPreferences {
 }
 
 impl CodecPreferences {
+    /// Set `prefer`.
+    pub fn with_prefer(mut self, v: Vec<String>) -> Self {
+        self.prefer = v;
+        self
+    }
+
+    /// Set `exclude`.
+    pub fn with_exclude(mut self, v: Vec<String>) -> Self {
+        self.exclude = v;
+        self
+    }
+
+    /// Set `no_hardware`.
+    pub fn with_no_hardware(mut self, v: bool) -> Self {
+        self.no_hardware = v;
+        self
+    }
+
+    /// Set `require_hardware`.
+    pub fn with_require_hardware(mut self, v: bool) -> Self {
+        self.require_hardware = v;
+        self
+    }
+
+    /// Set `boost`.
+    pub fn with_boost(mut self, v: i32) -> Self {
+        self.boost = v;
+        self
+    }
+}
+
+impl CodecPreferences {
     pub fn excludes(&self, caps: &CodecCapabilities) -> bool {
         self.exclude.iter().any(|n| n == &caps.implementation)
             || (self.no_hardware && caps.hardware_accelerated)

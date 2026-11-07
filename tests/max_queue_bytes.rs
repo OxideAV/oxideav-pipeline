@@ -210,14 +210,7 @@ fn byte_ceiling_composes_with_channel_caps() {
     // byte ceiling clamps to a sub-packet 1 byte. Whichever binds first
     // applies; the run must still complete and preserve the count.
     let reference = run_with_budget(0, None, "max_queue_bytes_compose_ref");
-    let combined = run_with_budget(
-        1,
-        Some(ChannelCaps {
-            packets: 1,
-            frames: 1,
-        }),
-        "max_queue_bytes_compose",
-    );
+    let combined = run_with_budget(1, Some(ChannelCaps::new(1, 1)), "max_queue_bytes_compose");
     assert_eq!(
         reference, combined,
         "byte ceiling + tight count caps ({combined}) must process the same packet count \

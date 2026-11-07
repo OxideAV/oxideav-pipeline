@@ -82,6 +82,86 @@ pub struct BenchOpts {
     pub side: Side,
 }
 
+impl BenchOpts {
+    /// Set `prep_frames`.
+    pub fn with_prep_frames(mut self, v: u32) -> Self {
+        self.prep_frames = v;
+        self
+    }
+
+    /// Set `bench_duration_secs`.
+    pub fn with_bench_duration_secs(mut self, v: f64) -> Self {
+        self.bench_duration_secs = v;
+        self
+    }
+
+    /// Set `width`.
+    pub fn with_width(mut self, v: u32) -> Self {
+        self.width = v;
+        self
+    }
+
+    /// Set `height`.
+    pub fn with_height(mut self, v: u32) -> Self {
+        self.height = v;
+        self
+    }
+
+    /// Set `pix_fmt`.
+    pub fn with_pix_fmt(mut self, v: PixelFormat) -> Self {
+        self.pix_fmt = v;
+        self
+    }
+
+    /// Set `fps_num`.
+    pub fn with_fps_num(mut self, v: i32) -> Self {
+        self.fps_num = v;
+        self
+    }
+
+    /// Set `fps_den`.
+    pub fn with_fps_den(mut self, v: i32) -> Self {
+        self.fps_den = v;
+        self
+    }
+
+    /// Set `bitrate_video`.
+    pub fn with_bitrate_video(mut self, v: u64) -> Self {
+        self.bitrate_video = v;
+        self
+    }
+
+    /// Set `sample_rate`.
+    pub fn with_sample_rate(mut self, v: u32) -> Self {
+        self.sample_rate = v;
+        self
+    }
+
+    /// Set `channels`.
+    pub fn with_channels(mut self, v: u16) -> Self {
+        self.channels = v;
+        self
+    }
+
+    /// Set `sample_format`.
+    pub fn with_sample_format(mut self, v: SampleFormat) -> Self {
+        self.sample_format = v;
+        self
+    }
+
+    /// Set `bitrate_audio`.
+    pub fn with_bitrate_audio(mut self, v: u64) -> Self {
+        self.bitrate_audio = v;
+        self
+    }
+
+    /// Set `side`.
+    pub fn with_side(mut self, v: Side) -> Self {
+        self.side = v;
+        self
+    }
+}
+
 impl Default for BenchOpts {
     fn default() -> Self {
         Self {
@@ -103,6 +183,7 @@ impl Default for BenchOpts {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum Side {
     Decode,
     Encode,
@@ -111,6 +192,7 @@ pub enum Side {
 
 /// Result of one (codec_id × backend × side) bench cell.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct BenchResult {
     pub codec_id: String,
     pub backend: String,
@@ -1052,6 +1134,7 @@ fn error_result(
 /// shells out to `sysctl` (macOS) or reads `/proc/cpuinfo` (Linux);
 /// missing fields fall back to `"unknown"`.
 #[derive(Clone, Debug)]
+#[non_exhaustive]
 pub struct SystemInfo {
     pub os: &'static str,
     pub cpu_brand: String,
